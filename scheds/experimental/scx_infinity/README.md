@@ -262,6 +262,118 @@ The cgroup part counts `cpu.max` throttled enqueues and reenqueues, and
 reports the largest effective group weight and folded group scale seen on
 any CPU. `scale_q10` is the shares/load product in 1/1024 units.
 
+## Test harnesses
+
+`scripts/` holds reusable harnesses. They fail closed: a missing tool, a
+missing kernel feature, a non-virtual machine or an unreadable file is
+BLOCKED, never PASS. Each harness prints one JSON object per line on
+stdout and the last line is a summary object. Exit codes are 0 for PASS,
+1 for FAIL and 2 for BLOCKED. A check is FAIL only after it ran and
+missed its limit.
+
+Every destructive harness needs root, a disposable virtual machine and
+an explicit opt-in:
+
+```
+export SCX_INFINITY_VM=1
+```
+
+Without the variable the harness records a BLOCKED `vm` item and starts
+nothing. Never set it on a host you cannot reboot.
+
+The harnesses stop their workers, unload the scheduler and remove their
+cgroups on exit, including after a failure. They sample dmesg from the
+start of the run and fail on `scx_bpf_error`, a runnable task stall, a
+watchdog line or an `Oops`.
+
+The scheduler binary defaults to `target/release/scx_infinity`, then
+`target/debug/scx_infinity`. `SCX_INFINITY_BIN` or `--scheduler` selects
+another binary. Pass `--out FILE` to keep a copy of the JSON Lines
+records.
+
+### Feature preflight
+
+```
+sudo scripts/infinity_vm_preflight.sh --json --strict
+```
+
+The repository preflight checks `sched_ext`, the BPF arena, the cgroup v2
+cpu controller, `cpu.idle` and the sched_ext cgroup callbacks. Strict
+mode requires the runtime file, not the kernel configuration alone. The
+harness wrapper adds the VM gate:
+
+```
+sudo \
+  scheds/experimental/scx_infinity/scripts/infinity_feature_preflight.sh \
+  --require-vm [--require-two-numa-nodes]
+```
+
+### Cgroup harness
+
+```
+SCX_INFINITY_VM=1 sudo \
+  scheds/experimental/scx_infinity/scripts/infinity_cgroup_harness.sh \
+  [--trials 5] [--cpu 0] [--window 5] [--settle 1] [--out FILE]
+```
+
+The harness creates two cgroups and pins one busy worker of each group to
+one CPU, so the cases contend. Five trials each cover:
+
+- `cpu.weight` 100:200, expected ratio 1.8 to 2.2.
+- A live change from 100:100 to 100:200 after the first window.
+- `cpu.idle` 1, then 0, then 1, with progress after the normal worker
+  stops.
+- `cpu.max` `50000 100000`, expected 45 to 55 percent and rising
+  `nr_throttled` and `throttled_usec`.
+- `cpu.max.burst` 40000 after an underspend, expected a short burst above
+  quota.
+
+Every trial record carries the raw `usage_usec` values and the ratio.
+The median of each case follows as a `note` record.
+
+### Queue stress
+
+```
+SCX_INFINITY_VM=1 sudo \
+  scheds/experimental/scx_infinity/scripts/infinity_queue_stress.sh \
+  [--duration 8] [--workers N] [--yield-to-cmd CMD] [--out FILE]
+```
+
+The harness loads the scheduler and runs CPU-bound workers, sleepers next
+to burners, fork and exec loops, affinity changes, migrations and
+`sched_yield` loops. It then changes the nice value and the cgroup weight
+of a running worker and checks the scheduling counters. It stops the
+scheduler with SIGINT and checks the exit status, the `disabled` state
+and the counters `lost` and `stale`.
+
+Directed yield is reachable from user space only through KVM. Without
+`--yield-to-cmd` the `yieldto` item is BLOCKED. A caller with a guest KVM
+workload passes the command that triggers the directed yield.
+
+### Two-node placement
+
+```
+SCX_INFINITY_VM=1 sudo \
+  scheds/experimental/scx_infinity/scripts/infinity_numa_placement.sh \
+  [--duration 2] [--out FILE]
+```
+
+The guest must have two online vNUMA nodes. The harness samples the CPU
+of a task that wakes on an idle CPU and checks that it stays in the local
+LLC and node. It then fills node 0 and expects a wakeup to spill to node
+1. It narrows the affinity to node 0 and then to one CPU and requires
+zero out-of-mask samples. A sample outside the mask is FAIL.
+
+### Harness self-test
+
+```
+scheds/experimental/scx_infinity/scripts/infinity_harness_selftest.sh
+```
+
+The self-test needs no root and no scheduler. It covers the JSON, cpulist,
+numeric and statistics helpers and checks that each harness rejects an
+unknown argument and fails closed on a host.
+
 ## Performance status
 
 This tree does not claim performance parity with native Infinity. The

@@ -30,38 +30,73 @@
 #     CONFIG_EXT_GROUP_SCHED.
 #
 # Usage:
-#   sudo scripts/infinity_vm_preflight.sh [--require-two-numa-nodes]
+#   sudo scripts/infinity_vm_preflight.sh [--json] [--strict] \
+#       [--require-two-numa-nodes]
 #
+# --json prints one JSON object per item and a final summary object, one
+#   object per line. The human format is the default.
+# --strict turns an item that can only be inferred from the kernel
+#   configuration into BLOCKED. The runtime file or symbol must be
+#   present. A harness therefore never reports PASS from a guess.
 # --require-two-numa-nodes makes a two-node guest a required item. Without
 # the flag the NUMA layout is printed as INFO only.
 
 set -Eeuo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
 IFS=$'\n\t'
+export LC_ALL=C
 
 readonly CGROUP_ROOT_DEFAULT="/sys/fs/cgroup"
 
 FAILED=0
 REQUIRE_NUMA=0
+EMIT_JSON=0
+STRICT=0
 CGROUP_ROOT=""
 CGROUP_CHILD=""
 SUBTREE_ADDED=0
 
+json_escape() {
+    local text=${1-}
+
+    text=${text//\\/\\\\}
+    text=${text//\"/\\\"}
+    text=${text//$'\n'/\\n}
+    text=${text//$'\r'/\\r}
+    text=${text//$'\t'/\\t}
+    printf '%s' "$text"
+}
+
+emit_item() {
+    local -r item="$1"
+    local -r status="$2"
+    local -r detail="$3"
+
+    if (( EMIT_JSON )); then
+        printf '{"item":"%s","status":"%s","detail":"%s"}\n' \
+            "$(json_escape "$item")" "$(json_escape "$status")" \
+            "$(json_escape "$detail")"
+        return 0
+    fi
+
+    printf '%s: %s (%s)\n' "$item" "$status" "$detail"
+}
+
 pass() {
-    printf '%s: PASS (%s)\n' "$1" "$2"
+    emit_item "$1" PASS "$2"
 }
 
 blocked() {
-    printf '%s: BLOCKED (%s)\n' "$1" "$2"
+    emit_item "$1" BLOCKED "$2"
     FAILED=1
 }
 
 info() {
-    printf '%s: INFO (%s)\n' "$1" "$2"
+    emit_item "$1" INFO "$2"
 }
 
 usage() {
-    printf 'usage: %s [--require-two-numa-nodes]\n' "${0##*/}"
+    printf 'usage: %s [--json] [--strict] [--require-two-numa-nodes]\n' "${0##*/}"
 }
 
 cleanup() {
@@ -297,8 +332,12 @@ check_cgroup_cpu() {
         detail="${detail:+$detail, }cpu.max file present"
         pass cgroup_cpu "$detail"
     elif (( max_cfg || max_ksym )); then
-        detail="${detail:+$detail, }cpu.max supported by config or symbol, runtime file not checked"
-        pass cgroup_cpu "$detail"
+        if (( STRICT )); then
+            blocked cgroup_cpu "cpu.max is only known from the config or a symbol, the runtime file is missing"
+        else
+            detail="${detail:+$detail, }cpu.max supported by config or symbol, runtime file not checked"
+            pass cgroup_cpu "$detail"
+        fi
     else
         blocked cgroup_cpu "the cpu controller exists but cpu.max is missing"
     fi
@@ -329,6 +368,10 @@ check_cpu_idle() {
         detail="${detail:+$detail, }cpu.idle file present"
         pass cpu_idle "$detail"
     elif (( cfg )) || ksym_exists cpu_idle_write_s64; then
+        if (( STRICT )); then
+            blocked cpu_idle "cpu.idle is only known from the config or a symbol, the runtime file is missing"
+            return
+        fi
         detail="${detail:+$detail, }runtime file not checked"
         if [[ "$EUID" -ne 0 ]]; then
             detail="$detail (not root)"
@@ -376,6 +419,9 @@ check_scx_cgroup_cbs() {
         if grep -qw cgroup_set_bandwidth <<<"$body"; then
             bandwidth=1
         fi
+    elif (( STRICT )); then
+        blocked scx_cgroup_cbs "the sched_ext_ops BTF body is not readable, the callbacks cannot be verified"
+        return
     fi
 
     if (( weight == 0 )); then
@@ -434,6 +480,12 @@ check_numa() {
 main() {
     while (($#)); do
         case "$1" in
+            --json)
+                EMIT_JSON=1
+                ;;
+            --strict)
+                STRICT=1
+                ;;
             --require-two-numa-nodes)
                 REQUIRE_NUMA=1
                 ;;
@@ -457,13 +509,23 @@ main() {
     check_scx_cgroup_cbs
     check_numa
 
-    printf '\n'
+    if (( EMIT_JSON == 0 )); then
+        printf '\n'
+    fi
     if (( FAILED )); then
-        printf 'summary: BLOCKED\n'
+        if (( EMIT_JSON )); then
+            printf '{"item":"summary","status":"BLOCKED","detail":""}\n'
+        else
+            printf 'summary: BLOCKED\n'
+        fi
         exit 1
     fi
 
-    printf 'summary: PASS\n'
+    if (( EMIT_JSON )); then
+        printf '{"item":"summary","status":"PASS","detail":""}\n'
+    else
+        printf 'summary: PASS\n'
+    fi
 }
 
 main "$@"
