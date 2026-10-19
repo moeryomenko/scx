@@ -1127,16 +1127,20 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 
 	p    = bpf_task_from_pid(tctx->pid);
 	if (!p) {
-		if (!inf_queue_try_remove(pq, node))
+		if (!inf_queue_try_remove(pq, node)) {
+			tctx->queued_cpu = -1;
 			inf_queue_uncharge(pcctx, w);
+		}
 		inf_queue_drop(node);
 		INF_STAT_INC(stale_pops);
 		return false;
 	}
 
 	if ((p->flags & PF_EXITING) || tctx->state == INF_TASK_EXITING) {
-		if (!inf_queue_try_remove(pq, node))
+		if (!inf_queue_try_remove(pq, node)) {
+			tctx->queued_cpu = -1;
 			inf_queue_uncharge(pcctx, w);
+		}
 		bpf_task_release(p);
 		inf_queue_drop(node);
 		INF_STAT_INC(stale_pops);
@@ -1144,8 +1148,10 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 	}
 
 	if (tctx->dequeue_pending || tctx->exit_pending) {
-		if (!inf_queue_try_remove(pq, node))
+		if (!inf_queue_try_remove(pq, node)) {
+			tctx->queued_cpu = -1;
 			inf_queue_uncharge(pcctx, w);
+		}
 		tctx->dequeue_pending = 0;
 		tctx->exit_pending    = 0;
 		bpf_task_release(p);
@@ -1167,11 +1173,11 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 		return false;
 	}
 
-	inf_queue_uncharge(pcctx, w);
 	tctx->queued_cpu = -1;
-	tctx->state	 = INF_TASK_DISPATCHED;
-	q		 = inf_quantum(w, READ_ONCE(dcctx->w_sum) + w);
-	tctx->slice_ns	 = q;
+	inf_queue_uncharge(pcctx, w);
+	tctx->state    = INF_TASK_DISPATCHED;
+	q	       = inf_quantum(w, READ_ONCE(dcctx->w_sum) + w);
+	tctx->slice_ns = q;
 
 	scx_bpf_task_set_slice(p, q);
 	scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, q, 0);
@@ -1431,15 +1437,30 @@ void BPF_STRUCT_OPS(infinity_set_weight, struct task_struct *p, u32 weight)
 
 	INF_STAT_INC(weight_queued_cpu);
 
-	if (tctx->state != INF_TASK_QUEUED)
-		return;
-
-	INF_STAT_INC(reweight_queued);
-
 	queue = inf_queue(cpu);
 	cctx  = inf_cpu_ctx(cpu);
 	if (!queue || !cctx)
 		return;
+
+	/*
+	 * The queue holds a charge for the old weight. Move it to the new
+	 * weight before any return that leaves the node in place, so a later
+	 * pop never subtracts a weight the queue did not hold.
+	 */
+	if (tctx->state != INF_TASK_QUEUED) {
+		__sync_fetch_and_add(&cctx->w_sum, (s64)new - (s64)old);
+		return;
+	}
+
+	INF_STAT_INC(reweight_queued);
+
+	/*
+	 * Take a hold before claiming the mover slot. A concurrent exit
+	 * waits for this hold, so the context survives until the move
+	 * finishes even if the exit wins the race.
+	 */
+	node = &tctx->qnode;
+	inf_queue_hold(node);
 
 	/*
 	 * A concurrent mover owns the node. Defer the move; the task is
@@ -1447,17 +1468,17 @@ void BPF_STRUCT_OPS(infinity_set_weight, struct task_struct *p, u32 weight)
 	 */
 	if (cmpxchg(&tctx->moving, 0, 1)) {
 		tctx->reweight_pending = 1;
+		__sync_fetch_and_add(&cctx->w_sum, (s64)new - (s64)old);
+		inf_queue_drop(node);
 		return;
 	}
 
-	node = &tctx->qnode;
-	inf_queue_hold(node);
 	old_key = inf_queue_node_key(node);
 
 	ret	= inf_queue_remove(queue, node);
 	if (ret) {
-		inf_queue_drop(node);
 		tctx->moving = 0;
+		inf_queue_drop(node);
 		INF_STAT_INC(lost_state_errors);
 		return;
 	}
@@ -1483,8 +1504,8 @@ void BPF_STRUCT_OPS(infinity_set_weight, struct task_struct *p, u32 weight)
 			if (inf_requeue_task(p, tctx, cpu))
 				INF_STAT_INC(lost_state_errors);
 		}
-		inf_queue_drop(node);
 		tctx->moving = 0;
+		inf_queue_drop(node);
 		return;
 	}
 
@@ -1492,8 +1513,8 @@ void BPF_STRUCT_OPS(infinity_set_weight, struct task_struct *p, u32 weight)
 	tctx->state	       = INF_TASK_QUEUED;
 	tctx->reweight_pending = 0;
 	inf_resolve_pending(p, tctx);
-	inf_queue_drop(node);
 	tctx->moving = 0;
+	inf_queue_drop(node);
 	INF_STAT_INC(reweight_moves);
 }
 
