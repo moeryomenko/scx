@@ -368,6 +368,13 @@ fn main() -> Result<()> {
     })
     .context("Error setting Ctrl-C handler")?;
 
+    /*
+     * ctrlc handles SIGINT only. SIGTERM needs the same graceful stop, and
+     * SIGHUP must reload, so both use signal-hook.
+     */
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, shutdown.clone())
+        .context("Error setting SIGTERM handler")?;
+
     let reload_flag = reload::install_reload_flag()?;
 
     let mut open_object = MaybeUninit::uninit();

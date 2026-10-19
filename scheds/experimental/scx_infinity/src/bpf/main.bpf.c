@@ -414,7 +414,7 @@ struct inf_pick_score {
 };
 
 /* Idle candidates: lower class, then nearer node, then faster CPU. */
-static __always_inline bool inf_score_better(const struct inf_pick_score *a,
+static __noinline bool inf_score_better(const struct inf_pick_score *a,
 					     const struct inf_pick_score *b)
 {
 	if (a->cls != b->cls)
@@ -429,7 +429,7 @@ static __always_inline bool inf_score_better(const struct inf_pick_score *a,
 }
 
 /* Capacity fallback: a CPU below the spill threshold wins first. */
-static __always_inline bool inf_capacity_better(const struct inf_pick_score *a,
+static __noinline bool inf_capacity_better(const struct inf_pick_score *a,
 						const struct inf_pick_score *b,
 						u32 spill)
 {
