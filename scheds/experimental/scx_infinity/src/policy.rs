@@ -126,8 +126,9 @@ pub fn effective_weight(base: u32, levels: &[(u64, u64)], idle: bool) -> u64 {
     ((base * scale + CGROUP_WEIGHT_ONE / 2) >> CGROUP_WEIGHT_SHIFT).max(1)
 }
 
-/// A fresh wakeup preempts only when it is heavier than the running task
-/// and the victim still retains the configured preemption margin.
+/// A fresh wakeup preempts only when the enqueue took a head slot, the
+/// wakeup is heavier than the running task, and the victim still retains
+/// the configured preemption margin.
 pub fn should_preempt(
     newcomer_weight: u64,
     victim_weight: u64,

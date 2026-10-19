@@ -12,10 +12,11 @@
  * Regular enqueues pass a 7:1 gate. Every eighth regular enqueue takes a
  * tail key and the other seven take a head key, so at most seven normal
  * arrivals can move ahead of a queued task between two tail insertions.
- * A fresh wakeup is exempt and enters at the head. An expired slice, a
- * requeue or a forced-progress enqueue enters at the tail, and a yield
- * zeroes the slice so the core hands the task back through the same
- * tail path.
+ * SCX_ENQ_HEAD is the only head-exempt hint; sched_ext has no equivalent
+ * of the kernel's curr == se exemption. A wakeup passes the gate like any
+ * other enqueue. An expired slice, a requeue or a forced-progress enqueue
+ * enters at the tail, and a yield zeroes the slice so the core hands the
+ * task back through the same tail path.
  *
  * The slice is proportional to the task's effective weight over the
  * contending weight on the target CPU. The effective weight folds the
@@ -282,11 +283,12 @@ static __always_inline u32 inf_nr_cpu_ids(void)
 }
 
 /*
- * Preempt only a fresh wakeup that took a head slot. The newcomer must be
- * heavier than the running task and the victim must retain at least the
- * configured preemption margin, so a task that is about to expire
- * finishes instead of taking an IPI. A task under a cpu.idle cgroup never
- * preempts.
+ * Preempt only a fresh wakeup that took a head slot. A wakeup that the
+ * gate placed on the tail does not preempt, because it is already behind
+ * the running task in queue order. The newcomer must be heavier than the
+ * running task and the victim must retain at least the configured
+ * preemption margin, so a task that is about to expire finishes instead of
+ * taking an IPI. A task under a cpu.idle cgroup never preempts.
  */
 static __always_inline void inf_maybe_preempt(struct task_struct *p, s32 cpu,
 					      u64 enq_flags, bool head, u64 w)
@@ -707,17 +709,16 @@ static int inf_enqueue_common(struct task_struct *p, u64 enq_flags, bool reenq)
 		__sync_fetch_and_add(&stats->expiries, 1);
 
 	/*
-	 * Head-exempt: core head hint, fresh wakeup.
+	 * Head-exempt: the SCX_ENQ_HEAD hint only. sched_ext exposes no
+	 * curr == se exemption.
 	 * Tail: expiry, yield hand-back, requeue, forced progress.
-	 * Otherwise the 7:1 gate decides.
+	 * Otherwise the 7:1 gate decides, including a wakeup.
 	 */
 	if (enq_flags & SCX_ENQ_HEAD) {
 		head = true;
 	} else if (expired || (enq_flags & (SCX_ENQ_REENQ | SCX_ENQ_LAST |
 					    SCX_ENQ_PREEMPT))) {
 		head = false;
-	} else if (wake) {
-		head = true;
 	} else {
 		seq  = __sync_fetch_and_add(&cctx->seq, 1);
 		head = !(seq == (u32)-1 ||
@@ -725,9 +726,8 @@ static int inf_enqueue_common(struct task_struct *p, u64 enq_flags, bool reenq)
 	}
 	tctx->yielded = 0;
 
-	exempt = wake || expired ||
-		 (enq_flags & (SCX_ENQ_HEAD | SCX_ENQ_REENQ | SCX_ENQ_LAST |
-			       SCX_ENQ_PREEMPT));
+	exempt = expired || (enq_flags & (SCX_ENQ_HEAD | SCX_ENQ_REENQ |
+					  SCX_ENQ_LAST | SCX_ENQ_PREEMPT));
 
 	/*
 	 * The task's cgroup load counts it from the first enqueue until the

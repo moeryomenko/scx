@@ -39,8 +39,11 @@ The core policy is a bounded last-in-first-out queue:
 - Eight regular enqueues pass a fixed 7:1 gate. Seven take the head and
   one takes the tail, so at most seven normal arrivals move ahead of a
   queued task between two tail insertions.
-- A fresh wakeup is exempt and enters at the head. An expired slice, a
-  requeue, a forced-progress enqueue and a yield enter at the tail.
+- `SCX_ENQ_HEAD` is the only head-exempt hint. sched_ext has no
+  equivalent of the kernel's `curr == se` exemption. A wakeup passes the
+  same 7:1 gate as any other enqueue and can take the head or the tail
+  slot. An expired slice, a requeue, a forced-progress enqueue and a
+  yield enter at the tail.
 - The slice is `quantum * weight / contending_weight`, with a 100 us
   floor for a task below one tenth of the queue weight. The contending
   weight is the sum of the effective weights on the target CPU. The
@@ -53,10 +56,11 @@ The core policy is a bounded last-in-first-out queue:
   library (`lib/cgroup_bw.bpf.c`). A task in a throttled group is parked
   on the library's arena backlog and re-enqueued through the same 7:1
   gate when the group gets time again.
-- A fresh wakeup preempts only when it is heavier than the running task
-  and the victim retains at least the configured preemption margin.
-  Yield forfeits the remaining slice and re-enters at the tail. A task
-  under a `cpu.idle` cgroup never preempts.
+- A fresh wakeup preempts only when the enqueue took a head slot, the
+  wakeup is heavier than the running task, and the victim retains at
+  least the configured preemption margin. A wakeup that took a tail slot
+  does not preempt. Yield forfeits the remaining slice and re-enters at
+  the tail. A task under a `cpu.idle` cgroup never preempts.
 
 The queue order, the 7:1 gate and the slice-expiry rules are fixed. Only
 the settings below can change at run time.
@@ -198,10 +202,10 @@ inserts: head=... tail=... exempt=... expiries=... preemptions=... yields=... de
 cgrp: throttled=... reenqueued=... eff_weight=... scale_q10=...
 ```
 
-`head_inserts` and `tail_inserts` count only regular gated enqueues, so
-their ratio approaches 7:1. `exempt_inserts` counts wakeups, core head
-hints, expiries, requeues and forced progress. `depth` sums the per-CPU
-queue depths when the line is printed.
+`head_inserts` and `tail_inserts` count all enqueues that pass the 7:1
+gate, including wakeups, so their ratio approaches 7:1. `exempt_inserts`
+counts only `SCX_ENQ_HEAD` hints, expiries, requeues and forced progress.
+`depth` sums the per-CPU queue depths when the line is printed.
 
 The cgroup part counts `cpu.max` throttled enqueues and reenqueues, and
 reports the largest effective group weight and folded group scale seen on

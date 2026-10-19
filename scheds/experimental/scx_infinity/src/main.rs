@@ -56,9 +56,10 @@ const CGROUP_TREE_HEIGHT_MAX: u32 = 32;
 /// scx_infinity: experimental sched_ext scheduler.
 ///
 /// A bounded-LIFO scheduler with a weighted quantum. The queue takes
-/// seven head inserts and one tail insert per eight regular enqueues,
-/// fresh wakeups enter at the head, and expiry, requeue, forced progress
-/// and yield enter at the tail.
+/// seven head inserts and one tail insert per eight gated enqueues.
+/// Wakeups pass the same gate, `SCX_ENQ_HEAD` is the only head-exempt
+/// hint, and expiry, requeue, forced progress and yield enter at the
+/// tail.
 ///
 /// The TOML file at $XDG_CONFIG_HOME/scx_infinity/config.toml (or
 /// $HOME/.config/scx_infinity/config.toml) holds the base quantum and the

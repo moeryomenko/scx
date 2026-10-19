@@ -29,8 +29,8 @@ pub enum Insert {
 /// Replica of the enqueue decision in `inf_enqueue_common()`.
 ///
 /// The order is the same as the BPF core: a core head hint wins, an expiry
-/// or a requeue rotates to the tail, a fresh wakeup takes the head, and a
-/// regular arrival passes the 7:1 gate.
+/// or a requeue rotates to the tail, and every other arrival, including a
+/// wakeup, passes the 7:1 gate.
 pub fn classify_enqueue(
     slice: u64,
     wake: bool,
@@ -46,8 +46,6 @@ pub fn classify_enqueue(
         Insert::Head
     } else if expired || reenq || last || preempt {
         Insert::Tail
-    } else if wake {
-        Insert::Head
     } else if gate_tail(seq) {
         Insert::Tail
     } else {
@@ -106,9 +104,15 @@ impl QueueModel {
         insert
     }
 
-    /// A fresh wakeup, which is exempt and takes the head.
-    pub fn enqueue_wakeup(&mut self, id: u64, weight: u64) {
-        self.push(id, weight, Insert::Head, true);
+    /// A wakeup. It is not exempt: it advances the gate sequence and can
+    /// take either the head or the tail slot. A zero slice does not turn a
+    /// wakeup into an expiry.
+    pub fn enqueue_wakeup(&mut self, id: u64, weight: u64) -> Insert {
+        let seq = self.seq;
+        self.seq = self.seq.wrapping_add(1);
+        let insert = classify_enqueue(0, true, false, false, false, false, seq);
+        self.push(id, weight, insert, false);
+        insert
     }
 
     /// An expiry, a requeue or a yield hand-back, which is exempt and takes
@@ -274,7 +278,35 @@ mod tests {
     }
 
     #[test]
-    fn a_wakeup_with_a_zero_slice_keeps_the_head_slot() {
+    fn a_wakeup_that_the_gate_places_on_the_head_is_not_exempt() {
+        let mut queue = QueueModel::new();
+
+        assert_eq!(queue.enqueue_wakeup(1, 100), Insert::Head);
+        assert_eq!(queue.head_inserts, 1);
+        assert_eq!(queue.tail_inserts, 0);
+        assert_eq!(queue.exempt_inserts, 0);
+        assert_eq!(queue.seq, 1);
+        assert_eq!(queue.rank(1), Some(0));
+    }
+
+    #[test]
+    fn a_wakeup_that_the_gate_places_on_the_tail_runs_last() {
+        let mut queue = QueueModel::new();
+
+        for id in 0..7 {
+            assert_eq!(queue.enqueue_regular(id, 100), Insert::Head);
+        }
+        assert_eq!(queue.enqueue_wakeup(7, 100), Insert::Tail);
+
+        assert_eq!(queue.head_inserts, 7);
+        assert_eq!(queue.tail_inserts, 1);
+        assert_eq!(queue.exempt_inserts, 0);
+        assert_eq!(queue.rank(7), Some(7));
+        assert_eq!(queue.pop(), Some((6, 100)));
+    }
+
+    #[test]
+    fn only_the_head_hint_and_expiry_bypass_the_gate() {
         assert_eq!(
             classify_enqueue(0, true, false, false, false, false, 0),
             Insert::Head
@@ -284,7 +316,7 @@ mod tests {
             Insert::Tail
         );
         assert_eq!(
-            classify_enqueue(0, false, true, false, false, false, 0),
+            classify_enqueue(0, false, true, false, false, false, 7),
             Insert::Head
         );
     }
