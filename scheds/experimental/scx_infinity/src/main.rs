@@ -8,7 +8,9 @@
 mod bpf_skel;
 pub use bpf_skel::*;
 pub mod bpf_intf;
+mod placement;
 mod policy;
+mod topology;
 
 use std::mem::MaybeUninit;
 use std::sync::Arc;
@@ -22,7 +24,12 @@ use anyhow::Result;
 use clap::Parser;
 use libbpf_rs::MapCore;
 use log::info;
+use placement::PlacementMode;
+use placement::SPILL_THRESHOLD_DEFAULT;
+use placement::SPILL_THRESHOLD_MAX;
+use placement::SPILL_THRESHOLD_MIN;
 use scx_utils::NR_CPU_IDS;
+use scx_utils::Topology;
 use scx_utils::UserExitInfo;
 use scx_utils::build_id;
 use scx_utils::scx_ops_attach;
@@ -51,6 +58,24 @@ struct Opts {
     #[clap(long, default_value_t = policy::QUANTUM_DEFAULT_NS / 1000)]
     quantum_us: u64,
 
+    /// Placement preference: auto, llc, numa or machine.
+    #[clap(long, value_enum, default_value_t = PlacementMode::Auto)]
+    placement: PlacementMode,
+
+    /// Do not place new work on an SMT sibling of a busy core.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    no_smt: bool,
+
+    /// Queue depth at which a CPU is considered crowded.
+    #[clap(
+        long,
+        default_value_t = SPILL_THRESHOLD_DEFAULT,
+        value_parser = clap::value_parser!(u32).range(
+            SPILL_THRESHOLD_MIN as i64..=SPILL_THRESHOLD_MAX as i64
+        )
+    )]
+    spill_threshold: u32,
+
     /// Enable verbose output, including libbpf details.
     #[clap(short = 'v', long, action = clap::ArgAction::SetTrue)]
     verbose: bool,
@@ -78,6 +103,15 @@ impl<'a> Scheduler<'a> {
             build_id::full_version(env!("CARGO_PKG_VERSION"))
         );
 
+        let topo = Topology::new().context("failed to read the host topology")?;
+        let smt_enabled = !opts.no_smt && topo.smt_enabled;
+        info!(
+            "Placement: {:?}, SMT {}, spill threshold {}",
+            opts.placement,
+            if smt_enabled { "on" } else { "off" },
+            opts.spill_threshold
+        );
+
         let mut skel_builder = BpfSkelBuilder::default();
         skel_builder.obj_builder.debug(opts.verbose);
         let mut skel = scx_ops_open!(skel_builder, open_object, infinity_ops, None)?;
@@ -94,9 +128,13 @@ impl<'a> Scheduler<'a> {
         rodata.nr_cpu_ids = (*NR_CPU_IDS)
             .try_into()
             .context("CPU count does not fit in u32")?;
+        rodata.placement_mode = opts.placement.as_u32();
+        rodata.smt_enabled = u32::from(smt_enabled);
+        rodata.spill_threshold = opts.spill_threshold;
         info!("Infinity quantum: {quantum_ns} ns");
 
         let mut skel = scx_ops_load!(skel, infinity_ops, uei)?;
+        topology::seed(&mut skel, &topo)?;
         let struct_ops = Some(scx_ops_attach!(skel, infinity_ops)?);
 
         Ok(Self { skel, struct_ops })
@@ -243,5 +281,29 @@ mod tests {
             policy::quantum_us_to_ns(opts.quantum_us).unwrap(),
             2_000_000
         );
+    }
+
+    #[test]
+    fn cli_parses_placement_options() {
+        let opts = Opts::try_parse_from([
+            "scx_infinity",
+            "--placement",
+            "numa",
+            "--no-smt",
+            "--spill-threshold",
+            "8",
+        ])
+        .unwrap();
+
+        assert_eq!(opts.placement, PlacementMode::Numa);
+        assert!(opts.no_smt);
+        assert_eq!(opts.spill_threshold, 8);
+    }
+
+    #[test]
+    fn cli_rejects_an_out_of_range_spill_threshold() {
+        assert!(Opts::try_parse_from(["scx_infinity", "--spill-threshold", "0"]).is_err());
+        assert!(Opts::try_parse_from(["scx_infinity", "--spill-threshold", "65"]).is_err());
+        assert!(Opts::try_parse_from(["scx_infinity", "--placement", "bad"]).is_err());
     }
 }

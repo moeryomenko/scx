@@ -36,6 +36,12 @@ UEI_DEFINE(uei);
 const volatile u64 quantum_ns = INF_QUANTUM_DEFAULT_NS;
 /* Possible CPU count, written by the loader before load. */
 const volatile u32 nr_cpu_ids = 0;
+/* Placement preference, written by the loader before load. */
+const volatile u32 placement_mode = INF_PLACEMENT_AUTO;
+/* Whether an idle SMT thread of a busy core may take new work. */
+const volatile u32 smt_enabled = 1;
+/* Queue depth at which a CPU is considered crowded. */
+const volatile u32 spill_threshold = 4;
 
 struct {
 	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
@@ -50,6 +56,25 @@ struct {
 	__type(key, u32);
 	__type(value, struct inf_cpu_ctx);
 } cpu_ctx_stor SEC(".maps");
+
+/*
+ * Scheduler-local topology. The loader fills one row per CPU and one
+ * distance row per node before load. Keeping the data here leaves the
+ * placement policy out of the shared utilities.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, INF_MAX_CPUS);
+	__type(key, u32);
+	__type(value, struct inf_cpu_topo);
+} topo_stor SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, INF_MAX_NODES);
+	__type(key, u32);
+	__type(value, struct inf_node_topo);
+} node_topo_stor SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -298,20 +323,293 @@ static __always_inline void inf_maybe_preempt(struct task_struct *p, s32 cpu,
 		__sync_fetch_and_add(&stats->preemptions, 1);
 }
 
+/* Scheduler-local topology row for a CPU, or NULL out of range. */
+static __always_inline struct inf_cpu_topo *inf_cpu_topo(s32 cpu)
+{
+	u32 key;
+
+	if (cpu < 0 || cpu >= INF_MAX_CPUS)
+		return NULL;
+	key = (u32)cpu;
+	return bpf_map_lookup_elem(&topo_stor, &key);
+}
+
+/* An allowed CPU is online and present in the task's affinity mask. */
+static __always_inline bool inf_cpu_allowed(struct task_struct	*p,
+					    struct inf_cpu_topo *t, s32 cpu)
+{
+	if (!t || !t->online)
+		return false;
+	return bpf_cpumask_test_cpu(cpu, p->cpus_ptr);
+}
+
+static __always_inline s32 inf_first_allowed(struct task_struct *p,
+					     bool		 primary_only)
+{
+	u32 ncpu = inf_nr_cpu_ids();
+	s32 cpu;
+
+	bpf_for(cpu, 0, INF_MAX_CPUS)
+	{
+		struct inf_cpu_topo *t;
+
+		if ((u32)cpu >= ncpu)
+			break;
+		t = inf_cpu_topo(cpu);
+		if (!inf_cpu_allowed(p, t, cpu))
+			continue;
+		if (primary_only && !t->core_primary)
+			continue;
+		return cpu;
+	}
+	return -1;
+}
+
+/* Advisory queue depth. A stale value only changes the chosen CPU. */
+static __always_inline u32 inf_cpu_depth(s32 cpu)
+{
+	struct inf_cpu_ctx *cctx = inf_cpu_ctx(cpu);
+	s64		    depth;
+
+	if (!cctx)
+		return 0;
+	depth = READ_ONCE(cctx->depth);
+	if (depth <= 0)
+		return 0;
+	if (depth > 0xffffffffU)
+		return 0xffffffffU;
+	return (u32)depth;
+}
+
+struct inf_pick_score {
+	s32 cpu;
+	u32 cls;
+	u32 distance;
+	u32 capacity;
+	u32 depth;
+};
+
+/* Idle candidates: lower class, then nearer node, then faster CPU. */
+static __always_inline bool inf_score_better(const struct inf_pick_score *a,
+					     const struct inf_pick_score *b)
+{
+	if (a->cls != b->cls)
+		return a->cls < b->cls;
+	if (a->distance != b->distance)
+		return a->distance < b->distance;
+	if (a->capacity != b->capacity)
+		return a->capacity > b->capacity;
+	if (a->depth != b->depth)
+		return a->depth < b->depth;
+	return a->cpu < b->cpu;
+}
+
+/* Capacity fallback: a CPU below the spill threshold wins first. */
+static __always_inline bool inf_capacity_better(const struct inf_pick_score *a,
+						const struct inf_pick_score *b,
+						u32 spill)
+{
+	bool a_fits = a->depth < spill;
+	bool b_fits = b->depth < spill;
+
+	if (a_fits != b_fits)
+		return a_fits;
+	if (a->capacity != b->capacity)
+		return a->capacity > b->capacity;
+	if (a->depth != b->depth)
+		return a->depth < b->depth;
+	return a->cpu < b->cpu;
+}
+
+/*
+ * Locality-first CPU selection.
+ *
+ * The scan assigns each allowed, online CPU one placement class and keeps
+ * the best class, so one pass covers every step of the order:
+ *
+ *   0  fully idle physical core in the local LLC
+ *   1  fully idle physical core in the local NUMA node
+ *   2  fully idle physical core in another NUMA node
+ *   3  idle SMT thread in the local LLC
+ *   4  idle SMT thread in the local NUMA node
+ *   5  idle SMT thread in another NUMA node
+ *   6  capacity and depth ranking, with no idle CPU free
+ *
+ * The previous CPU is taken earlier when it is idle, and the idleness
+ * test also claims the CPU. A lost claim falls back to the kernel's idle
+ * picker. Affinity and cpuset limits come from p->cpus_ptr, and an
+ * offline CPU has online == 0 in the seeded topology.
+ */
 s32 BPF_STRUCT_OPS(infinity_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
-	struct inf_task_ctx *tctx;
-	bool		     direct = false;
-	s32		     cpu;
+	const struct cpumask *idle_mask, *core_mask;
+	struct inf_cpu_topo  *lt;
+	struct inf_node_topo *node_row = NULL;
+	struct inf_pick_score best     = { .cpu = -1 };
+	struct inf_pick_score cap      = { .cpu = -1 };
+	struct inf_task_ctx  *tctx;
+	u32		      ncpu, mode, spill;
+	u32		      local_node = 0, local_llc = 0;
+	u32		      nkey;
+	s32		      cpu, local_cpu, this_cpu;
+	bool		      use_smt = !!smt_enabled;
 
-	cpu  = scx_bpf_select_cpu_dfl(p, prev_cpu, wake_flags, &direct);
-
+	/* Remember the fork wakeup for the preemption check. */
 	tctx = inf_task_ctx(p);
 	if (tctx)
 		tctx->wake_fork = !!(wake_flags & SCX_WAKE_FORK);
 
-	return cpu;
+	/* A pinned task has no choice beyond its mask. */
+	if (p->nr_cpus_allowed == 1 || is_migration_disabled(p)) {
+		struct inf_cpu_topo *t = inf_cpu_topo(prev_cpu);
+
+		if (inf_cpu_allowed(p, t, prev_cpu))
+			return prev_cpu;
+		cpu = inf_first_allowed(p, !use_smt);
+		if (cpu >= 0)
+			return cpu;
+		return inf_first_allowed(p, false);
+	}
+
+	/* Previous CPU when it is idle, allowed, and not an SMT sibling. */
+	lt = inf_cpu_topo(prev_cpu);
+	if (inf_cpu_allowed(p, lt, prev_cpu) && (use_smt || lt->core_primary) &&
+	    scx_bpf_test_and_clear_cpu_idle(prev_cpu))
+		return prev_cpu;
+
+	/* Locality anchor: the waker CPU when allowed, else the previous. */
+	this_cpu  = bpf_get_smp_processor_id();
+	local_cpu = -1;
+	lt	  = inf_cpu_topo(this_cpu);
+	if (inf_cpu_allowed(p, lt, this_cpu)) {
+		local_cpu = this_cpu;
+	} else {
+		lt = inf_cpu_topo(prev_cpu);
+		if (inf_cpu_allowed(p, lt, prev_cpu))
+			local_cpu = prev_cpu;
+	}
+	if (local_cpu < 0)
+		local_cpu = inf_first_allowed(p, !use_smt);
+	if (local_cpu < 0)
+		return -1;
+
+	lt = inf_cpu_topo(local_cpu);
+	if (lt) {
+		local_node = lt->node_id;
+		local_llc  = lt->llc_id;
+	}
+
+	if (local_node < INF_MAX_NODES) {
+		nkey	 = local_node;
+		node_row = bpf_map_lookup_elem(&node_topo_stor, &nkey);
+	}
+
+	mode	  = placement_mode;
+	spill	  = spill_threshold ? spill_threshold : 1;
+	ncpu	  = inf_nr_cpu_ids();
+
+	idle_mask = scx_bpf_get_idle_cpumask();
+	core_mask = scx_bpf_get_idle_smtmask();
+
+	bpf_for(cpu, 0, INF_MAX_CPUS)
+	{
+		struct inf_pick_score s;
+		struct inf_cpu_topo  *t;
+		bool		      core_idle, thread_idle;
+		u32		      cls, distance = 0;
+
+		if ((u32)cpu >= ncpu)
+			break;
+		t = inf_cpu_topo(cpu);
+		if (!inf_cpu_allowed(p, t, cpu))
+			continue;
+		if (!use_smt && !t->core_primary)
+			continue;
+
+		core_idle   = bpf_cpumask_test_cpu(cpu, core_mask);
+		thread_idle = bpf_cpumask_test_cpu(cpu, idle_mask);
+
+		if (mode == INF_PLACEMENT_MACHINE) {
+			cls = INF_CLASS_CAPACITY;
+		} else {
+			/*
+			 * A bounded mode never leaves its domain, for an
+			 * idle CPU or for the capacity fallback.
+			 */
+			if (mode == INF_PLACEMENT_LLC && t->llc_id != local_llc)
+				continue;
+			if (mode == INF_PLACEMENT_NUMA &&
+			    t->node_id != local_node)
+				continue;
+
+			if (core_idle) {
+				if (t->llc_id == local_llc)
+					cls = INF_CLASS_IDLE_CORE_LLC;
+				else if (t->node_id == local_node)
+					cls = INF_CLASS_IDLE_CORE_NODE;
+				else
+					cls = INF_CLASS_IDLE_CORE_REMOTE;
+			} else if (thread_idle) {
+				if (t->llc_id == local_llc)
+					cls = INF_CLASS_IDLE_THREAD_LLC;
+				else if (t->node_id == local_node)
+					cls = INF_CLASS_IDLE_THREAD_NODE;
+				else
+					cls = INF_CLASS_IDLE_THREAD_REMOTE;
+			} else {
+				cls = INF_CLASS_CAPACITY;
+			}
+		}
+
+		if (cls == INF_CLASS_IDLE_CORE_REMOTE ||
+		    cls == INF_CLASS_IDLE_THREAD_REMOTE) {
+			if (node_row && t->node_id < INF_MAX_NODES)
+				distance = node_row->distance[t->node_id];
+			else
+				distance = INF_NODE_DISTANCE_FAR;
+		}
+
+		s.cpu	   = cpu;
+		s.cls	   = cls;
+		s.distance = distance;
+		s.capacity = t->capacity;
+		s.depth	   = inf_cpu_depth(cpu);
+
+		if (cls == INF_CLASS_CAPACITY) {
+			if (cap.cpu < 0 || inf_capacity_better(&s, &cap, spill))
+				cap = s;
+		} else {
+			if (best.cpu < 0 || inf_score_better(&s, &best))
+				best = s;
+		}
+	}
+
+	scx_bpf_put_cpumask(core_mask);
+	scx_bpf_put_cpumask(idle_mask);
+
+	if (best.cpu >= 0) {
+		if (scx_bpf_test_and_clear_cpu_idle(best.cpu))
+			return best.cpu;
+
+		/*
+		 * Another CPU claimed the idle bit after the scan. Ask the
+		 * kernel for an idle CPU in the mask instead of returning
+		 * a CPU that is now busy.
+		 */
+		cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr,
+					    use_smt ? 0 : SCX_PICK_IDLE_CORE);
+		if (cpu >= 0)
+			return cpu;
+	}
+
+	if (cap.cpu >= 0)
+		return cap.cpu;
+
+	cpu = inf_first_allowed(p, !use_smt);
+	if (cpu >= 0)
+		return cpu;
+	return local_cpu;
 }
 
 void BPF_STRUCT_OPS(infinity_enqueue, struct task_struct *p, u64 enq_flags)

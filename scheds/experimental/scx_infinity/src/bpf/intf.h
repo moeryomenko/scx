@@ -8,6 +8,10 @@
  * ascending vtime order pops the newest head insert first and a tail
  * insert last. The 7:1 gate and the key ranges are fixed; only the base
  * quantum is a startup setting.
+ *
+ * Placement is locality-first. The loader seeds one topology row per
+ * CPU and one NUMA distance row per node, and the scheduler keeps the
+ * policy in its own map. No shared helper carries it.
  */
 #ifndef __SCX_INFINITY_INTF_H
 #define __SCX_INFINITY_INTF_H
@@ -45,6 +49,30 @@ typedef signed long    s64;
 
 #define INF_MAX_CPUS 1024
 #define INF_MAX_CGROUPS 2048
+#define INF_MAX_NODES 64
+
+/* A CPU id that cannot name a valid CPU, used for a missing SMT sibling. */
+#define INF_NO_CPU 0xffffffffU
+/* Distance reported for a node pair that the loader did not seed. */
+#define INF_NODE_DISTANCE_FAR 1000U
+
+/* Locality-first placement preferences. */
+#define INF_PLACEMENT_AUTO 0U
+#define INF_PLACEMENT_LLC 1U
+#define INF_PLACEMENT_NUMA 2U
+#define INF_PLACEMENT_MACHINE 3U
+
+/*
+ * Placement classes, ordered from the best to the worst. The BPF target
+ * selection and the pure Rust ranking model share these values.
+ */
+#define INF_CLASS_IDLE_CORE_LLC 0U
+#define INF_CLASS_IDLE_CORE_NODE 1U
+#define INF_CLASS_IDLE_CORE_REMOTE 2U
+#define INF_CLASS_IDLE_THREAD_LLC 3U
+#define INF_CLASS_IDLE_THREAD_NODE 4U
+#define INF_CLASS_IDLE_THREAD_REMOTE 5U
+#define INF_CLASS_CAPACITY 6U
 
 /*
  * Weight cap. The kernel task weight is at most 10000 and the cgroup
@@ -67,6 +95,28 @@ struct inf_cpu_ctx {
 	s64 depth;
 	u32 seq;
 	u32 pad;
+};
+
+/*
+ * Scheduler-local CPU topology, seeded by the loader from
+ * scx_utils::Topology before the scheduler is loaded. An entry is valid
+ * only when online is 1; an offline CPU keeps zeroed ancestors and is
+ * never selected.
+ */
+struct inf_cpu_topo {
+	u32 node_id;
+	u32 llc_id;
+	u32 core_id;
+	u32 sibling_cpu;
+	u32 capacity;
+	u32 core_primary;
+	u32 online;
+	u32 pad;
+};
+
+/* NUMA distance row for one node. The key of the map entry is the node. */
+struct inf_node_topo {
+	u32 distance[INF_MAX_NODES];
 };
 
 struct inf_task_ctx {
