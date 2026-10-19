@@ -32,16 +32,19 @@ char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
 
-/* Startup quantum, written by the loader before load. */
-const volatile u64 quantum_ns = INF_QUANTUM_DEFAULT_NS;
 /* Possible CPU count, written by the loader before load. */
 const volatile u32 nr_cpu_ids = 0;
-/* Placement preference, written by the loader before load. */
-const volatile u32 placement_mode = INF_PLACEMENT_AUTO;
-/* Whether an idle SMT thread of a busy core may take new work. */
-const volatile u32 smt_enabled = 1;
-/* Queue depth at which a CPU is considered crowded. */
-const volatile u32 spill_threshold = 4;
+
+/*
+ * Live configuration. The loader replaces the single entry with one map
+ * update, so every reader sees either the old or the new value.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct inf_cfg);
+} cfg_stor SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
@@ -128,6 +131,25 @@ static struct inf_stats *inf_stats(void)
 }
 
 /*
+ * One lookup per decision. The entry is never resized, so the returned
+ * pointer stays valid for the rest of the hook. The compiled-in defaults
+ * cover the window before the loader publishes the first value.
+ */
+static __always_inline struct inf_cfg *inf_cfg(void)
+{
+	u32 key = 0;
+
+	return bpf_map_lookup_elem(&cfg_stor, &key);
+}
+
+static __always_inline u64 inf_cfg_quantum_ns(void)
+{
+	struct inf_cfg *cfg = inf_cfg();
+
+	return cfg ? READ_ONCE(cfg->quantum_ns) : INF_QUANTUM_DEFAULT_NS;
+}
+
+/*
  * Weighted quantum:
  *
  *     q = max(quantum_ns * w / W, 1)
@@ -138,7 +160,7 @@ static struct inf_stats *inf_stats(void)
  */
 static __always_inline u64 inf_quantum(u64 w, u64 total)
 {
-	u64 base = quantum_ns;
+	u64 base = inf_cfg_quantum_ns();
 	u64 q;
 
 	if (w == 0)
@@ -277,9 +299,9 @@ static __always_inline u32 inf_nr_cpu_ids(void)
 
 /*
  * Preempt only a fresh wakeup that took a head slot. The newcomer must be
- * heavier than the running task and the victim must retain at least one
- * preemption reserve of the configured quantum, so a task that is about
- * to expire finishes instead of taking an IPI.
+ * heavier than the running task and the victim must retain at least the
+ * configured preemption margin, so a task that is about to expire
+ * finishes instead of taking an IPI.
  */
 static __always_inline void inf_maybe_preempt(struct task_struct *p, s32 cpu,
 					      u64 enq_flags, bool head, u64 w)
@@ -311,9 +333,11 @@ static __always_inline void inf_maybe_preempt(struct task_struct *p, s32 cpu,
 	if (w <= victim_w)
 		return;
 
-	reserve = quantum_ns / INF_PREEMPT_DIV;
-	if (!reserve)
-		reserve = 1;
+	{
+		struct inf_cfg *cfg = inf_cfg();
+
+		reserve = cfg ? READ_ONCE(cfg->preempt_margin_ns) : 0;
+	}
 	if (READ_ONCE(victim->scx.slice) < reserve)
 		return;
 
@@ -445,6 +469,7 @@ s32 BPF_STRUCT_OPS(infinity_select_cpu, struct task_struct *p, s32 prev_cpu,
 {
 	const struct cpumask *idle_mask, *core_mask;
 	struct inf_cpu_topo  *lt;
+	struct inf_cfg	     *cfg;
 	struct inf_node_topo *node_row = NULL;
 	struct inf_pick_score best     = { .cpu = -1 };
 	struct inf_pick_score cap      = { .cpu = -1 };
@@ -453,7 +478,13 @@ s32 BPF_STRUCT_OPS(infinity_select_cpu, struct task_struct *p, s32 prev_cpu,
 	u32		      local_node = 0, local_llc = 0;
 	u32		      nkey;
 	s32		      cpu, local_cpu, this_cpu;
-	bool		      use_smt = !!smt_enabled;
+	bool		      use_smt;
+
+	/* Sample the live placement preferences once for this decision. */
+	cfg	= inf_cfg();
+	use_smt = !cfg || cfg->smt_enabled;
+	mode	= cfg ? cfg->placement_mode : INF_PLACEMENT_AUTO;
+	spill	= cfg && cfg->spill_threshold ? cfg->spill_threshold : 1;
 
 	/* Remember the fork wakeup for the preemption check. */
 	tctx = inf_task_ctx(p);
@@ -505,8 +536,6 @@ s32 BPF_STRUCT_OPS(infinity_select_cpu, struct task_struct *p, s32 prev_cpu,
 		node_row = bpf_map_lookup_elem(&node_topo_stor, &nkey);
 	}
 
-	mode	  = placement_mode;
-	spill	  = spill_threshold ? spill_threshold : 1;
 	ncpu	  = inf_nr_cpu_ids();
 
 	idle_mask = scx_bpf_get_idle_cpumask();
@@ -593,14 +622,20 @@ s32 BPF_STRUCT_OPS(infinity_select_cpu, struct task_struct *p, s32 prev_cpu,
 			return best.cpu;
 
 		/*
-		 * Another CPU claimed the idle bit after the scan. Ask the
-		 * kernel for an idle CPU in the mask instead of returning
-		 * a CPU that is now busy.
+		 * Another CPU claimed the idle bit after the scan. In the
+		 * unbounded modes ask the kernel for another idle CPU. A
+		 * bounded mode keeps the scanned CPU, because the helper
+		 * ignores the LLC and node bounds, and this CPU is still
+		 * allowed even if it is no longer idle.
 		 */
-		cpu = scx_bpf_pick_idle_cpu(p->cpus_ptr,
-					    use_smt ? 0 : SCX_PICK_IDLE_CORE);
-		if (cpu >= 0)
-			return cpu;
+		if (mode == INF_PLACEMENT_AUTO ||
+		    mode == INF_PLACEMENT_MACHINE) {
+			cpu = scx_bpf_pick_idle_cpu(
+				p->cpus_ptr, use_smt ? 0 : SCX_PICK_IDLE_CORE);
+			if (cpu >= 0)
+				return cpu;
+		}
+		return best.cpu;
 	}
 
 	if (cap.cpu >= 0)

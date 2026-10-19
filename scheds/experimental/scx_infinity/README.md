@@ -30,8 +30,11 @@ The core policy is a bounded last-in-first-out queue:
   `cpu.weight` when the running kernel exposes `scx_bpf_task_cgroup()`.
   A cgroup in `cpu.idle` mode gets the `SCHED_IDLE` weight of 3.
 - A fresh wakeup preempts only when it is heavier than the running task
-  and the victim retains at least one preemption reserve of the quantum.
+  and the victim retains at least the configured preemption margin.
   Yield forfeits the remaining slice and re-enters at the tail.
+
+The queue order, the 7:1 gate and the slice-expiry rules are fixed. Only
+the settings below can change at run time.
 
 ## Placement
 
@@ -56,27 +59,77 @@ carry none of it.
 ## Usage
 
 ```
-scx_infinity [--exit-dump-len N] [--quantum-us N] [--placement MODE]
-             [--no-smt] [--spill-threshold N] [--verbose] [--version]
+scx_infinity [--config PATH] [--exit-dump-len N] [--quantum-us N]
+             [--placement MODE] [--no-smt] [--spill-threshold N]
+             [--preempt-margin-us N] [--verbose] [--version]
 ```
 
+- `--config PATH`: read this TOML file instead of the default XDG path.
 - `--exit-dump-len N`: exit debug dump buffer length, 0 selects the
   default.
 - `--quantum-us N`: base quantum in microseconds, 100 to 4000, default
-  1000 (1 ms).
+  1000 (1 ms). Overrides the file.
 - `--placement MODE`: `auto` (default) walks the full order. `llc`
   stops at the local LLC, `numa` stops at the local NUMA node, and
   `machine` skips locality and ranks every allowed CPU by capacity and
-  depth.
+  depth. Overrides the file.
 - `--no-smt`: never place new work on an SMT sibling of a busy core
-  while a primary thread is available.
+  while a primary thread is available. Overrides the file.
 - `--spill-threshold N`: queue depth at which a CPU is considered
   crowded, 1 to 64, default 4. The capacity fallback prefers a CPU below
-  the threshold.
+  the threshold. Overrides the file.
+- `--preempt-margin-us N`: minimum remaining victim slice for a wakeup
+  preemption, 0 to 1000. Default 100. Overrides the file.
 - `--verbose`: enable libbpf and loader diagnostics.
 - `--version`: print the scheduler version and exit.
 
 Run it as root. Press Ctrl-C to unregister the scheduler.
+
+## Configuration
+
+The loader reads:
+
+```
+$XDG_CONFIG_HOME/scx_infinity/config.toml
+```
+
+If `XDG_CONFIG_HOME` is unset, empty or not absolute, the path is:
+
+```
+$HOME/.config/scx_infinity/config.toml
+```
+
+`--config PATH` overrides the path. A missing file is not an error: it
+means the built-in defaults apply. A command-line value wins over the
+file. Unknown keys and out-of-range values reject the entire file.
+
+```toml
+# scx_infinity configuration
+quantum_ns = 1000000        # 100_000 ..= 4_000_000
+placement = "auto"          # "auto" | "llc" | "numa" | "machine"
+smt = true                  # false: physical cores only
+preempt_margin_ns = 100000  # 0 ..= 1_000_000
+spill_threshold = 4         # 1 ..= 64
+stats_interval_ms = 1000    # 0 disables the stats line
+```
+
+The file is validated as a whole before any value is applied. All errors
+are reported in one message, and a rejected file changes nothing.
+
+## Reload
+
+Send `SIGHUP` to reread the same path:
+
+```
+kill -HUP $(pidof scx_infinity)
+```
+
+The loader parses and validates the new file, applies the command-line
+overrides again, and publishes the result with one BPF map update. An
+override therefore persists across a reload. If parsing or validation
+fails, the error is logged, the active settings stay live, and the
+scheduler keeps running. The queue order and expiry mechanics never
+change on reload.
 
 ## Statistics
 

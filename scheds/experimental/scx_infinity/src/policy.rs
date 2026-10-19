@@ -13,15 +13,18 @@
 
 /// Infinity base quantum, 1 ms.
 pub const QUANTUM_DEFAULT_NS: u64 = 1_000_000;
-/// Lowest accepted startup quantum, 100 us.
+/// Lowest accepted quantum, 100 us.
 pub const QUANTUM_MIN_NS: u64 = 100_000;
-/// Highest accepted startup quantum, 4 ms.
+/// Highest accepted quantum, 4 ms.
 pub const QUANTUM_MAX_NS: u64 = 4_000_000;
+
+/// Default preemption margin, 100 us.
+pub const PREEMPT_MARGIN_DEFAULT_NS: u64 = 100_000;
+/// Highest accepted preemption margin, 1 ms.
+pub const PREEMPT_MARGIN_MAX_NS: u64 = 1_000_000;
 
 /// One tail insert in every eight regular enqueues.
 pub const GATE_MASK: u32 = 7;
-/// The preemption reserve is one eighth of the configured quantum.
-pub const PREEMPT_DIV: u64 = 8;
 /// Weight cap mirrored by the BPF core.
 pub const WEIGHT_CAP: u64 = 1 << 32;
 
@@ -88,20 +91,15 @@ pub fn effective_weight(base: u32, group_weight: u32, idle: bool) -> u64 {
     ((base * group + 50) / 100).max(1)
 }
 
-/// The victim must retain at least this much slice before a preemption.
-pub fn preempt_reserve_ns(base: u64) -> u64 {
-    (base / PREEMPT_DIV).max(1)
-}
-
 /// A fresh wakeup preempts only when it is heavier than the running task
-/// and the victim still retains the preemption reserve.
+/// and the victim still retains the configured preemption margin.
 pub fn should_preempt(
     newcomer_weight: u64,
     victim_weight: u64,
     victim_slice: u64,
-    base: u64,
+    preempt_margin_ns: u64,
 ) -> bool {
-    newcomer_weight > victim_weight && victim_slice >= preempt_reserve_ns(base)
+    newcomer_weight > victim_weight && victim_slice >= preempt_margin_ns
 }
 
 #[cfg(test)]
@@ -118,6 +116,14 @@ mod tests {
         assert_eq!(QUANTUM_MAX_NS, crate::bpf_intf::INF_QUANTUM_MAX_NS as u64);
         assert_eq!(GATE_MASK, crate::bpf_intf::INF_GATE_MASK);
         assert_eq!(WEIGHT_CAP, crate::bpf_intf::INF_WEIGHT_CAP as u64);
+        assert_eq!(
+            PREEMPT_MARGIN_DEFAULT_NS,
+            crate::bpf_intf::INF_PREEMPT_MARGIN_DEFAULT_NS as u64
+        );
+        assert_eq!(
+            PREEMPT_MARGIN_MAX_NS,
+            crate::bpf_intf::INF_PREEMPT_MARGIN_MAX_NS as u64
+        );
     }
 
     #[test]
@@ -189,14 +195,10 @@ mod tests {
 
     #[test]
     fn preemption_needs_a_heavier_newcomer_and_a_live_victim() {
-        let base = QUANTUM_DEFAULT_NS;
-        assert!(should_preempt(200, 100, preempt_reserve_ns(base), base));
-        assert!(!should_preempt(100, 200, base, base));
-        assert!(!should_preempt(
-            200,
-            100,
-            preempt_reserve_ns(base) - 1,
-            base
-        ));
+        let margin = PREEMPT_MARGIN_DEFAULT_NS;
+        assert!(should_preempt(200, 100, margin, margin));
+        assert!(!should_preempt(100, 200, QUANTUM_DEFAULT_NS, margin));
+        assert!(!should_preempt(200, 100, margin - 1, margin));
+        assert!(should_preempt(200, 100, 1, 0));
     }
 }

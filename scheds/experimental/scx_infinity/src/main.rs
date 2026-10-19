@@ -8,11 +8,14 @@
 mod bpf_skel;
 pub use bpf_skel::*;
 pub mod bpf_intf;
+mod config;
 mod placement;
 mod policy;
+mod reload;
 mod topology;
 
 use std::mem::MaybeUninit;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -22,12 +25,12 @@ use std::time::Instant;
 use anyhow::Context;
 use anyhow::Result;
 use clap::Parser;
+use config::LiveConfig;
+use config::Overrides;
 use libbpf_rs::MapCore;
+use log::error;
 use log::info;
 use placement::PlacementMode;
-use placement::SPILL_THRESHOLD_DEFAULT;
-use placement::SPILL_THRESHOLD_MAX;
-use placement::SPILL_THRESHOLD_MIN;
 use scx_utils::NR_CPU_IDS;
 use scx_utils::Topology;
 use scx_utils::UserExitInfo;
@@ -40,7 +43,7 @@ use scx_utils::uei_exited;
 use scx_utils::uei_report;
 
 const SCHEDULER_NAME: &str = "scx_infinity";
-const STATS_INTERVAL: Duration = Duration::from_secs(1);
+const STATS_INTERVAL: Duration = Duration::from_millis(100);
 
 /// scx_infinity: experimental sched_ext scheduler.
 ///
@@ -48,33 +51,41 @@ const STATS_INTERVAL: Duration = Duration::from_secs(1);
 /// seven head inserts and one tail insert per eight regular enqueues,
 /// fresh wakeups enter at the head, and expiry, requeue, forced progress
 /// and yield enter at the tail.
+///
+/// The TOML file at $XDG_CONFIG_HOME/scx_infinity/config.toml (or
+/// $HOME/.config/scx_infinity/config.toml) holds the base quantum and the
+/// placement preferences. A command-line value overrides the file. The
+/// file is reloaded on SIGHUP; an invalid file is rejected as a whole and
+/// the active settings stay live.
 #[derive(Debug, Parser)]
 struct Opts {
     /// Exit debug dump buffer length. 0 indicates default.
     #[clap(long, default_value = "0")]
     exit_dump_len: u32,
 
-    /// Infinity base quantum in microseconds.
-    #[clap(long, default_value_t = policy::QUANTUM_DEFAULT_NS / 1000)]
-    quantum_us: u64,
+    /// Configuration file. Overrides the default XDG path.
+    #[clap(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// Infinity base quantum in microseconds, 100 to 4000.
+    #[clap(long, value_name = "N")]
+    quantum_us: Option<u64>,
 
     /// Placement preference: auto, llc, numa or machine.
-    #[clap(long, value_enum, default_value_t = PlacementMode::Auto)]
-    placement: PlacementMode,
+    #[clap(long, value_enum)]
+    placement: Option<PlacementMode>,
 
     /// Do not place new work on an SMT sibling of a busy core.
     #[clap(long, action = clap::ArgAction::SetTrue)]
     no_smt: bool,
 
-    /// Queue depth at which a CPU is considered crowded.
-    #[clap(
-        long,
-        default_value_t = SPILL_THRESHOLD_DEFAULT,
-        value_parser = clap::value_parser!(u32).range(
-            SPILL_THRESHOLD_MIN as i64..=SPILL_THRESHOLD_MAX as i64
-        )
-    )]
-    spill_threshold: u32,
+    /// Queue depth at which a CPU is considered crowded, 1 to 64.
+    #[clap(long, value_name = "N")]
+    spill_threshold: Option<u32>,
+
+    /// Minimum remaining slice of a preemption victim, in microseconds.
+    #[clap(long, value_name = "N")]
+    preempt_margin_us: Option<u64>,
 
     /// Enable verbose output, including libbpf details.
     #[clap(short = 'v', long, action = clap::ArgAction::SetTrue)]
@@ -85,14 +96,67 @@ struct Opts {
     version: bool,
 }
 
+impl Opts {
+    /// The command-line values that override the configuration file.
+    fn overrides(&self) -> Overrides {
+        Overrides {
+            quantum_us: self.quantum_us,
+            placement: self.placement,
+            no_smt: self.no_smt,
+            preempt_margin_us: self.preempt_margin_us,
+            spill_threshold: self.spill_threshold,
+        }
+    }
+}
+
+fn describe(config: &LiveConfig) -> String {
+    format!(
+        "quantum_ns={} placement={:?} smt={} preempt_margin_ns={} spill_threshold={} stats_interval_ms={}",
+        config.quantum_ns,
+        config.placement,
+        config.smt,
+        config.preempt_margin_ns,
+        config.spill_threshold,
+        config.stats_interval_ms,
+    )
+}
+
+/// Publish one configuration with a single map update.
+///
+/// The BPF side reads the entry with one lookup per decision, so a reader
+/// sees either the whole old value or the whole new one. The map is never
+/// resized.
+fn write_config(skel: &mut BpfSkel<'_>, config: &LiveConfig, generation: u32) -> Result<()> {
+    let value = config.to_bpf(generation);
+    /* SAFETY: the value is a plain C-layout struct and its length is exact. */
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            std::ptr::addr_of!(value) as *const u8,
+            std::mem::size_of::<bpf_intf::inf_cfg>(),
+        )
+    };
+    let key = 0u32.to_ne_bytes();
+
+    skel.maps
+        .cfg_stor
+        .update(&key, bytes, libbpf_rs::MapFlags::ANY)
+        .context("failed to publish the live configuration")
+}
+
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
+    config_path: Option<PathBuf>,
+    overrides: Overrides,
+    live: LiveConfig,
+    generation: u32,
 }
 
 impl<'a> Scheduler<'a> {
     fn init(
         opts: &'a Opts,
+        live: LiveConfig,
+        config_path: Option<PathBuf>,
         open_object: &'a mut MaybeUninit<libbpf_rs::OpenObject>,
     ) -> Result<Self> {
         try_set_rlimit_infinity();
@@ -104,12 +168,12 @@ impl<'a> Scheduler<'a> {
         );
 
         let topo = Topology::new().context("failed to read the host topology")?;
-        let smt_enabled = !opts.no_smt && topo.smt_enabled;
+        let smt_enabled = live.smt && topo.smt_enabled;
         info!(
             "Placement: {:?}, SMT {}, spill threshold {}",
-            opts.placement,
+            live.placement,
             if smt_enabled { "on" } else { "off" },
-            opts.spill_threshold
+            live.spill_threshold
         );
 
         let mut skel_builder = BpfSkelBuilder::default();
@@ -118,30 +182,63 @@ impl<'a> Scheduler<'a> {
 
         skel.struct_ops.infinity_ops_mut().exit_dump_len = opts.exit_dump_len;
 
-        let quantum_ns = policy::quantum_us_to_ns(opts.quantum_us).map_err(anyhow::Error::msg)?;
         let rodata = skel
             .maps
             .rodata_data
             .as_mut()
             .context("BPF rodata is missing")?;
-        rodata.quantum_ns = quantum_ns;
         rodata.nr_cpu_ids = (*NR_CPU_IDS)
             .try_into()
             .context("CPU count does not fit in u32")?;
-        rodata.placement_mode = opts.placement.as_u32();
-        rodata.smt_enabled = u32::from(smt_enabled);
-        rodata.spill_threshold = opts.spill_threshold;
-        info!("Infinity quantum: {quantum_ns} ns");
 
         let mut skel = scx_ops_load!(skel, infinity_ops, uei)?;
         topology::seed(&mut skel, &topo)?;
+        write_config(&mut skel, &live, 1)?;
         let struct_ops = Some(scx_ops_attach!(skel, infinity_ops)?);
 
-        Ok(Self { skel, struct_ops })
+        info!("Infinity configuration: {}", describe(&live));
+
+        Ok(Self {
+            skel,
+            struct_ops,
+            config_path,
+            overrides: opts.overrides(),
+            live,
+            generation: 1,
+        })
     }
 
     fn exited(&self) -> bool {
         uei_exited!(&self.skel, uei)
+    }
+
+    /// Reload the configuration file and publish it when it is valid.
+    ///
+    /// The command-line overrides are applied again, so they persist
+    /// across a reload. A rejected file logs the error and leaves the
+    /// active configuration in place.
+    fn reload_config(&mut self) {
+        let path = self.config_path.clone();
+        let overrides = self.overrides;
+        let generation = self.generation.wrapping_add(1);
+        let skel = &mut self.skel;
+
+        match reload::reload(path.as_deref(), &overrides, |config| {
+            write_config(skel, config, generation)
+        }) {
+            Ok(config) => {
+                self.live = config;
+                self.generation = generation;
+                info!(
+                    "Configuration reloaded (generation {}): {}",
+                    generation,
+                    describe(&self.live)
+                );
+            }
+            Err(err) => {
+                error!("Configuration reload failed, keeping the active settings: {err:#}");
+            }
+        }
     }
 
     fn log_stats(&self) {
@@ -200,12 +297,22 @@ impl<'a> Scheduler<'a> {
         );
     }
 
-    fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<UserExitInfo> {
+    fn run(
+        &mut self,
+        shutdown: Arc<AtomicBool>,
+        reload_flag: Arc<AtomicBool>,
+    ) -> Result<UserExitInfo> {
         let mut last_stats = Instant::now();
 
         while !shutdown.load(Ordering::Relaxed) && !self.exited() {
-            std::thread::sleep(Duration::from_millis(100));
-            if last_stats.elapsed() >= STATS_INTERVAL {
+            std::thread::sleep(STATS_INTERVAL);
+
+            if reload_flag.swap(false, Ordering::Relaxed) {
+                self.reload_config();
+            }
+
+            let interval = Duration::from_millis(self.live.stats_interval_ms);
+            if !interval.is_zero() && last_stats.elapsed() >= interval {
                 self.log_stats();
                 last_stats = Instant::now();
             }
@@ -242,6 +349,18 @@ fn main() -> Result<()> {
         simplelog::ColorChoice::Auto,
     )?;
 
+    let overrides = opts.overrides();
+    let config_path = config::resolve_path(opts.config.as_deref());
+    match &config_path {
+        Some(path) => info!("Configuration file: {}", path.display()),
+        None => info!(
+            "Configuration file: no usable path ({} or {}), the built-in defaults apply",
+            config::CONFIG_PATH,
+            config::CONFIG_PATH_FALLBACK
+        ),
+    }
+    let live = config::load_resolved(config_path.as_deref(), &overrides)?;
+
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
     ctrlc::set_handler(move || {
@@ -249,9 +368,11 @@ fn main() -> Result<()> {
     })
     .context("Error setting Ctrl-C handler")?;
 
+    let reload_flag = reload::install_reload_flag()?;
+
     let mut open_object = MaybeUninit::uninit();
-    let mut sched = Scheduler::init(&opts, &mut open_object)?;
-    sched.run(shutdown)?;
+    let mut sched = Scheduler::init(&opts, live, config_path, &mut open_object)?;
+    sched.run(shutdown, reload_flag)?;
     info!("{} scheduler exited", SCHEDULER_NAME);
 
     Ok(())
@@ -267,18 +388,25 @@ mod tests {
             Opts::try_parse_from(["scx_infinity", "--exit-dump-len", "4096", "--verbose"]).unwrap();
 
         assert_eq!(opts.exit_dump_len, 4096);
-        assert_eq!(opts.quantum_us, policy::QUANTUM_DEFAULT_NS / 1000);
         assert!(opts.verbose);
         assert!(!opts.version);
     }
 
     #[test]
-    fn cli_parses_quantum_us() {
-        let opts = Opts::try_parse_from(["scx_infinity", "--quantum-us", "2000"]).unwrap();
+    fn cli_without_an_option_leaves_no_override() {
+        let opts = Opts::try_parse_from(["scx_infinity"]).unwrap();
 
-        assert_eq!(opts.quantum_us, 2000);
+        assert_eq!(opts.overrides(), Overrides::default());
+    }
+
+    #[test]
+    fn cli_parses_quantum_us_into_an_override() {
+        let opts = Opts::try_parse_from(["scx_infinity", "--quantum-us", "2000"]).unwrap();
+        let overrides = opts.overrides();
+
+        assert_eq!(overrides.quantum_us, Some(2000));
         assert_eq!(
-            policy::quantum_us_to_ns(opts.quantum_us).unwrap(),
+            policy::quantum_us_to_ns(overrides.quantum_us.unwrap()).unwrap(),
             2_000_000
         );
     }
@@ -292,18 +420,32 @@ mod tests {
             "--no-smt",
             "--spill-threshold",
             "8",
+            "--preempt-margin-us",
+            "250",
         ])
         .unwrap();
+        let overrides = opts.overrides();
 
-        assert_eq!(opts.placement, PlacementMode::Numa);
-        assert!(opts.no_smt);
-        assert_eq!(opts.spill_threshold, 8);
+        assert_eq!(overrides.placement, Some(PlacementMode::Numa));
+        assert!(overrides.no_smt);
+        assert_eq!(overrides.spill_threshold, Some(8));
+        assert_eq!(overrides.preempt_margin_us, Some(250));
     }
 
     #[test]
-    fn cli_rejects_an_out_of_range_spill_threshold() {
-        assert!(Opts::try_parse_from(["scx_infinity", "--spill-threshold", "0"]).is_err());
-        assert!(Opts::try_parse_from(["scx_infinity", "--spill-threshold", "65"]).is_err());
+    fn cli_parses_a_config_path() {
+        let opts =
+            Opts::try_parse_from(["scx_infinity", "--config", "/etc/infinity.toml"]).unwrap();
+
+        assert_eq!(opts.config, Some(PathBuf::from("/etc/infinity.toml")));
+        assert_eq!(
+            config::resolve_path(opts.config.as_deref()),
+            Some(PathBuf::from("/etc/infinity.toml"))
+        );
+    }
+
+    #[test]
+    fn cli_rejects_a_bad_placement() {
         assert!(Opts::try_parse_from(["scx_infinity", "--placement", "bad"]).is_err());
     }
 }

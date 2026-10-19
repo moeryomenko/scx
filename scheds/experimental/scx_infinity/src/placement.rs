@@ -13,6 +13,7 @@
 #![allow(dead_code)]
 
 use clap::ValueEnum;
+use serde::Deserialize;
 
 /// Default queue depth at which a CPU is considered crowded.
 pub const SPILL_THRESHOLD_DEFAULT: u32 = 4;
@@ -22,7 +23,11 @@ pub const SPILL_THRESHOLD_MIN: u32 = 1;
 pub const SPILL_THRESHOLD_MAX: u32 = 64;
 
 /// Placement preference. `Auto` walks the full locality order.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+///
+/// The TOML spelling is the lowercase name, so a configuration file uses
+/// `placement = "llc"`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, ValueEnum)]
+#[serde(rename_all = "lowercase")]
 pub enum PlacementMode {
     #[default]
     Auto,
@@ -32,7 +37,7 @@ pub enum PlacementMode {
 }
 
 impl PlacementMode {
-    /// Value written to the BPF `placement_mode` rodata field.
+    /// Value written to the BPF `inf_cfg` placement field.
     pub const fn as_u32(self) -> u32 {
         match self {
             Self::Auto => 0,

@@ -6,8 +6,9 @@
  * sequence key gives the DSQ bounded-LIFO order: a head insert takes the
  * next key below INF_KEY_MID, a tail insert the next key above it, so the
  * ascending vtime order pops the newest head insert first and a tail
- * insert last. The 7:1 gate and the key ranges are fixed; only the base
- * quantum is a startup setting.
+ * insert last. The 7:1 gate and the key ranges are fixed. The base
+ * quantum and the placement preferences live in `struct inf_cfg` and a
+ * SIGHUP reload replaces them.
  *
  * Placement is locality-first. The loader seeds one topology row per
  * CPU and one NUMA distance row per node, and the scheduler keeps the
@@ -31,6 +32,10 @@ typedef signed long    s64;
 #define INF_QUANTUM_DEFAULT_NS 1000000ULL
 #define INF_QUANTUM_MIN_NS 100000ULL
 #define INF_QUANTUM_MAX_NS 4000000ULL
+
+#define INF_PREEMPT_MARGIN_DEFAULT_NS 100000ULL
+#define INF_PREEMPT_MARGIN_MAX_NS 1000000ULL
+#define INF_STATS_INTERVAL_DEFAULT_MS 1000ULL
 
 /* Copy of SCHED_NORMAL, SCHED_IDLE and SCHED_EXT from uapi/linux/sched.h. */
 #define INF_SCHED_NORMAL 0
@@ -83,10 +88,18 @@ typedef signed long    s64;
 #define INF_WEIGHT_CAP (1ULL << 32)
 
 /*
- * A victim that has less than one eighth of the configured quantum left
- * is about to expire, so it finishes instead of taking a preemption IPI.
+ * Live configuration. The loader owns the single array entry and replaces
+ * it with one map update, so the BPF side never observes a partial
+ * configuration. Queue order and expiry stay compile-time constants.
  */
-#define INF_PREEMPT_DIV 8ULL
+struct inf_cfg {
+	u64 quantum_ns;
+	u64 preempt_margin_ns;
+	u32 placement_mode;
+	u32 smt_enabled;
+	u32 spill_threshold;
+	u32 generation;
+};
 
 struct inf_cpu_ctx {
 	u64 head_seq;

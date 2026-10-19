@@ -6123,7 +6123,9 @@ dependencies = [
  "scx_stats_derive",
  "scx_utils",
  "serde",
+ "signal-hook 0.4.5",
  "simplelog",
+ "toml",
 ]
 
 [[package]]
