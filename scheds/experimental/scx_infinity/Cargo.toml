@@ -7,6 +7,11 @@ rust-version = "1.91"
 description = "Experimental bounded-LIFO sched_ext scheduler for the Infinity fair policy."
 license = "GPL-2.0-only"
 
+[features]
+default = []
+# Prototype: replace the EDQ ready queue with an intrusive FIFO list.
+queue-list = []
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env", "unicode", "wrap_help"] }

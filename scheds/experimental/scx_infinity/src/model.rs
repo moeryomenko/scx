@@ -5,407 +5,784 @@
 // This software may be used and distributed according to the terms of the
 // GNU General Public License version 2.
 
-//! Pure queue model for the tests.
+//! Shared model for both ready-queue prototypes.
 //!
-//! The BPF core keeps one vtime-ordered DSQ per CPU. A head insert takes a
-//! key below `INF_KEY_MID`, a tail insert a key above it, and the core pops
-//! the lowest key. `VecDeque` reproduces the same order: head inserts go to
-//! the front, tail inserts to the back, and dispatch pops the front. This
-//! module checks queue progress, weight accounting and slice expiry without
-//! a kernel. It builds only for tests.
+//! The BPF core keeps one scheduler-owned queue per CPU. A head insert
+//! takes a key below `KEY_MID`, a tail insert a key above it, and dispatch
+//! pops the lowest head. Two implementations are modelled:
+//!
+//! - [`EdqModel`] orders by `(key, insertion)`, mirroring `scx_edq`.
+//! - [`ListModel`] is an intrusive FIFO list: a head key pushes to the
+//!   front and a tail key to the back.
+//!
+//! Both are driven through [`IntrusiveQueue`], so one test suite covers the
+//! ordering, the 7:1 gate, exact removal, yield-to, queued reweight, peer
+//! steal, a stale pop and the task lifetime. The tests run for both
+//! implementations in the default test build.
+//!
+//! This module builds only for tests.
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::collections::VecDeque;
 
 use crate::policy::gate_tail;
 
-/// Where an enqueue puts the task.
+/// Head keys count down from this value and tail keys count up from it.
+pub const KEY_MID: u64 = 1 << 62;
+/// One steal tier scans at most this many eligible peers.
+pub const STEAL_MAX_PEERS: usize = 8;
+
+/// Where an insert puts the new item.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Insert {
+pub enum Position {
     Head,
     Tail,
 }
 
-/// Replica of the enqueue decision in `inf_enqueue_common()`.
-///
-/// The order is the same as the BPF core: a core head hint wins, an expiry
-/// or a requeue rotates to the tail, and every other arrival, including a
-/// wakeup, passes the 7:1 gate.
-pub fn classify_enqueue(
-    slice: u64,
-    wake: bool,
-    head_flag: bool,
-    reenq: bool,
-    last: bool,
-    preempt: bool,
-    seq: u32,
-) -> Insert {
-    let expired = slice == 0 && !wake && !head_flag;
+/// One queued task as the queue sees it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Item {
+    pub id: u64,
+    pub key: u64,
+    pub weight: u64,
+    pub slice: u64,
+}
 
-    if head_flag {
-        Insert::Head
-    } else if expired || reenq || last || preempt {
-        Insert::Tail
-    } else if gate_tail(seq) {
-        Insert::Tail
-    } else {
-        Insert::Head
+/// The queue contract the two prototypes share.
+pub trait IntrusiveQueue {
+    /// Insert a new item. Returns false when the id is already queued.
+    fn insert(&mut self, item: Item, position: Position) -> bool;
+    /// Remove one exact item by id.
+    fn remove(&mut self, id: u64) -> Option<Item>;
+    /// Pop the head.
+    fn pop(&mut self) -> Option<Item>;
+    /// Id of the head item, without removing it.
+    fn peek_id(&self) -> Option<u64>;
+    /// Position from the head. Zero runs next.
+    fn rank(&self, id: u64) -> Option<usize>;
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct Item {
-    id: u64,
-    weight: u64,
-}
-
-/// A single per-CPU queue with the weight counters of `struct inf_cpu_ctx`.
+/// `scx_edq`: order by the scheduler key, then by insertion sequence.
 #[derive(Debug, Default)]
-pub struct QueueModel {
-    items: VecDeque<Item>,
-    pub head_inserts: u64,
-    pub tail_inserts: u64,
-    pub exempt_inserts: u64,
-    pub expiries: u64,
-    /// Signed so a test can detect an accounting underflow.
-    pub w_sum: i64,
-    pub seq: u32,
+pub struct EdqModel {
+    items: Vec<Item>,
+    seq: u64,
 }
 
-impl QueueModel {
-    pub fn new() -> Self {
-        Self::default()
+impl IntrusiveQueue for EdqModel {
+    fn insert(&mut self, item: Item, _position: Position) -> bool {
+        if self.items.iter().any(|queued| queued.id == item.id) {
+            return false;
+        }
+        self.seq = self.seq.wrapping_add(1);
+        let at = self.items.partition_point(|queued| queued.key < item.key);
+        self.items.insert(at, item);
+        true
     }
 
-    fn push(&mut self, id: u64, weight: u64, insert: Insert, exempt: bool) {
-        let item = Item { id, weight };
+    fn remove(&mut self, id: u64) -> Option<Item> {
+        let at = self.items.iter().position(|item| item.id == id)?;
+        Some(self.items.remove(at))
+    }
 
-        match insert {
-            Insert::Head => self.items.push_front(item),
-            Insert::Tail => self.items.push_back(item),
-        }
-        self.w_sum += weight as i64;
-        if exempt {
-            self.exempt_inserts += 1;
-        } else if insert == Insert::Head {
-            self.head_inserts += 1;
+    fn pop(&mut self) -> Option<Item> {
+        if self.items.is_empty() {
+            None
         } else {
-            self.tail_inserts += 1;
+            Some(self.items.remove(0))
         }
     }
 
-    /// A gated arrival. The sequence advances only on this path, as in the
-    /// BPF core.
-    pub fn enqueue_regular(&mut self, id: u64, weight: u64) -> Insert {
-        let seq = self.seq;
-        self.seq = self.seq.wrapping_add(1);
-        let insert = classify_enqueue(1, false, false, false, false, false, seq);
-        self.push(id, weight, insert, false);
-        insert
+    fn peek_id(&self) -> Option<u64> {
+        self.items.first().map(|item| item.id)
     }
 
-    /// A wakeup. It is not exempt: it advances the gate sequence and can
-    /// take either the head or the tail slot. A zero slice does not turn a
-    /// wakeup into an expiry.
-    pub fn enqueue_wakeup(&mut self, id: u64, weight: u64) -> Insert {
-        let seq = self.seq;
-        self.seq = self.seq.wrapping_add(1);
-        let insert = classify_enqueue(0, true, false, false, false, false, seq);
-        self.push(id, weight, insert, false);
-        insert
-    }
-
-    /// An expiry, a requeue or a yield hand-back, which is exempt and takes
-    /// the tail.
-    pub fn enqueue_expired(&mut self, id: u64, weight: u64) {
-        self.expiries += 1;
-        self.push(id, weight, Insert::Tail, true);
-    }
-
-    /// Remove a queued task and reinsert it at the tail, as slice expiry
-    /// does through `ops.enqueue()` with a zero slice.
-    pub fn rotate_to_tail(&mut self, id: u64) -> bool {
-        let Some(index) = self.items.iter().position(|item| item.id == id) else {
-            return false;
-        };
-        let item = self.items.remove(index).unwrap();
-        self.w_sum -= item.weight as i64;
-        self.expiries += 1;
-        self.push(id, item.weight, Insert::Tail, true);
-        true
-    }
-
-    /// Replace the weight of a queued task, as `ops.set_weight()` does.
-    pub fn set_weight(&mut self, id: u64, weight: u64) -> bool {
-        let Some(item) = self.items.iter_mut().find(|item| item.id == id) else {
-            return false;
-        };
-        self.w_sum += weight as i64 - item.weight as i64;
-        item.weight = weight;
-        true
-    }
-
-    /// Pop the queue head, as `ops.dispatch()` does.
-    pub fn pop(&mut self) -> Option<(u64, u64)> {
-        let item = self.items.pop_front()?;
-        self.w_sum -= item.weight as i64;
-        Some((item.id, item.weight))
-    }
-
-    /// Position from the head. Zero is the next task to run.
-    pub fn rank(&self, id: u64) -> Option<usize> {
+    fn rank(&self, id: u64) -> Option<usize> {
         self.items.iter().position(|item| item.id == id)
     }
 
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.items.len()
     }
+}
 
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+/// The queue-list prototype: an intrusive FIFO list ordered by insert
+/// side. A head key pushes to the front, a tail key to the back.
+#[derive(Debug, Default)]
+pub struct ListModel {
+    items: VecDeque<Item>,
+}
+
+impl IntrusiveQueue for ListModel {
+    fn insert(&mut self, item: Item, position: Position) -> bool {
+        if self.items.iter().any(|queued| queued.id == item.id) {
+            return false;
+        }
+        match position {
+            Position::Head => self.items.push_front(item),
+            Position::Tail => self.items.push_back(item),
+        }
+        true
     }
 
-    pub fn drain(&mut self) -> Vec<u64> {
-        let mut order = Vec::with_capacity(self.items.len());
-        while let Some((id, _)) = self.pop() {
-            order.push(id);
+    fn remove(&mut self, id: u64) -> Option<Item> {
+        let at = self.items.iter().position(|item| item.id == id)?;
+        self.items.remove(at)
+    }
+
+    fn pop(&mut self) -> Option<Item> {
+        self.items.pop_front()
+    }
+
+    fn peek_id(&self) -> Option<u64> {
+        self.items.front().map(|item| item.id)
+    }
+
+    fn rank(&self, id: u64) -> Option<usize> {
+        self.items.iter().position(|item| item.id == id)
+    }
+
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+}
+
+/// Task run state, matching `enum inf_task_state` in `intf.h`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskState {
+    Idle,
+    Queued,
+    Dispatched,
+    Running,
+    Parked,
+    Exiting,
+}
+
+#[derive(Clone, Debug)]
+pub struct Task {
+    pub weight: u64,
+    pub slice: u64,
+    pub state: TaskState,
+    pub queued_cpu: Option<usize>,
+    pub holdcnt: u32,
+    /// CPUs on which the task may run.
+    pub allowed: Vec<usize>,
+    pub exiting: bool,
+}
+
+impl Task {
+    fn new(weight: u64, allowed: Vec<usize>) -> Self {
+        Self {
+            weight,
+            slice: 1,
+            state: TaskState::Idle,
+            queued_cpu: None,
+            holdcnt: 0,
+            allowed,
+            exiting: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StealTier {
+    Llc,
+    Node,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Pop {
+    pub id: u64,
+    pub weight: u64,
+    pub stale: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct Stats {
+    pub head_inserts: u64,
+    pub tail_inserts: u64,
+    pub exempt_inserts: u64,
+    pub steals: u64,
+    pub steal_llc: u64,
+    pub steal_node: u64,
+    pub yield_to_moves: u64,
+    pub reweight_moves: u64,
+    pub stale_pops: u64,
+    pub lost_state_errors: u64,
+}
+
+/// A small scheduler: one queue per CPU, the gate and key runs, the
+/// per-CPU weight and depth, the steal cursors and the task table.
+pub struct Model<Q> {
+    pub queues: Vec<Q>,
+    pub seq: Vec<u32>,
+    pub head_seq: Vec<u64>,
+    pub tail_seq: Vec<u64>,
+    pub w_sum: Vec<i64>,
+    pub depth: Vec<i64>,
+    pub llc: Vec<u32>,
+    pub node: Vec<u32>,
+    pub online: Vec<bool>,
+    pub cursor_llc: Vec<u32>,
+    pub cursor_node: Vec<u32>,
+    pub tasks: BTreeMap<u64, Task>,
+    pub stats: Stats,
+}
+
+impl<Q: IntrusiveQueue + Default> Model<Q> {
+    pub fn new(ncpu: usize) -> Self {
+        Self {
+            queues: (0..ncpu).map(|_| Q::default()).collect(),
+            seq: vec![0; ncpu],
+            head_seq: vec![KEY_MID; ncpu],
+            tail_seq: vec![KEY_MID; ncpu],
+            w_sum: vec![0; ncpu],
+            depth: vec![0; ncpu],
+            llc: vec![0; ncpu],
+            node: vec![0; ncpu],
+            online: vec![true; ncpu],
+            cursor_llc: vec![0; ncpu],
+            cursor_node: vec![0; ncpu],
+            tasks: BTreeMap::new(),
+            stats: Stats::default(),
+        }
+    }
+
+    pub fn set_topo(&mut self, cpu: usize, llc: u32, node: u32) {
+        self.llc[cpu] = llc;
+        self.node[cpu] = node;
+    }
+
+    pub fn add_task(&mut self, id: u64, weight: u64, allowed: Vec<usize>) {
+        self.tasks.insert(id, Task::new(weight, allowed));
+    }
+
+    fn head_key(&mut self, cpu: usize) -> u64 {
+        self.head_seq[cpu] = self.head_seq[cpu].wrapping_sub(1);
+        self.head_seq[cpu]
+    }
+
+    fn tail_key(&mut self, cpu: usize) -> u64 {
+        let key = self.tail_seq[cpu];
+        self.tail_seq[cpu] = self.tail_seq[cpu].wrapping_add(1);
+        key
+    }
+
+    /// Replica of the enqueue decision in `inf_enqueue_common()`.
+    pub fn enqueue(
+        &mut self,
+        id: u64,
+        cpu: usize,
+        wake: bool,
+        head_flag: bool,
+        reenq: bool,
+        last: bool,
+        preempt: bool,
+    ) -> Position {
+        let slice = self.tasks.get(&id).map(|task| task.slice).unwrap_or(1);
+        let expired = slice == 0 && !wake && !head_flag;
+        let mut gated = false;
+
+        let position = if head_flag {
+            Position::Head
+        } else if expired || reenq || last || preempt {
+            Position::Tail
+        } else {
+            gated = true;
+            let seq = self.seq[cpu];
+            self.seq[cpu] = seq.wrapping_add(1);
+            if gate_tail(seq) {
+                Position::Tail
+            } else {
+                Position::Head
+            }
+        };
+
+        let weight = self.tasks.get(&id).map(|task| task.weight).unwrap_or(100);
+        self.push(cpu, id, weight, slice, position, gated);
+        position
+    }
+
+    fn push(
+        &mut self,
+        cpu: usize,
+        id: u64,
+        weight: u64,
+        slice: u64,
+        position: Position,
+        gated: bool,
+    ) {
+        let key = match position {
+            Position::Head => self.head_key(cpu),
+            Position::Tail => self.tail_key(cpu),
+        };
+        let item = Item {
+            id,
+            key,
+            weight,
+            slice,
+        };
+        if !self.queues[cpu].insert(item, position) {
+            self.stats.lost_state_errors += 1;
+            return;
+        }
+        self.w_sum[cpu] += weight as i64;
+        self.depth[cpu] += 1;
+        if let Some(task) = self.tasks.get_mut(&id) {
+            task.state = TaskState::Queued;
+            task.queued_cpu = Some(cpu);
+        }
+        if gated {
+            match position {
+                Position::Head => self.stats.head_inserts += 1,
+                Position::Tail => self.stats.tail_inserts += 1,
+            }
+        } else {
+            self.stats.exempt_inserts += 1;
+        }
+    }
+
+    /// Pop the head. A node whose task left the task table is stale.
+    pub fn pop(&mut self, cpu: usize, hold: bool) -> Option<Pop> {
+        let item = self.queues[cpu].pop()?;
+        self.w_sum[cpu] -= item.weight as i64;
+        self.depth[cpu] -= 1;
+
+        let stale = !self.tasks.contains_key(&item.id);
+        if stale {
+            self.stats.stale_pops += 1;
+        } else if let Some(task) = self.tasks.get_mut(&item.id) {
+            task.state = TaskState::Dispatched;
+            task.queued_cpu = None;
+            if hold {
+                task.holdcnt += 1;
+            }
+        }
+
+        Some(Pop {
+            id: item.id,
+            weight: item.weight,
+            stale,
+        })
+    }
+
+    /// Remove one exact item from a queue and release its charge.
+    pub fn remove(&mut self, cpu: usize, id: u64) -> Option<Item> {
+        let item = self.queues[cpu].remove(id)?;
+        self.w_sum[cpu] -= item.weight as i64;
+        self.depth[cpu] -= 1;
+        if let Some(task) = self.tasks.get_mut(&id) {
+            task.queued_cpu = None;
+            if task.state == TaskState::Queued {
+                task.state = TaskState::Idle;
+            }
+        }
+        Some(item)
+    }
+
+    pub fn rank(&self, cpu: usize, id: u64) -> Option<usize> {
+        self.queues[cpu].rank(id)
+    }
+
+    pub fn drain(&mut self, cpu: usize) -> Vec<u64> {
+        let mut order = Vec::new();
+        while let Some(pop) = self.pop(cpu, false) {
+            order.push(pop.id);
         }
         order
+    }
+
+    /// Two-argument yield: the donor forfeits its slice and a runnable
+    /// queued target moves to the newest head key. The gate does not move.
+    pub fn yield_to(&mut self, from: u64, to: u64) -> bool {
+        if let Some(task) = self.tasks.get_mut(&from) {
+            task.slice = 0;
+        }
+        if from == to {
+            return false;
+        }
+        let Some(cpu) = self.tasks.get(&to).and_then(|task| task.queued_cpu) else {
+            return false;
+        };
+        match self.tasks.get(&to) {
+            Some(task) if task.state == TaskState::Queued && !task.exiting => {}
+            _ => return false,
+        }
+
+        let item = self.remove(cpu, to).expect("a queued target is removable");
+        let key = self.head_key(cpu);
+        let moved = Item {
+            id: to,
+            key,
+            weight: item.weight,
+            slice: item.slice,
+        };
+        self.queues[cpu].insert(moved, Position::Head);
+        self.w_sum[cpu] += item.weight as i64;
+        self.depth[cpu] += 1;
+        if let Some(task) = self.tasks.get_mut(&to) {
+            task.state = TaskState::Queued;
+            task.queued_cpu = Some(cpu);
+        }
+        self.stats.yield_to_moves += 1;
+        true
+    }
+
+    /// Queued reweight: leave the queue and re-enter through the gate.
+    pub fn reweight(&mut self, id: u64, weight: u64) -> bool {
+        let Some(cpu) = self.tasks.get(&id).and_then(|task| task.queued_cpu) else {
+            if let Some(task) = self.tasks.get_mut(&id) {
+                task.weight = weight;
+            }
+            return false;
+        };
+        let Some(item) = self.remove(cpu, id) else {
+            return false;
+        };
+        if let Some(task) = self.tasks.get_mut(&id) {
+            task.weight = weight;
+        }
+
+        let seq = self.seq[cpu];
+        self.seq[cpu] = seq.wrapping_add(1);
+        let position = if gate_tail(seq) {
+            Position::Tail
+        } else {
+            Position::Head
+        };
+        self.push(cpu, id, weight, item.slice, position, true);
+        self.stats.reweight_moves += 1;
+        true
+    }
+
+    /// One steal tier: at most eight eligible peers from the rotating
+    /// cursor. A head that the destination cannot run is skipped.
+    pub fn steal(&mut self, dst: usize, tier: StealTier) -> Option<u64> {
+        let ncpu = self.queues.len() as u32;
+        let start = match tier {
+            StealTier::Llc => self.cursor_llc[dst] % ncpu,
+            StealTier::Node => self.cursor_node[dst] % ncpu,
+        };
+        let mut next = start;
+        let mut examined = 0usize;
+
+        for step in 0..ncpu {
+            if examined >= STEAL_MAX_PEERS {
+                break;
+            }
+            let peer = (start + step) % ncpu;
+            if peer as usize == dst || !self.online[peer as usize] {
+                continue;
+            }
+            let eligible = match tier {
+                StealTier::Llc => self.llc[peer as usize] == self.llc[dst],
+                StealTier::Node => {
+                    self.node[peer as usize] == self.node[dst]
+                        && self.llc[peer as usize] != self.llc[dst]
+                }
+            };
+            if !eligible {
+                continue;
+            }
+            examined += 1;
+            next = (peer + 1) % ncpu;
+
+            let Some(id) = self.queues[peer as usize].peek_id() else {
+                continue;
+            };
+            let allowed = self
+                .tasks
+                .get(&id)
+                .map(|task| task.allowed.contains(&dst))
+                .unwrap_or(false);
+            if !allowed {
+                /* Do not look deeper in this peer queue. */
+                continue;
+            }
+
+            let Some(item) = self.queues[peer as usize].pop() else {
+                continue;
+            };
+            self.w_sum[peer as usize] -= item.weight as i64;
+            self.depth[peer as usize] -= 1;
+            self.w_sum[dst] += item.weight as i64;
+            if let Some(task) = self.tasks.get_mut(&id) {
+                task.state = TaskState::Dispatched;
+                task.queued_cpu = None;
+            }
+            self.stats.steals += 1;
+            match tier {
+                StealTier::Llc => self.stats.steal_llc += 1,
+                StealTier::Node => self.stats.steal_node += 1,
+            }
+            match tier {
+                StealTier::Llc => self.cursor_llc[dst] = next,
+                StealTier::Node => self.cursor_node[dst] = next,
+            }
+            return Some(id);
+        }
+
+        match tier {
+            StealTier::Llc => self.cursor_llc[dst] = next,
+            StealTier::Node => self.cursor_node[dst] = next,
+        }
+        None
+    }
+
+    /// End a task and report whether its context can be freed now.
+    pub fn exit_task(&mut self, id: u64) -> bool {
+        if let Some(task) = self.tasks.get_mut(&id) {
+            task.exiting = true;
+            task.state = TaskState::Exiting;
+        }
+        if let Some(cpu) = self.tasks.get(&id).and_then(|task| task.queued_cpu) {
+            self.remove(cpu, id);
+        }
+        self.tasks
+            .get(&id)
+            .map(|task| task.holdcnt == 0)
+            .unwrap_or(true)
+    }
+
+    /// Drop one hold; returns true when an exiting task is now free.
+    pub fn drop_hold(&mut self, id: u64) -> bool {
+        if let Some(task) = self.tasks.get_mut(&id) {
+            if task.holdcnt > 0 {
+                task.holdcnt -= 1;
+            }
+            task.exiting && task.holdcnt == 0
+        } else {
+            true
+        }
+    }
+
+    /// Remove the task from the table: the context is freed.
+    pub fn release(&mut self, id: u64) {
+        self.tasks.remove(&id);
+    }
+
+    /// Simulate a task that exited behind a queued node.
+    pub fn abandon(&mut self, id: u64) {
+        self.tasks.remove(&id);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     use super::*;
-    use crate::policy;
 
-    #[test]
-    fn normal_enqueues_keep_the_seven_to_one_ratio() {
-        let mut queue = QueueModel::new();
+    fn one_cpu<Q: IntrusiveQueue + Default>() -> Model<Q> {
+        Model::new(1)
+    }
 
+    fn ordering<Q: IntrusiveQueue + Default>() {
+        let mut model = one_cpu::<Q>();
+        for id in 1..=7 {
+            model.add_task(id, 100, vec![0]);
+            assert_eq!(
+                model.enqueue(id, 0, true, false, false, false, false),
+                Position::Head
+            );
+        }
+        /* The most recent head insert runs first. */
+        assert_eq!(model.rank(0, 7), Some(0));
+        assert_eq!(model.rank(0, 1), Some(6));
+
+        model.add_task(8, 100, vec![0]);
+        assert_eq!(
+            model.enqueue(8, 0, false, false, false, false, false),
+            Position::Tail
+        );
+        assert_eq!(model.rank(0, 8), Some(7));
+        assert_eq!(model.drain(0), vec![7, 6, 5, 4, 3, 2, 1, 8]);
+        assert_eq!(model.w_sum[0], 0);
+    }
+
+    fn gate_ratio<Q: IntrusiveQueue + Default>() {
+        let mut model = one_cpu::<Q>();
         for id in 0..8_000 {
-            queue.enqueue_regular(id, 100);
+            model.add_task(id, 100, vec![0]);
+            model.enqueue(id, 0, false, false, false, false, false);
         }
-
-        assert_eq!(queue.head_inserts, 7_000);
-        assert_eq!(queue.tail_inserts, 1_000);
-        assert_eq!(queue.head_inserts / queue.tail_inserts, 7);
+        assert_eq!(model.stats.head_inserts, 7_000);
+        assert_eq!(model.stats.tail_inserts, 1_000);
+        assert_eq!(model.seq[0], 8_000);
     }
 
-    #[test]
-    fn a_queued_task_moves_ahead_only_on_head_inserts() {
-        let mut queue = QueueModel::new();
-        queue.enqueue_regular(0, 100);
-        let start = queue.rank(0).unwrap();
+    fn exact_removal<Q: IntrusiveQueue + Default>() {
+        let mut model = one_cpu::<Q>();
+        for id in 1..=4 {
+            model.add_task(id, 100, vec![0]);
+            model.enqueue(id, 0, true, false, false, false, false);
+        }
+        assert_eq!(model.rank(0, 2), Some(2));
+        let removed = model.remove(0, 2).expect("queued");
+        assert_eq!(removed.id, 2);
+        assert_eq!(model.rank(0, 2), None);
+        assert_eq!(model.w_sum[0], 300);
+        assert_eq!(model.drain(0), vec![4, 3, 1]);
+        assert_eq!(model.w_sum[0], 0);
+    }
 
-        let mut head_inserts = 0u64;
-        for id in 1..=800 {
-            if queue.enqueue_regular(id, 100) == Insert::Head {
-                head_inserts += 1;
+    fn yield_to<Q: IntrusiveQueue + Default>() {
+        let mut model = one_cpu::<Q>();
+        for id in 1..=4 {
+            model.add_task(id, 100, vec![0]);
+            model.enqueue(id, 0, true, false, false, false, false);
+        }
+        let seq = model.seq[0];
+        assert_eq!(model.rank(0, 1), Some(3));
+
+        assert!(model.yield_to(4, 1));
+        assert_eq!(model.rank(0, 1), Some(0));
+        /* The gate did not advance and the weight is unchanged. */
+        assert_eq!(model.seq[0], seq);
+        assert_eq!(model.w_sum[0], 400);
+        assert_eq!(model.stats.yield_to_moves, 1);
+
+        /* An unqueued target is refused. */
+        model.add_task(9, 100, vec![0]);
+        assert!(!model.yield_to(1, 9));
+        /* A running or exiting target is refused. */
+        model.tasks.get_mut(&2).unwrap().state = TaskState::Running;
+        assert!(!model.yield_to(1, 2));
+        model.tasks.get_mut(&2).unwrap().state = TaskState::Queued;
+        model.tasks.get_mut(&2).unwrap().exiting = true;
+        assert!(!model.yield_to(1, 2));
+    }
+
+    fn reweight<Q: IntrusiveQueue + Default>() {
+        let mut model = one_cpu::<Q>();
+        for id in 1..=3 {
+            model.add_task(id, 100, vec![0]);
+            model.enqueue(id, 0, true, false, false, false, false);
+        }
+        let seq = model.seq[0];
+
+        /* One gate slot, and a head slot at seq 3. */
+        assert!(model.reweight(1, 400));
+        assert_eq!(model.seq[0], seq + 1);
+        assert_eq!(model.stats.reweight_moves, 1);
+        assert_eq!(model.rank(0, 1), Some(0));
+        assert_eq!(model.w_sum[0], 600);
+
+        /* At seq 7 the reinsert takes the tail slot. */
+        let mut model = one_cpu::<Q>();
+        for id in 1..=7 {
+            model.add_task(id, 100, vec![0]);
+            model.enqueue(id, 0, true, false, false, false, false);
+        }
+        assert_eq!(model.seq[0], 7);
+        assert!(model.reweight(1, 400));
+        assert_eq!(model.seq[0], 8);
+        assert_eq!(model.rank(0, 1), Some(6));
+        assert_eq!(model.w_sum[0], 1_000);
+    }
+
+    fn peer_steal<Q: IntrusiveQueue + Default>() {
+        let mut model: Model<Q> = Model::new(6);
+        /* Node 0: CPUs 0,1 in LLC 0 and CPUs 2,3 in LLC 1.
+         * Node 1: CPUs 4,5 in LLC 2. */
+        for (cpu, (llc, node)) in [(0, 0), (0, 0), (1, 0), (1, 0), (2, 1), (2, 1)]
+            .into_iter()
+            .enumerate()
+        {
+            model.set_topo(cpu, llc, node);
+        }
+
+        model.add_task(10, 100, vec![0]);
+        model.enqueue(10, 2, true, false, false, false, false);
+        model.add_task(11, 100, vec![0]);
+        model.enqueue(11, 1, true, false, false, false, false);
+
+        /* Same LLC wins over the same-node peer. */
+        assert_eq!(model.steal(0, StealTier::Llc), Some(11));
+        assert_eq!(model.stats.steal_llc, 1);
+        assert_eq!(model.steal(0, StealTier::Llc), None);
+        /* The node tier excludes the local LLC and finds CPU 2. */
+        assert_eq!(model.steal(0, StealTier::Node), Some(10));
+        assert_eq!(model.stats.steal_node, 1);
+        assert_eq!(model.w_sum[0], 200);
+
+        /* An affinity-limited head is skipped, not bypassed. */
+        let mut model: Model<Q> = Model::new(2);
+        model.set_topo(1, 0, 0);
+        model.add_task(20, 100, vec![1]);
+        model.enqueue(20, 1, true, false, false, false, false);
+        assert_eq!(model.steal(0, StealTier::Llc), None);
+
+        /* At most eight peers are examined; the cursor rotates. */
+        let mut model: Model<Q> = Model::new(12);
+        for cpu in 0..12 {
+            model.set_topo(cpu, 0, 0);
+        }
+        model.add_task(30, 100, vec![0]);
+        model.enqueue(30, 9, true, false, false, false, false);
+        assert_eq!(model.steal(0, StealTier::Llc), None);
+        assert_eq!(model.cursor_llc[0], 9);
+        assert_eq!(model.steal(0, StealTier::Llc), Some(30));
+    }
+
+    fn stale_pop<Q: IntrusiveQueue + Default>() {
+        let mut model = one_cpu::<Q>();
+        model.add_task(1, 100, vec![0]);
+        model.enqueue(1, 0, true, false, false, false, false);
+        model.add_task(2, 100, vec![0]);
+        model.enqueue(2, 0, true, false, false, false, false);
+
+        /* The task behind the node exits and its context is gone. */
+        model.abandon(2);
+        let first = model.pop(0, true).expect("stale node");
+        assert!(first.stale);
+        assert_eq!(first.id, 2);
+        assert_eq!(model.stats.stale_pops, 1);
+        assert_eq!(model.w_sum[0], 100);
+
+        /* The remaining task is not lost. */
+        let second = model.pop(0, true).expect("live node");
+        assert!(!second.stale);
+        assert_eq!(second.id, 1);
+        assert!(model.queues[0].is_empty());
+    }
+
+    fn task_lifetime<Q: IntrusiveQueue + Default>() {
+        let mut model = one_cpu::<Q>();
+        model.add_task(1, 100, vec![0]);
+        model.enqueue(1, 0, true, false, false, false, false);
+
+        let pop = model.pop(0, true).expect("queued");
+        assert_eq!(pop.id, 1);
+        assert_eq!(model.tasks[&1].holdcnt, 1);
+
+        /* Exit cannot free a context that a pop still holds. */
+        assert!(!model.exit_task(1));
+        assert_eq!(model.tasks[&1].state, TaskState::Exiting);
+        assert!(model.drop_hold(1));
+        model.release(1);
+        assert!(!model.tasks.contains_key(&1));
+    }
+
+    macro_rules! both_queues {
+        ($name:ident, $body:ident) => {
+            #[test]
+            fn $name() {
+                $body::<EdqModel>();
+                $body::<ListModel>();
             }
-        }
-
-        assert_eq!(queue.rank(0), Some(start + head_inserts as usize));
-        assert_eq!(queue.head_inserts - 1, head_inserts);
-
-        queue.pop().unwrap();
-        assert_eq!(queue.rank(0), Some(start + head_inserts as usize - 1));
+        };
     }
 
-    #[test]
-    fn a_stopped_queue_drains_every_task_exactly_once() {
-        let mut queue = QueueModel::new();
-        let mut expected = BTreeSet::new();
-
-        for id in 0..256 {
-            let weight = 100 + u64::from((id % 7) as u32);
-            if id % 3 == 0 {
-                queue.enqueue_wakeup(id, weight);
-            } else {
-                queue.enqueue_regular(id, weight);
-            }
-            expected.insert(id);
-        }
-
-        let order = queue.drain();
-        let actual: BTreeSet<u64> = order.iter().copied().collect();
-
-        assert_eq!(actual, expected);
-        assert_eq!(order.len(), expected.len());
-        assert!(queue.is_empty());
-        assert_eq!(queue.w_sum, 0);
-    }
-
-    #[test]
-    fn tail_insertions_drain_in_fifo_order() {
-        let mut queue = QueueModel::new();
-
-        for id in 0..5 {
-            queue.enqueue_expired(id, 100);
-        }
-
-        assert_eq!(queue.drain(), vec![0, 1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn slice_expiry_rotates_a_task_to_the_tail() {
-        let mut queue = QueueModel::new();
-        queue.enqueue_wakeup(1, 100);
-        queue.enqueue_wakeup(2, 100);
-        assert_eq!(queue.rank(1), Some(1));
-
-        assert!(queue.rotate_to_tail(1));
-        assert_eq!(queue.expiries, 1);
-        assert_eq!(queue.rank(1), Some(1));
-        assert_eq!(queue.drain(), vec![2, 1]);
-    }
-
-    #[test]
-    fn a_lone_task_is_dispatched_again_after_each_quantum() {
-        let mut queue = QueueModel::new();
-        queue.enqueue_wakeup(7, 100);
-
-        for _ in 0..3 {
-            assert_eq!(queue.pop(), Some((7, 100)));
-            assert!(queue.is_empty());
-            queue.enqueue_expired(7, 100);
-            assert_eq!(queue.len(), 1);
-        }
-
-        assert_eq!(queue.w_sum, 100);
-    }
-
-    #[test]
-    fn a_wakeup_that_the_gate_places_on_the_head_is_not_exempt() {
-        let mut queue = QueueModel::new();
-
-        assert_eq!(queue.enqueue_wakeup(1, 100), Insert::Head);
-        assert_eq!(queue.head_inserts, 1);
-        assert_eq!(queue.tail_inserts, 0);
-        assert_eq!(queue.exempt_inserts, 0);
-        assert_eq!(queue.seq, 1);
-        assert_eq!(queue.rank(1), Some(0));
-    }
-
-    #[test]
-    fn a_wakeup_that_the_gate_places_on_the_tail_runs_last() {
-        let mut queue = QueueModel::new();
-
-        for id in 0..7 {
-            assert_eq!(queue.enqueue_regular(id, 100), Insert::Head);
-        }
-        assert_eq!(queue.enqueue_wakeup(7, 100), Insert::Tail);
-
-        assert_eq!(queue.head_inserts, 7);
-        assert_eq!(queue.tail_inserts, 1);
-        assert_eq!(queue.exempt_inserts, 0);
-        assert_eq!(queue.rank(7), Some(7));
-        assert_eq!(queue.pop(), Some((6, 100)));
-    }
-
-    #[test]
-    fn only_the_head_hint_and_expiry_bypass_the_gate() {
-        assert_eq!(
-            classify_enqueue(0, true, false, false, false, false, 0),
-            Insert::Head
-        );
-        assert_eq!(
-            classify_enqueue(0, false, false, false, false, false, 0),
-            Insert::Tail
-        );
-        assert_eq!(
-            classify_enqueue(0, false, true, false, false, false, 7),
-            Insert::Head
-        );
-    }
-
-    #[test]
-    fn weight_sum_tracks_join_leave_and_reweight() {
-        let mut queue = QueueModel::new();
-
-        queue.enqueue_regular(1, 100);
-        queue.enqueue_regular(2, 200);
-        assert_eq!(queue.w_sum, 300);
-
-        assert!(queue.set_weight(1, 400));
-        assert_eq!(queue.w_sum, 600);
-
-        assert_eq!(queue.pop(), Some((2, 200)));
-        assert_eq!(queue.w_sum, 400);
-
-        assert_eq!(queue.pop(), Some((1, 400)));
-        assert_eq!(queue.w_sum, 0);
-        assert!(queue.pop().is_none());
-        assert_eq!(queue.w_sum, 0);
-    }
-
-    #[test]
-    fn repeated_expiry_does_not_double_count_the_weight() {
-        let mut queue = QueueModel::new();
-        queue.enqueue_wakeup(9, 50);
-
-        for _ in 0..16 {
-            assert!(queue.rotate_to_tail(9));
-            assert_eq!(queue.len(), 1);
-            assert_eq!(queue.w_sum, 50);
-        }
-    }
-
-    #[test]
-    fn a_queued_task_keeps_its_position_on_reweight() {
-        let mut queue = QueueModel::new();
-        queue.enqueue_regular(1, 100);
-        queue.enqueue_regular(2, 100);
-        queue.enqueue_regular(3, 100);
-        assert_eq!(queue.rank(1), Some(2));
-
-        assert!(queue.set_weight(1, 400));
-
-        /* Deviation 2: the weight changes, the DSQ position does not. A
-         * reference dequeue and reinsert through the gate would move the
-         * task to a new position. */
-        assert_eq!(queue.rank(3), Some(0));
-        assert_eq!(queue.rank(2), Some(1));
-        assert_eq!(queue.rank(1), Some(2));
-        assert_eq!(queue.w_sum, 600);
-    }
-
-    #[test]
-    fn yield_rotates_only_the_donor_to_the_tail() {
-        let mut queue = QueueModel::new();
-        queue.enqueue_regular(1, 100);
-        queue.enqueue_regular(2, 100);
-        queue.enqueue_regular(3, 100);
-        assert_eq!(queue.rank(1), Some(2));
-
-        assert!(queue.rotate_to_tail(3));
-
-        /* Deviation 1: the donor forfeits its slice and rotates to the
-         * tail. A queued target keeps its position, so it does not move to
-         * the head as a two-argument yield in the reference would. */
-        assert_eq!(queue.rank(3), Some(2));
-        assert_eq!(queue.rank(2), Some(0));
-        assert_eq!(queue.rank(1), Some(1));
-        assert_ne!(queue.rank(1), Some(0));
-    }
-
-    #[test]
-    fn the_queue_weight_is_the_quantum_normalizer() {
-        let mut queue = QueueModel::new();
-        queue.enqueue_regular(1, 100);
-        queue.enqueue_regular(2, 100);
-
-        let half = policy::quantum_ns(policy::QUANTUM_DEFAULT_NS, 100, queue.w_sum as u64);
-        assert_eq!(half, policy::QUANTUM_DEFAULT_NS / 2);
-
-        queue.enqueue_regular(3, 200);
-        let third = policy::quantum_ns(policy::QUANTUM_DEFAULT_NS, 100, queue.w_sum as u64);
-        assert_eq!(third, policy::QUANTUM_DEFAULT_NS / 4);
-
-        queue.pop().unwrap();
-        queue.set_weight(3, 100);
-        assert_eq!(queue.w_sum, 200);
-    }
+    both_queues!(both_queues_keep_bounded_lifo_order, ordering);
+    both_queues!(both_queues_keep_the_seven_to_one_gate, gate_ratio);
+    both_queues!(both_queues_remove_an_exact_node, exact_removal);
+    both_queues!(both_queues_move_a_yield_to_target, yield_to);
+    both_queues!(both_queues_reinsert_a_reweight, reweight);
+    both_queues!(both_queues_steal_from_peers, peer_steal);
+    both_queues!(both_queues_drop_a_stale_pop, stale_pop);
+    both_queues!(both_queues_hold_a_task_across_exit, task_lifetime);
 }

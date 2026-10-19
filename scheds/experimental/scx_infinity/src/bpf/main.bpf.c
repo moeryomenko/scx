@@ -2,12 +2,13 @@
 /*
  * scx_infinity core policy.
  *
- * One vtime-ordered DSQ per CPU holds the runnable tasks. The key is a
- * scheduler-owned sequence, not wall time: a head insert takes the next
+ * One scheduler-owned queue per CPU holds the runnable tasks. The key is
+ * a scheduler-owned sequence, not wall time: a head insert takes the next
  * key below INF_KEY_MID and a tail insert the next key above it. The
- * kernel pops the lowest key first, so the most recent head insert runs
- * first and a tail insert runs last. That is the bounded-LIFO order of
- * the Infinity fair policy.
+ * newest head insert is therefore first and a tail insert is last. That
+ * is the bounded-LIFO order of the Infinity fair policy. The default
+ * queue is scx_edq from lib/edq.h; the queue-list build feature swaps in
+ * an intrusive FIFO list through the same interface.
  *
  * Regular enqueues pass a 7:1 gate. Every eighth regular enqueue takes a
  * tail key and the other seven take a head key, so at most seven normal
@@ -18,6 +19,10 @@
  * enters at the tail, and a yield zeroes the slice so the core hands the
  * task back through the same tail path.
  *
+ * A sched_ext local DSQ is used only to run the task the scheduler
+ * selected. Dispatch pops the local queue, then steals the head of a
+ * same-LLC peer queue and then a same-NUMA peer queue.
+ *
  * The slice is proportional to the task's effective weight over the
  * contending weight on the target CPU. The effective weight folds the
  * cgroup hierarchy in through the shared cgroup control library: nested
@@ -27,13 +32,17 @@
  *
  * The task context lives in the BPF arena because the bandwidth library
  * parks throttled tasks on an arena queue with the task context embedded in
- * it.
+ * it. The queue nodes are arena objects too, and one hold keeps a node
+ * alive across the unlocked insert that follows a pop.
  */
 #include <scx/common.bpf.h>
 #include <scx/compat.bpf.h>
+#include <lib/arena_map.h>
 #include <lib/cgroup_ctl.h>
+#include <lib/edq.h>
 #include <lib/sdt_task.h>
 #include "intf.h"
+#include "queue.h"
 
 char _license[] SEC("license") = "GPL";
 
@@ -100,17 +109,25 @@ struct {
  * Per-task context, allocated in the arena by scx_task_alloc(). The
  * bandwidth context must stay first: REGISTER_SCX_CGROUP_BW_ENQUEUE_CB()
  * and the scx_cgroup_bw_* API cast the context to scx_task_common at offset
- * 0.
+ * 0. The ready-queue node follows it and is embedded for the task's whole
+ * lifetime.
  */
 struct task_ctx {
 	struct scx_task_cgroup_bw cg_bw; /* MUST be first */
+	INF_QUEUE_NODE_FIELD	  qnode; /* default EDQ node or list node */
 	u64 base_weight; /* p->scx.weight at the last change */
 	u64 weight; /* effective weight, hierarchy folded in */
 	u64 group_scale; /* folded shares/load product, Q10 */
 	u64 slice_ns; /* last assigned quantum */
 	u64 last_running_ns; /* clock at the last ops.running() */
-	s32 queued_cpu; /* DSQ CPU, -1 when not queued */
+	u64 weight_epoch; /* cgroup epoch seen at the last fold */
+	s32 queued_cpu; /* queue CPU, -1 when not queued */
 	s32 group_cpu; /* CPU the group load is charged to */
+	u32 state; /* enum inf_task_state */
+	u32 moving; /* one writer owns a queue move */
+	u32 reweight_pending; /* apply the new weight at the next step */
+	u32 dequeue_pending; /* a dequeue arrived during a move */
+	u32 exit_pending; /* an exit arrived during a move */
 	u32 joined; /* 1 while the cgroup load counts this task */
 	u32 yielded;
 	u32 wake_fork;
@@ -121,18 +138,53 @@ struct task_ctx {
 
 typedef struct task_ctx __arena task_ctx;
 
+/*
+ * The queue block is one arena allocation: one queue per possible CPU.
+ * It is created in the sleepable ops.init() and never resized.
+ */
+static inf_queue_t *inf_queues;
+static u32	    inf_nr_queues;
+
+#define TOUCH_ARENA()                           \
+	do {                                    \
+		asm volatile("" ::"r"(&arena)); \
+	} while (0)
+
 /* intf.h carries the same layout for the loader's arena sizing. */
 _Static_assert(sizeof(struct task_ctx) == sizeof(struct inf_task_ctx_layout),
 	       "task_ctx layout mirror in intf.h is out of sync");
+#ifdef INF_QUEUE_LIST
+_Static_assert(sizeof(struct inf_list_node) <= INF_QUEUE_NODE_BYTES,
+	       "queue-list node does not fit the shared layout");
+#else
+_Static_assert(sizeof(struct scx_edq_task) == INF_QUEUE_NODE_BYTES,
+	       "EDQ node does not match INF_QUEUE_NODE_BYTES");
+#endif
 
-static task_ctx *inf_task_ctx(struct task_struct *p)
+static __always_inline task_ctx *inf_task_ctx(struct task_struct *p)
 {
 	return (task_ctx *)__scx_task_data(p);
 }
 
-static task_ctx *inf_task_ctx_alloc(struct task_struct *p)
+static __always_inline task_ctx *inf_task_ctx_alloc(struct task_struct *p)
 {
 	return (task_ctx *)scx_task_alloc(p);
+}
+
+/* Recover the task context from the queue node embedded in it. */
+static __always_inline task_ctx *
+inf_task_from_qnode(inf_queue_node_t __arg_arena *node)
+{
+	return (task_ctx *)(void __arena *)((u64)node -
+					    offsetof(struct task_ctx, qnode));
+}
+
+/* One queue per CPU. The caller checks for NULL. */
+static __always_inline inf_queue_t *inf_queue(s32 cpu)
+{
+	if (cpu < 0 || (u32)cpu >= inf_nr_queues)
+		return NULL;
+	return &inf_queues[cpu];
 }
 
 static struct inf_cpu_ctx *inf_cpu_ctx(s32 cpu)
@@ -150,6 +202,38 @@ static struct inf_stats *inf_stats(void)
 	u32 key = 0;
 
 	return bpf_map_lookup_elem(&stats_stor, &key);
+}
+
+#define INF_STAT_INC(field)                                       \
+	do {                                                      \
+		struct inf_stats *__stats = inf_stats();          \
+		if (__stats)                                      \
+			__sync_fetch_and_add(&__stats->field, 1); \
+	} while (0)
+
+/* Charge the queue before the node becomes visible in it. */
+static __always_inline void inf_queue_charge(struct inf_cpu_ctx *cctx, u64 w)
+{
+	__sync_fetch_and_add(&cctx->w_sum, (s64)w);
+	__sync_fetch_and_add(&cctx->depth, 1);
+}
+
+/* Release the charge after the node is no longer visible. */
+static __always_inline void inf_queue_uncharge(struct inf_cpu_ctx *cctx, u64 w)
+{
+	s64 prev;
+
+	prev = __sync_fetch_and_add(&cctx->w_sum, -(s64)w);
+	if (prev < (s64)w) {
+		WRITE_ONCE(cctx->w_sum, 0);
+		INF_STAT_INC(lost_state_errors);
+	}
+
+	prev = __sync_fetch_and_add(&cctx->depth, -1);
+	if (prev <= 0) {
+		WRITE_ONCE(cctx->depth, 0);
+		INF_STAT_INC(lost_state_errors);
+	}
 }
 
 static __always_inline bool inf_cpu_bw_enabled(void)
@@ -468,6 +552,8 @@ s32 BPF_STRUCT_OPS(infinity_select_cpu, struct task_struct *p, s32 prev_cpu,
 	s32		      cpu, local_cpu, this_cpu;
 	bool		      use_smt;
 
+	TOUCH_ARENA();
+
 	/* Sample the live placement preferences once for this decision. */
 	cfg	= inf_cfg();
 	use_smt = !cfg || cfg->smt_enabled;
@@ -639,7 +725,8 @@ s32 BPF_STRUCT_OPS(infinity_select_cpu, struct task_struct *p, s32 prev_cpu,
  * Shared enqueue path. @reenq marks a call from the bandwidth callback: the
  * cgroup has just become unthrottled, so the throttle check is skipped.
  */
-static int inf_enqueue_common(struct task_struct *p, u64 enq_flags, bool reenq)
+static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
+					 bool reenq)
 {
 	struct inf_cpu_ctx *cctx;
 	task_ctx	   *tctx;
@@ -659,6 +746,8 @@ static int inf_enqueue_common(struct task_struct *p, u64 enq_flags, bool reenq)
 
 	if (!p)
 		return -EINVAL;
+
+	TOUCH_ARENA();
 
 	cpu = scx_bpf_task_cpu(p);
 	if (cpu < 0 || (u32)cpu >= inf_nr_cpu_ids())
@@ -689,6 +778,8 @@ static int inf_enqueue_common(struct task_struct *p, u64 enq_flags, bool reenq)
 				tctx->joined = 0;
 			}
 			if (!scx_cgroup_ctl_put_aside(p, (u64)tctx, 0)) {
+				tctx->state	 = INF_TASK_PARKED;
+				tctx->queued_cpu = -1;
 				if (stats)
 					__sync_fetch_and_add(
 						&stats->cgrp_throttled, 1);
@@ -749,19 +840,61 @@ static int inf_enqueue_common(struct task_struct *p, u64 enq_flags, bool reenq)
 	q   = inf_quantum(w, READ_ONCE(cctx->w_sum) + w);
 	key = head ? inf_head_key(cctx) : inf_tail_key(cctx);
 
+	/*
+	 * The task claims no queue membership when ops.enqueue() runs. A
+	 * stale claim means a previous move did not finish; remove the node
+	 * from wherever it claims to be and release that charge before the
+	 * new insert, so no task is lost and no weight is charged twice.
+	 */
+	if (tctx->queued_cpu >= 0) {
+		s32		    old_cpu   = tctx->queued_cpu;
+		struct inf_cpu_ctx *old_cctx  = inf_cpu_ctx(old_cpu);
+		inf_queue_t	   *old_queue = inf_queue(old_cpu);
+		u64		    old_w = tctx->weight ? tctx->weight : base;
+		int		    old_ret;
+
+		if (old_queue)
+			old_ret = inf_queue_remove(old_queue, &tctx->qnode);
+		else
+			old_ret = -EINVAL;
+
+		if (!old_ret) {
+			if (old_cctx)
+				inf_queue_uncharge(old_cctx, old_w);
+		} else if (old_ret != -EINVAL) {
+			/* Still linked behind a busy queue lock. */
+			INF_STAT_INC(lost_state_errors);
+			return -EAGAIN;
+		}
+		tctx->queued_cpu = -1;
+		if (tctx->state == INF_TASK_QUEUED)
+			tctx->state = INF_TASK_IDLE;
+	}
+
 	/* Charge the queue before the insert so the pop sees this weight. */
-	__sync_fetch_and_add(&cctx->w_sum, (s64)w);
-	if (!scx_bpf_dsq_insert_vtime(p, (u64)cpu, q, key, 0)) {
-		__sync_fetch_and_add(&cctx->w_sum, -(s64)w);
+	inf_queue_charge(cctx, w);
+	if (!inf_queue(cpu)) {
+		inf_queue_uncharge(cctx, w);
 		if (newly_joined) {
 			scx_cgroup_ctl_leave(p, cpu, base);
 			tctx->joined = 0;
 		}
+		INF_STAT_INC(lost_state_errors);
 		return -EINVAL;
 	}
-	__sync_fetch_and_add(&cctx->depth, 1);
+	ret = inf_queue_insert(inf_queue(cpu), &tctx->qnode, key, q);
+	if (ret) {
+		inf_queue_uncharge(cctx, w);
+		if (newly_joined) {
+			scx_cgroup_ctl_leave(p, cpu, base);
+			tctx->joined = 0;
+		}
+		INF_STAT_INC(lost_state_errors);
+		return -EINVAL;
+	}
 
 	tctx->queued_cpu = cpu;
+	tctx->state	 = INF_TASK_QUEUED;
 	tctx->slice_ns	 = q;
 
 	if (stats) {
@@ -792,9 +925,14 @@ void BPF_STRUCT_OPS(infinity_enqueue, struct task_struct *p, u64 enq_flags)
  * through the normal path so the task re-enters through the 7:1 gate and
  * rejoins its cgroup load.
  */
-int inf_bw_enqueue(struct task_struct *p __arg_trusted, u64 ctx)
+__noinline int inf_bw_enqueue(struct task_struct *p __arg_trusted, u64 ctx)
 {
 	struct inf_stats *stats;
+
+	if (!p || !ctx)
+		return 0;
+
+	TOUCH_ARENA();
 
 	if (!inf_cpu_bw_enabled())
 		return 0;
@@ -810,16 +948,319 @@ int inf_bw_enqueue(struct task_struct *p __arg_trusted, u64 ctx)
 REGISTER_SCX_CGROUP_BW_ENQUEUE_CB(inf_bw_enqueue);
 
 /*
- * Pop the head of the CPU's own vtime DSQ, recompute its slice against
- * the weight still contending on this CPU, and move it to the local DSQ.
+ * The CPU the task may run on, preferring the CPU the core already
+ * selected. Returns -1 when the affinity mask contains no known CPU.
+ */
+static __always_inline s32 inf_task_allowed_cpu(struct task_struct *p,
+						s32		    fallback)
+{
+	struct inf_cpu_topo *t;
+	s32		     cpu;
+
+	cpu = scx_bpf_task_cpu(p);
+	t   = inf_cpu_topo(cpu);
+	if (inf_cpu_allowed(p, t, cpu))
+		return cpu;
+
+	cpu = inf_first_allowed(p, false);
+	if (cpu >= 0)
+		return cpu;
+
+	t = inf_cpu_topo(fallback);
+	if (inf_cpu_allowed(p, t, fallback))
+		return fallback;
+	return -1;
+}
+
+/*
+ * Put a task that left a queue back on @cpu at the tail. Used when a pop
+ * finds a task that cannot run on the popping CPU. The queue lock is not
+ * held here.
+ */
+static __noinline int inf_requeue_task(struct task_struct *p, task_ctx *tctx,
+				       s32 cpu)
+{
+	struct inf_cpu_ctx *cctx;
+	inf_queue_t	   *queue;
+	u64		    w, q, key;
+	int		    ret;
+
+	cctx  = inf_cpu_ctx(cpu);
+	queue = inf_queue(cpu);
+	if (!cctx || !queue)
+		return -EINVAL;
+
+	w   = tctx->weight ? tctx->weight : inf_task_weight(p);
+	q   = inf_quantum(w, READ_ONCE(cctx->w_sum) + w);
+	key = inf_tail_key(cctx);
+
+	inf_queue_charge(cctx, w);
+	ret = inf_queue_insert(queue, &tctx->qnode, key, q);
+	if (ret) {
+		inf_queue_uncharge(cctx, w);
+		INF_STAT_INC(lost_state_errors);
+		return ret;
+	}
+
+	tctx->queued_cpu = cpu;
+	tctx->state	 = INF_TASK_QUEUED;
+	tctx->slice_ns	 = q;
+	INF_STAT_INC(requeues);
+
+	if (cpu != bpf_get_smp_processor_id())
+		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+	return 0;
+}
+
+/*
+ * Pop the local queue and move the task to the local DSQ. A node whose
+ * task is gone, exiting or pending a dequeue is dropped, never run. A
+ * task that cannot run on this CPU is requeued on a CPU its mask allows.
+ */
+static __noinline bool inf_dispatch_local(s32 cpu, struct inf_cpu_ctx *cctx)
+{
+	inf_queue_t	   *queue = inf_queue(cpu);
+	inf_queue_node_t   *node;
+	struct task_struct *p;
+	task_ctx	   *tctx;
+	u64		    nodep, w, q;
+	s32		    target;
+
+	if (!queue)
+		return false;
+
+	nodep = inf_queue_pop(queue, true);
+	if (!nodep)
+		return false;
+
+	node = (inf_queue_node_t *)nodep;
+	tctx = inf_task_from_qnode(node);
+	w    = tctx->weight ? tctx->weight : 1;
+
+	/*
+	 * Publish the cleared membership before the charge drops, so a
+	 * concurrent dequeue does not release the same charge a second time.
+	 */
+	tctx->queued_cpu = -1;
+	inf_queue_uncharge(cctx, w);
+
+	p = bpf_task_from_pid(tctx->pid);
+	if (!p) {
+		tctx->state = INF_TASK_EXITING;
+		inf_queue_drop(node);
+		INF_STAT_INC(stale_pops);
+		return false;
+	}
+
+	if ((p->flags & PF_EXITING) || tctx->state == INF_TASK_EXITING ||
+	    tctx->exit_pending) {
+		tctx->state	   = INF_TASK_EXITING;
+		tctx->exit_pending = 0;
+		bpf_task_release(p);
+		inf_queue_drop(node);
+		INF_STAT_INC(stale_pops);
+		return false;
+	}
+
+	if (tctx->dequeue_pending) {
+		tctx->dequeue_pending = 0;
+		tctx->state	      = INF_TASK_IDLE;
+		bpf_task_release(p);
+		inf_queue_drop(node);
+		INF_STAT_INC(stale_pops);
+		return false;
+	}
+
+	if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+		target = inf_task_allowed_cpu(p, cpu);
+		if (target >= 0)
+			inf_requeue_task(p, tctx, target);
+		else
+			INF_STAT_INC(lost_state_errors);
+		bpf_task_release(p);
+		inf_queue_drop(node);
+		return false;
+	}
+
+	/* The task is out of the queue, so the remaining weight normalizes. */
+	q		       = inf_quantum(w, READ_ONCE(cctx->w_sum) + w);
+	tctx->queued_cpu       = -1;
+	tctx->state	       = INF_TASK_DISPATCHED;
+	tctx->slice_ns	       = q;
+	tctx->reweight_pending = 0;
+
+	scx_bpf_task_set_slice(p, q);
+	scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, q, 0);
+
+	bpf_task_release(p);
+	inf_queue_drop(node);
+	return true;
+}
+
+/*
+ * Steal the head of one peer queue. The peek holds the node before the
+ * queue lock is released; the node stays held until after the local DSQ
+ * insert, so the task context cannot be freed underneath us. No DSQ call
+ * runs while the peer queue lock is held.
+ */
+static __noinline bool inf_steal_from(s32 peer, s32 dst,
+				      struct inf_cpu_ctx *dcctx)
+{
+	struct inf_cpu_ctx  *pcctx = inf_cpu_ctx(peer);
+	struct inf_cpu_topo *pt	   = inf_cpu_topo(dst);
+	inf_queue_t	    *pq	   = inf_queue(peer);
+	inf_queue_node_t    *node;
+	struct task_struct  *p;
+	task_ctx	    *tctx;
+	u64		     nodep, w, q;
+
+	if (!pcctx || !pt || !pq)
+		return false;
+
+	nodep = inf_queue_peek_hold(pq);
+	if (!nodep)
+		return false;
+
+	node = (inf_queue_node_t *)nodep;
+	tctx = inf_task_from_qnode(node);
+	w    = tctx->weight ? tctx->weight : 1;
+
+	p    = bpf_task_from_pid(tctx->pid);
+	if (!p) {
+		if (!inf_queue_try_remove(pq, node))
+			inf_queue_uncharge(pcctx, w);
+		inf_queue_drop(node);
+		INF_STAT_INC(stale_pops);
+		return false;
+	}
+
+	if ((p->flags & PF_EXITING) || tctx->state == INF_TASK_EXITING) {
+		if (!inf_queue_try_remove(pq, node))
+			inf_queue_uncharge(pcctx, w);
+		bpf_task_release(p);
+		inf_queue_drop(node);
+		INF_STAT_INC(stale_pops);
+		return false;
+	}
+
+	if (tctx->dequeue_pending || tctx->exit_pending) {
+		if (!inf_queue_try_remove(pq, node))
+			inf_queue_uncharge(pcctx, w);
+		tctx->dequeue_pending = 0;
+		tctx->exit_pending    = 0;
+		bpf_task_release(p);
+		inf_queue_drop(node);
+		INF_STAT_INC(stale_pops);
+		return false;
+	}
+
+	/* A head that cannot run here is skipped, not bypassed. */
+	if (!inf_cpu_allowed(p, pt, dst)) {
+		bpf_task_release(p);
+		inf_queue_drop(node);
+		return false;
+	}
+
+	if (inf_queue_try_remove(pq, node)) {
+		bpf_task_release(p);
+		inf_queue_drop(node);
+		return false;
+	}
+
+	inf_queue_uncharge(pcctx, w);
+	tctx->queued_cpu = -1;
+	tctx->state	 = INF_TASK_DISPATCHED;
+	q		 = inf_quantum(w, READ_ONCE(dcctx->w_sum) + w);
+	tctx->slice_ns	 = q;
+
+	scx_bpf_task_set_slice(p, q);
+	scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, q, 0);
+
+	bpf_task_release(p);
+	inf_queue_drop(node);
+	INF_STAT_INC(steals);
+	return true;
+}
+
+/*
+ * One steal tier: at most eight eligible peers, starting at the cursor
+ * and wrapping. The cursor advances past every examined peer, so the next
+ * dispatch starts where this one stopped.
+ */
+static __noinline bool inf_steal_tier(s32 cpu, u32 llc, u32 node, u32 tier,
+				      u32 *cursor, struct inf_cpu_ctx *dcctx)
+{
+	u32 ncpu = inf_nr_cpu_ids();
+	u32 start, next;
+	s32 i, examined = 0;
+
+	if (!ncpu)
+		return false;
+
+	start = READ_ONCE(*cursor);
+	if (start >= ncpu)
+		start = 0;
+	next = start;
+
+	bpf_for(i, 0, INF_STEAL_SCAN_CPUS)
+	{
+		struct inf_cpu_topo *pt;
+		u32		     peer;
+
+		if ((u32)i >= ncpu || examined >= INF_STEAL_MAX_PEERS)
+			break;
+
+		peer = start + (u32)i;
+		if (peer >= ncpu)
+			peer -= ncpu;
+		if ((s32)peer == cpu)
+			continue;
+
+		pt = inf_cpu_topo((s32)peer);
+		if (!pt || !pt->online)
+			continue;
+		if (tier == INF_STEAL_LLC) {
+			if (pt->llc_id != llc)
+				continue;
+		} else {
+			/* The node tier excludes the local LLC. */
+			if (pt->node_id != node || pt->llc_id == llc)
+				continue;
+		}
+
+		examined++;
+		next = peer + 1;
+		if (next >= ncpu)
+			next = 0;
+
+		if (inf_steal_from((s32)peer, cpu, dcctx)) {
+			WRITE_ONCE(*cursor, next);
+			if (tier == INF_STEAL_LLC) {
+				INF_STAT_INC(steal_llc);
+			} else {
+				INF_STAT_INC(steal_node);
+			}
+			return true;
+		}
+	}
+
+	WRITE_ONCE(*cursor, next);
+	return false;
+}
+
+/*
+ * Dispatch: the local queue first, then same-LLC peers, then same-NUMA
+ * peers outside the local LLC. If nothing is runnable, renew the previous
+ * task in place when its slice expired.
  */
 void BPF_STRUCT_OPS(infinity_dispatch, s32 cpu, struct task_struct *prev)
 {
-	struct inf_cpu_ctx *cctx;
-	task_ctx	   *tctx;
-	struct task_struct *p;
-	u64		    q;
-	u64		    w;
+	struct inf_cpu_ctx  *cctx;
+	struct inf_cpu_topo *lt;
+	task_ctx	    *tctx;
+	u64		     q, w;
+
+	TOUCH_ARENA();
 
 	cctx = inf_cpu_ctx(cpu);
 	if (!cctx)
@@ -829,29 +1270,21 @@ void BPF_STRUCT_OPS(infinity_dispatch, s32 cpu, struct task_struct *prev)
 	if (inf_cpu_bw_enabled())
 		scx_cgroup_ctl_reenqueue();
 
-	p = __COMPAT_scx_bpf_dsq_peek((u64)cpu);
-	if (p) {
-		tctx = inf_task_ctx(p);
-		w    = tctx && tctx->weight ? tctx->weight : inf_task_weight(p);
-		q    = inf_quantum(w, READ_ONCE(cctx->w_sum));
-		scx_bpf_task_set_slice(p, q);
-		if (tctx) {
-			tctx->queued_cpu = -1;
-			tctx->slice_ns	 = q;
-		}
+	if (inf_dispatch_local(cpu, cctx))
+		return;
 
-		if (scx_bpf_dsq_move_to_local((u64)cpu, 0)) {
-			__sync_fetch_and_add(&cctx->w_sum, -(s64)w);
-			__sync_fetch_and_add(&cctx->depth, -1);
+	lt = inf_cpu_topo(cpu);
+	if (lt && lt->online) {
+		if (inf_steal_tier(cpu, lt->llc_id, lt->node_id, INF_STEAL_LLC,
+				   &cctx->steal_llc_cursor, cctx))
 			return;
-		}
-
-		if (tctx)
-			tctx->queued_cpu = cpu;
+		if (inf_steal_tier(cpu, lt->llc_id, lt->node_id, INF_STEAL_NODE,
+				   &cctx->steal_node_cursor, cctx))
+			return;
 	}
 
 	/*
-	 * The queue is empty and the previous task is still runnable with
+	 * The queues are empty and the previous task is still runnable with
 	 * no slice left. Renew it in place instead of waiting for a round
 	 * trip through enqueue.
 	 */
@@ -863,14 +1296,72 @@ void BPF_STRUCT_OPS(infinity_dispatch, s32 cpu, struct task_struct *prev)
 	}
 }
 
-void BPF_STRUCT_OPS(infinity_dequeue, struct task_struct *p, u64 deq_flags)
+/* Remove a queued task from its queue and release the charge once. */
+static __noinline void inf_remove_queued(struct task_struct *p, task_ctx *tctx)
 {
 	struct inf_cpu_ctx *cctx;
-	task_ctx	   *tctx;
+	inf_queue_t	   *queue;
 	u64		    w;
-	s32		    cpu;
+	s32		    cpu = tctx->queued_cpu;
+	int		    ret;
 
-	(void)deq_flags;
+	if (cpu < 0)
+		return;
+
+	queue = inf_queue(cpu);
+	cctx  = inf_cpu_ctx(cpu);
+	w     = tctx->weight ? tctx->weight : inf_task_weight(p);
+
+	if (queue)
+		ret = inf_queue_remove(queue, &tctx->qnode);
+	else
+		ret = -EINVAL;
+
+	if (!ret) {
+		if (cctx)
+			inf_queue_uncharge(cctx, w);
+		tctx->queued_cpu = -1;
+		if (tctx->state == INF_TASK_QUEUED)
+			tctx->state = INF_TASK_IDLE;
+	} else if (ret == -EINVAL) {
+		/*
+		 * The node is not linked. The path that unlinked it also
+		 * released its charge, so this path must not release it a
+		 * second time.
+		 */
+		tctx->queued_cpu = -1;
+		if (tctx->state == INF_TASK_QUEUED)
+			tctx->state = INF_TASK_IDLE;
+	} else {
+		/* The lock timed out and the node is still linked. */
+		INF_STAT_INC(lost_state_errors);
+	}
+}
+
+/*
+ * A dequeue or exit arrived while a mover held the task. The mover owns
+ * the queue operation, so it applies the pending state before it clears
+ * the moving flag.
+ */
+static __noinline void inf_resolve_pending(struct task_struct *p,
+					   task_ctx	      *tctx)
+{
+	if (!tctx->dequeue_pending && !tctx->exit_pending)
+		return;
+
+	inf_remove_queued(p, tctx);
+
+	if (tctx->exit_pending)
+		tctx->state = INF_TASK_EXITING;
+	tctx->dequeue_pending = 0;
+	tctx->exit_pending    = 0;
+}
+
+void BPF_STRUCT_OPS(infinity_dequeue, struct task_struct *p, u64 deq_flags)
+{
+	task_ctx *tctx;
+
+	TOUCH_ARENA();
 
 	tctx = inf_task_ctx(p);
 	if (!tctx)
@@ -882,34 +1373,46 @@ void BPF_STRUCT_OPS(infinity_dequeue, struct task_struct *p, u64 deq_flags)
 		tctx->joined = 0;
 	}
 
-	if (tctx->queued_cpu < 0)
-		return;
+	if (tctx->queued_cpu >= 0) {
+		if (cmpxchg(&tctx->moving, 0, 1)) {
+			tctx->dequeue_pending = 1;
+			return;
+		}
+		inf_remove_queued(p, tctx);
+		tctx->dequeue_pending = 0;
+		tctx->moving	      = 0;
+	}
 
-	cpu		 = tctx->queued_cpu;
-	tctx->queued_cpu = -1;
-
-	cctx		 = inf_cpu_ctx(cpu);
-	if (!cctx)
-		return;
-
-	w = tctx->weight ? tctx->weight : inf_task_weight(p);
-	__sync_fetch_and_add(&cctx->w_sum, -(s64)w);
-	__sync_fetch_and_add(&cctx->depth, -1);
+	/*
+	 * SCX_DEQ_CORE_SCHED_EXEC means the core ran a task that was still
+	 * queued. It stays runnable, so it moves to RUNNING. Every other
+	 * flag ends the runnable period.
+	 */
+	if (deq_flags & SCX_DEQ_CORE_SCHED_EXEC)
+		tctx->state = INF_TASK_RUNNING;
+	else if (tctx->state != INF_TASK_EXITING)
+		tctx->state = INF_TASK_IDLE;
 }
 
 void BPF_STRUCT_OPS(infinity_set_weight, struct task_struct *p, u32 weight)
 {
 	struct inf_cpu_ctx *cctx;
+	inf_queue_t	   *queue;
+	inf_queue_node_t   *node;
 	task_ctx	   *tctx;
-	u64		    old_base;
-	u64		    new_base;
-	u64		    old;
-	u64		    new;
+	u64		    old_base, new_base, old, new, old_key, key;
+	u32		    seq;
 	s32		    cpu;
+	bool		    head;
+	int		    ret;
+
+	TOUCH_ARENA();
 
 	tctx = inf_task_ctx(p);
 	if (!tctx)
 		return;
+
+	INF_STAT_INC(weight_changes);
 
 	old_base = tctx->base_weight;
 	new_base = weight ? weight : 1;
@@ -923,31 +1426,175 @@ void BPF_STRUCT_OPS(infinity_set_weight, struct task_struct *p, u32 weight)
 		scx_cgroup_ctl_reweight(p, tctx->group_cpu, old_base, new_base);
 
 	cpu = tctx->queued_cpu;
-	if (cpu < 0)
+	if (cpu < 0 || tctx->state != INF_TASK_QUEUED)
 		return;
-	cctx = inf_cpu_ctx(cpu);
-	if (!cctx)
+
+	INF_STAT_INC(reweight_queued);
+
+	queue = inf_queue(cpu);
+	cctx  = inf_cpu_ctx(cpu);
+	if (!queue || !cctx)
 		return;
 
 	/*
-	 * The queued node keeps its vtime position, but its contending
-	 * weight and its next slice must match the new share.
+	 * A concurrent mover owns the node. Defer the move; the task is
+	 * leaving the queue anyway, and the new weight is already stored.
 	 */
-	__sync_fetch_and_add(&cctx->w_sum, (s64)new - (s64)old);
-	{
-		u64 total      = READ_ONCE(cctx->w_sum);
-
-		tctx->slice_ns = inf_quantum(new, total > new ? total : new);
+	if (cmpxchg(&tctx->moving, 0, 1)) {
+		tctx->reweight_pending = 1;
+		return;
 	}
+
+	node = &tctx->qnode;
+	inf_queue_hold(node);
+	old_key = inf_queue_node_key(node);
+
+	ret	= inf_queue_remove(queue, node);
+	if (ret) {
+		inf_queue_drop(node);
+		tctx->moving = 0;
+		INF_STAT_INC(lost_state_errors);
+		return;
+	}
+
+	inf_queue_uncharge(cctx, old);
+
+	/* A reweight is a normal gate step: it consumes one sequence slot. */
+	seq  = __sync_fetch_and_add(&cctx->seq, 1);
+	head = !(seq == (u32)-1 || (seq & INF_GATE_MASK) == INF_GATE_MASK);
+	key  = head ? inf_head_key(cctx) : inf_tail_key(cctx);
+	tctx->slice_ns = inf_quantum(new, READ_ONCE(cctx->w_sum) + new);
+
+	inf_queue_charge(cctx, new);
+	ret = inf_queue_insert(queue, node, key, tctx->slice_ns);
+	if (ret) {
+		inf_queue_uncharge(cctx, new);
+
+		/* Put the node back where it was and keep the old weight. */
+		inf_queue_charge(cctx, old);
+		if (inf_queue_insert(queue, node, old_key, tctx->slice_ns)) {
+			inf_queue_uncharge(cctx, old);
+			tctx->queued_cpu = -1;
+			if (inf_requeue_task(p, tctx, cpu))
+				INF_STAT_INC(lost_state_errors);
+		}
+		inf_queue_drop(node);
+		tctx->moving = 0;
+		return;
+	}
+
+	tctx->queued_cpu       = cpu;
+	tctx->state	       = INF_TASK_QUEUED;
+	tctx->reweight_pending = 0;
+	inf_resolve_pending(p, tctx);
+	inf_queue_drop(node);
+	tctx->moving = 0;
+	INF_STAT_INC(reweight_moves);
+}
+
+/*
+ * Move a runnable queued target to the head of its own queue. The weight
+ * and the queue membership do not change, so neither the weight sum nor
+ * the 7:1 gate advances. A target that is running, in a local DSQ,
+ * throttled, exiting or not queued is refused.
+ */
+static __noinline bool inf_yield_to(struct task_struct *from,
+				    struct task_struct *to)
+{
+	struct inf_cpu_ctx *cctx;
+	inf_queue_t	   *queue;
+	inf_queue_node_t   *node;
+	task_ctx	   *tctx;
+	u64		    old_key, key, slice, w;
+	s32		    tcpu;
+	int		    ret;
+
+	if (!to || to == from)
+		return false;
+	if (to->flags & PF_EXITING)
+		return false;
+	if (scx_bpf_task_running(to))
+		return false;
+
+	tctx = inf_task_ctx(to);
+	if (!tctx)
+		return false;
+	if (tctx->state != INF_TASK_QUEUED || tctx->queued_cpu < 0)
+		return false;
+
+	tcpu = tctx->queued_cpu;
+	/* A task in a sched_ext local DSQ is not in our queue. */
+	if (to == __COMPAT_scx_bpf_cpu_curr(tcpu))
+		return false;
+
+	queue = inf_queue(tcpu);
+	cctx  = inf_cpu_ctx(tcpu);
+	if (!queue || !cctx)
+		return false;
+
+	/* One writer owns the node. A lost race is a refusal, not a move. */
+	if (cmpxchg(&tctx->moving, 0, 1))
+		return false;
+
+	node = &tctx->qnode;
+	inf_queue_hold(node);
+	old_key = inf_queue_node_key(node);
+	slice	= tctx->slice_ns ? tctx->slice_ns : 1;
+	w	= tctx->weight ? tctx->weight : 1;
+
+	ret	= inf_queue_remove(queue, node);
+	if (ret) {
+		if (ret == -EINVAL) {
+			/*
+			 * The node was already unlinked and its charge was
+			 * released by that path. Only the membership and
+			 * the state remain to be cleared.
+			 */
+			tctx->queued_cpu = -1;
+			tctx->state	 = INF_TASK_IDLE;
+		} else {
+			INF_STAT_INC(lost_state_errors);
+		}
+		inf_queue_drop(node);
+		tctx->moving = 0;
+		return false;
+	}
+
+	/*
+	 * The newest head key, without a gate step: the target runs before
+	 * every queued head and tail task and the 7:1 ratio is unchanged.
+	 */
+	key = inf_head_key(cctx);
+	if (inf_queue_insert(queue, node, key, slice)) {
+		if (inf_queue_insert(queue, node, old_key, slice)) {
+			/* Put the task back at the tail rather than lose it. */
+			inf_queue_uncharge(cctx, w);
+			tctx->queued_cpu = -1;
+			tctx->state	 = INF_TASK_IDLE;
+			if (inf_requeue_task(to, tctx, tcpu))
+				INF_STAT_INC(lost_state_errors);
+		}
+		inf_queue_drop(node);
+		tctx->moving = 0;
+		return false;
+	}
+
+	tctx->queued_cpu = tcpu;
+	tctx->state	 = INF_TASK_QUEUED;
+	inf_resolve_pending(to, tctx);
+	inf_queue_drop(node);
+	tctx->moving = 0;
+	INF_STAT_INC(yield_to_moves);
+	return true;
 }
 
 bool BPF_STRUCT_OPS(infinity_yield, struct task_struct *from,
 		    struct task_struct *to)
 {
-	struct inf_stats *stats;
-	task_ctx	 *tctx;
+	task_ctx *tctx;
+	bool	  moved = false;
 
-	(void)to;
+	TOUCH_ARENA();
 
 	if (!from)
 		return false;
@@ -958,28 +1605,37 @@ bool BPF_STRUCT_OPS(infinity_yield, struct task_struct *from,
 	if (tctx)
 		tctx->yielded = 1;
 
-	stats = inf_stats();
-	if (stats)
-		__sync_fetch_and_add(&stats->yields, 1);
+	if (to && to != from)
+		moved = inf_yield_to(from, to);
 
-	return false;
+	INF_STAT_INC(yields);
+
+	return moved;
 }
 
 void BPF_STRUCT_OPS(infinity_running, struct task_struct *p)
 {
-	task_ctx *tctx = inf_task_ctx(p);
+	task_ctx *tctx;
 
-	if (tctx)
+	TOUCH_ARENA();
+
+	tctx = inf_task_ctx(p);
+	if (tctx) {
 		tctx->last_running_ns = scx_bpf_now();
+		tctx->state	      = INF_TASK_RUNNING;
+	}
 }
 
 void BPF_STRUCT_OPS(infinity_stopping, struct task_struct *p, bool runnable)
 {
-	task_ctx *tctx = inf_task_ctx(p);
+	task_ctx *tctx;
 	u64	  now, delta;
 
 	(void)runnable;
 
+	TOUCH_ARENA();
+
+	tctx = inf_task_ctx(p);
 	if (!tctx)
 		return;
 
@@ -999,6 +1655,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init_task, struct task_struct *p,
 
 	(void)args;
 
+	TOUCH_ARENA();
+
 	tctx = inf_task_ctx_alloc(p);
 	if (!tctx)
 		return -ENOMEM;
@@ -1009,40 +1667,96 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init_task, struct task_struct *p,
 		((char __arena *)tctx)[i] = 0;
 	}
 
-	tctx->base_weight     = p->scx.weight ? p->scx.weight : 1;
-	tctx->weight	      = tctx->base_weight;
-	tctx->group_scale     = SCX_CGROUP_WEIGHT_ONE;
-	tctx->slice_ns	      = 0;
-	tctx->last_running_ns = scx_bpf_now();
-	tctx->queued_cpu      = -1;
-	tctx->group_cpu	      = -1;
-	tctx->joined	      = 0;
-	tctx->yielded	      = 0;
-	tctx->wake_fork	      = 0;
-	tctx->idle	      = 0;
-	tctx->pid	      = p->pid;
+	/* The queue node starts detached with a zero hold count. */
+	if (inf_queue_node_init(&tctx->qnode)) {
+		scx_task_free_rcu(p);
+		return -EINVAL;
+	}
+
+	tctx->base_weight      = p->scx.weight ? p->scx.weight : 1;
+	tctx->weight	       = tctx->base_weight;
+	tctx->group_scale      = SCX_CGROUP_WEIGHT_ONE;
+	tctx->slice_ns	       = 0;
+	tctx->last_running_ns  = scx_bpf_now();
+	tctx->weight_epoch     = 0;
+	tctx->queued_cpu       = -1;
+	tctx->group_cpu	       = -1;
+	tctx->state	       = INF_TASK_IDLE;
+	tctx->moving	       = 0;
+	tctx->reweight_pending = 0;
+	tctx->dequeue_pending  = 0;
+	tctx->exit_pending     = 0;
+	tctx->joined	       = 0;
+	tctx->yielded	       = 0;
+	tctx->wake_fork	       = 0;
+	tctx->idle	       = 0;
+	tctx->pid	       = p->pid;
 	return 0;
 }
 
 s32 BPF_STRUCT_OPS(infinity_exit_task, struct task_struct *p,
 		   struct scx_exit_task_args *args)
 {
-	task_ctx *tctx = inf_task_ctx(p);
+	struct inf_cpu_ctx *cctx;
+	task_ctx	   *tctx;
+	u64		    w;
+	s32		    cpu;
+	int		    ret;
 
 	(void)args;
 
-	if (tctx) {
-		if (tctx->joined)
-			scx_cgroup_ctl_leave(p, tctx->group_cpu,
-					     tctx->base_weight);
-		/*
-		 * Mark the task dead in the bandwidth queues before freeing the
-		 * context; concurrent drains holding the task must finish.
-		 */
-		if (inf_cpu_bw_enabled())
-			scx_cgroup_ctl_cancel((u64)tctx,
-					      SCX_CGROUP_BW_CANCEL_DROP);
+	TOUCH_ARENA();
+
+	tctx = inf_task_ctx(p);
+	if (!tctx) {
+		scx_task_free_rcu(p);
+		return 0;
 	}
+
+	tctx->state = INF_TASK_EXITING;
+
+	if (tctx->joined)
+		scx_cgroup_ctl_leave(p, tctx->group_cpu, tctx->base_weight);
+
+	/*
+	 * Remove the task from its scheduler queue and release the charge
+	 * only when this path wins the unlink. A concurrent mover has
+	 * already released it.
+	 */
+	cpu = tctx->queued_cpu;
+	if (cpu >= 0) {
+		inf_queue_t *queue = inf_queue(cpu);
+
+		cctx		   = inf_cpu_ctx(cpu);
+		w = tctx->weight ? tctx->weight : inf_task_weight(p);
+		if (queue && !inf_queue_remove(queue, &tctx->qnode)) {
+			if (cctx)
+				inf_queue_uncharge(cctx, w);
+			tctx->queued_cpu = -1;
+		} else if (queue) {
+			/* -EINVAL: already unlinked. The charge is gone too. */
+			tctx->queued_cpu = -1;
+		}
+	}
+
+	/*
+	 * Unlink any remaining node and wait for the last pop or steal
+	 * hold. A non-zero return means a hold never dropped; leak the
+	 * context rather than free memory another CPU may still use.
+	 */
+	ret = inf_queue_node_detach(&tctx->qnode);
+	if (ret) {
+		scx_bpf_error("infinity: queue detach failed for pid %d: %d",
+			      p->pid, ret);
+		return 0;
+	}
+
+	/*
+	 * Mark the task dead in the bandwidth queues before freeing the
+	 * context; concurrent drains holding the task must finish.
+	 */
+	if (inf_cpu_bw_enabled())
+		scx_cgroup_ctl_cancel((u64)tctx, SCX_CGROUP_BW_CANCEL_DROP);
 
 	scx_task_free_rcu(p);
 	return 0;
@@ -1086,6 +1800,8 @@ void BPF_STRUCT_OPS(infinity_cgroup_move, struct task_struct *p,
 	task_ctx		     *tctx;
 	int			      ret;
 
+	TOUCH_ARENA();
+
 	tctx = inf_task_ctx(p);
 	if (!tctx)
 		return;
@@ -1117,12 +1833,18 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init)
 		.enable_bw = enable_cpu_bw,
 	};
 	u32 ncpu = inf_nr_cpu_ids();
-	u32 key;
+	u32 key, pages;
 	s32 cpu;
 	int ret;
 
+	TOUCH_ARENA();
+
 	if (ncpu > INF_MAX_CPUS)
 		ncpu = INF_MAX_CPUS;
+	if (!ncpu) {
+		scx_bpf_error("infinity: no possible CPUs");
+		return -EINVAL;
+	}
 
 	/*
 	 * Bring up cpu.weight and cpu.idle, and cpu.max when the loader kept
@@ -1136,9 +1858,28 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init)
 	}
 
 	/*
-	 * Array maps start zeroed. Seed both key runs before any CPU can
-	 * enqueue, and create one DSQ per possible CPU.
+	 * One scheduler-owned queue per possible CPU. The block lives in
+	 * the BPF arena and is never resized; a CPU index selects an entry.
+	 * The arena frees the whole block when the map is destroyed.
 	 */
+	pages = (ncpu * (u32)sizeof(*inf_queues) + PAGE_SIZE - 1) / PAGE_SIZE;
+	inf_queues =
+		bpf_arena_alloc_pages(&arena, NULL, pages, NUMA_NO_NODE, 0);
+	if (!inf_queues) {
+		scx_bpf_error("infinity: failed to allocate %u queue pages",
+			      pages);
+		return -ENOMEM;
+	}
+	inf_nr_queues = ncpu;
+
+	bpf_for(cpu, 0, INF_MAX_CPUS)
+	{
+		if ((u32)cpu >= ncpu)
+			break;
+		inf_queue_init(&inf_queues[cpu]);
+	}
+
+	/* Array maps start zeroed. Seed both key runs before any enqueue. */
 	bpf_for(cpu, 0, INF_MAX_CPUS)
 	{
 		if (cpu < 0)
@@ -1146,26 +1887,13 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init)
 		key  = (u32)cpu;
 		cctx = bpf_map_lookup_elem(&cpu_ctx_stor, &key);
 		if (cctx) {
-			cctx->head_seq = INF_KEY_MID;
-			cctx->tail_seq = INF_KEY_MID;
-			cctx->w_sum    = 0;
-			cctx->depth    = 0;
-			cctx->seq      = 0;
-		}
-	}
-
-	bpf_for(cpu, 0, INF_MAX_CPUS)
-	{
-		if (cpu < 0)
-			continue;
-		if ((u32)cpu >= ncpu)
-			break;
-		ret = scx_bpf_create_dsq((u64)cpu,
-					 __COMPAT_scx_bpf_cpu_node(cpu));
-		if (ret < 0 && ret != -EEXIST) {
-			scx_bpf_error("failed to create DSQ for cpu %d: %d",
-				      cpu, ret);
-			return ret;
+			cctx->head_seq		= INF_KEY_MID;
+			cctx->tail_seq		= INF_KEY_MID;
+			cctx->w_sum		= 0;
+			cctx->depth		= 0;
+			cctx->seq		= 0;
+			cctx->steal_llc_cursor	= 0;
+			cctx->steal_node_cursor = 0;
 		}
 	}
 
@@ -1174,6 +1902,14 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init)
 
 void BPF_STRUCT_OPS(infinity_exit, struct scx_exit_info *ei)
 {
+	TOUCH_ARENA();
+
+	/*
+	 * The arena owns the queue block. Drop the scheduler pointer before
+	 * the map is destroyed; no callback runs after ops.exit().
+	 */
+	inf_queues    = NULL;
+	inf_nr_queues = 0;
 	UEI_RECORD(uei, ei);
 }
 

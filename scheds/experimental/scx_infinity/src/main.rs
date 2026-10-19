@@ -309,6 +309,16 @@ impl<'a> Scheduler<'a> {
         let mut cgrp_reenqueued = 0u64;
         let mut cgrp_eff_weight = 0u64;
         let mut cgrp_scale = 0u64;
+        let mut steals = 0u64;
+        let mut steal_llc = 0u64;
+        let mut steal_node = 0u64;
+        let mut yield_to_moves = 0u64;
+        let mut reweight_moves = 0u64;
+        let mut stale_pops = 0u64;
+        let mut lost_state_errors = 0u64;
+        let mut requeues = 0u64;
+        let mut weight_changes = 0u64;
+        let mut reweight_queued = 0u64;
 
         let key = 0u32.to_ne_bytes();
         if let Ok(Some(rows)) = self
@@ -334,6 +344,16 @@ impl<'a> Scheduler<'a> {
                 cgrp_reenqueued += stats.cgrp_reenqueued;
                 cgrp_eff_weight = cgrp_eff_weight.max(stats.cgrp_eff_weight);
                 cgrp_scale = cgrp_scale.max(stats.cgrp_scale);
+                steals += stats.steals;
+                steal_llc += stats.steal_llc;
+                steal_node += stats.steal_node;
+                yield_to_moves += stats.yield_to_moves;
+                reweight_moves += stats.reweight_moves;
+                stale_pops += stats.stale_pops;
+                lost_state_errors += stats.lost_state_errors;
+                requeues += stats.requeues;
+                weight_changes += stats.weight_changes;
+                reweight_queued += stats.reweight_queued;
             }
         }
 
@@ -360,7 +380,11 @@ impl<'a> Scheduler<'a> {
              expiries={expiries} preemptions={preemptions} yields={yields} \
              depth={depth} cgrp: throttled={cgrp_throttled} \
              reenqueued={cgrp_reenqueued} eff_weight={cgrp_eff_weight} \
-             scale_q10={cgrp_scale}"
+             scale_q10={cgrp_scale} queue: steals={steals} \
+             llc={steal_llc} node={steal_node} yield_to={yield_to_moves} \
+             reweight={reweight_moves} stale={stale_pops} \
+             lost={lost_state_errors} requeues={requeues} \
+             weight_changes={weight_changes} queued={reweight_queued}"
         );
     }
 

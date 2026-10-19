@@ -23,7 +23,7 @@ Revision 3 specifies one scheduler-owned queue per CPU. A sched_ext
 local DSQ runs only the task that the scheduler selected. The ready
 queue, its holds and its exact removal stay under scheduler control. The
 default queue is `scx_edq` from `scheds/include/lib/edq.h`. A FIFO
-intrusive list is a second prototype behind the `queue-fifo` build
+intrusive list is a second prototype behind the `queue-list` build
 feature. It exists to measure the queue cost. EDQ wins a correctness tie
 because it provides a hold count and exact node removal.
 
@@ -141,7 +141,7 @@ sudo ./scripts/infinity_vm_preflight.sh
 The default queue is EDQ. The FIFO measurement prototype builds with:
 
 ```
-cargo build -p scx_infinity --features queue-fifo
+cargo build -p scx_infinity --features queue-list
 ```
 
 For a release binary:
@@ -285,7 +285,7 @@ never crosses a node. Real hardware and a node hotplug remain unverified.
 Linux with `sched_ext` enabled (`CONFIG_SCHED_CLASS_EXT`), BPF arena
 support, and the sched_ext cgroup callbacks. Run
 `scripts/infinity_vm_preflight.sh` in the guest to check them. Build with
-`cargo build -p scx_infinity`. The FIFO prototype needs the `queue-fifo`
+`cargo build -p scx_infinity`. The FIFO prototype needs the `queue-list`
 Cargo feature.
 
 ## Deviations from the reference

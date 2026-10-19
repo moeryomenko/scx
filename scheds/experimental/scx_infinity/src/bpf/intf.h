@@ -2,13 +2,14 @@
 /*
  * Shared definitions for scx_infinity.
  *
- * The scheduler keeps one vtime-ordered DSQ per CPU. A scheduler-owned
- * sequence key gives the DSQ bounded-LIFO order: a head insert takes the
+ * The scheduler keeps one scheduler-owned queue per CPU. A scheduler-owned
+ * sequence key gives the queue bounded-LIFO order: a head insert takes the
  * next key below INF_KEY_MID, a tail insert the next key above it, so the
- * ascending vtime order pops the newest head insert first and a tail
- * insert last. The 7:1 gate and the key ranges are fixed. The base
- * quantum and the placement preferences live in `struct inf_cfg` and a
- * SIGHUP reload replaces them.
+ * queue pops the newest head insert first and a tail insert last. The 7:1
+ * gate and the key ranges are fixed. The queue itself is either the EDQ
+ * from lib/edq.h or the intrusive FIFO list selected by the queue-list
+ * build feature. The base quantum and the placement preferences live in
+ * `struct inf_cfg` and a SIGHUP reload replaces them.
  *
  * Placement is locality-first. The loader seeds one topology row per
  * CPU and one NUMA distance row per node, and the scheduler keeps the
@@ -62,6 +63,69 @@ typedef signed long    s64;
 #define INF_MAX_CPUS 1024
 #define INF_MAX_CGROUPS 2048
 #define INF_MAX_NODES 64
+
+/* At most eight peers are examined in each dispatch steal tier. */
+#define INF_STEAL_SCAN_MAX 8
+
+/*
+ * Queue implementation selected at build time. EDQ is the default and the
+ * supported integration. The queue-list feature trades the EDQ hold count
+ * for an intrusive FIFO list and exists to measure the queue cost.
+ */
+#define INF_QUEUE_KIND_EDQ 0
+#define INF_QUEUE_KIND_LIST 1
+#ifdef INF_QUEUE_LIST
+#define INF_QUEUE_KIND INF_QUEUE_KIND_LIST
+#else
+#define INF_QUEUE_KIND INF_QUEUE_KIND_EDQ
+#endif
+
+/* Scheduler queue membership and task lifetime states. */
+#define INF_TASK_IDLE 0
+#define INF_TASK_QUEUED 1
+#define INF_TASK_DISPATCHED 2
+#define INF_TASK_RUNNING 3
+#define INF_TASK_PARKED 4
+#define INF_TASK_EXITING 5
+
+/*
+ * Arena allocation size for the task context. The real struct embeds the
+ * cgroup bandwidth context at offset 0 and one queue node. The loader only
+ * needs the size, which a static assertion in main.bpf.c checks.
+ */
+#define INF_TASK_CTX_SIZE 512
+
+/*
+ * One queue node per task. The default node is struct scx_edq_task and
+ * the queue-list prototype node is smaller, so the arena layout reserves
+ * the size of the selected implementation. Static assertions in
+ * main.bpf.c check each implementation against this value.
+ */
+#ifdef INF_QUEUE_LIST
+#define INF_QUEUE_NODE_BYTES 48
+#else
+#define INF_QUEUE_NODE_BYTES 96
+#endif
+
+/* Peer steal tiers and the per-tier scan bound. */
+#define INF_STEAL_MAX_PEERS 8
+/*
+ * Upper bound on the CPU ids one tier walk inspects. The walk stops after
+ * eight peers in the tier; this bound keeps the verifier state small on a
+ * machine with many CPUs. The cursor carries the walk forward, so a peer
+ * outside the window is reached on a later dispatch.
+ */
+#define INF_STEAL_SCAN_CPUS 64
+#define INF_STEAL_LLC 0
+#define INF_STEAL_NODE 1
+
+/* Queue node states, mirrored by the Rust model. */
+#define INF_TASK_IDLE 0
+#define INF_TASK_QUEUED 1
+#define INF_TASK_DISPATCHED 2
+#define INF_TASK_RUNNING 3
+#define INF_TASK_PARKED 4
+#define INF_TASK_EXITING 5
 
 /*
  * Arena allocation size for the bandwidth task context. The struct holds
@@ -122,6 +186,8 @@ struct inf_cpu_ctx {
 	u64 w_sum;
 	s64 depth;
 	u32 seq;
+	u32 steal_llc_cursor;
+	u32 steal_node_cursor;
 	u32 pad;
 };
 
@@ -157,13 +223,20 @@ struct inf_node_topo {
 
 struct inf_task_ctx_layout {
 	u8  cg_bw[INF_CGROUP_BW_CTX_SIZE];
+	u8  qnode[INF_QUEUE_NODE_BYTES];
 	u64 base_weight;
 	u64 weight;
 	u64 group_scale;
 	u64 slice_ns;
 	u64 last_running_ns;
+	u64 weight_epoch;
 	s32 queued_cpu;
 	s32 group_cpu;
+	u32 state;
+	u32 moving;
+	u32 reweight_pending;
+	u32 dequeue_pending;
+	u32 exit_pending;
 	u32 joined;
 	u32 yielded;
 	u32 wake_fork;
@@ -183,6 +256,17 @@ struct inf_stats {
 	u64 cgrp_reenqueued;
 	u64 cgrp_eff_weight;
 	u64 cgrp_scale;
+	u64 steals;
+	u64 steal_llc;
+	u64 steal_node;
+	u64 yield_to_moves;
+	u64 reweight_moves;
+	u64 stale_pops;
+	u64 lost_state_errors;
+	u64 requeues;
+	u64 weight_changes;
+	u64 reweight_queued;
+	u64 weight_queued_cpu;
 };
 
 /*
