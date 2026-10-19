@@ -165,14 +165,23 @@ Linux with `sched_ext` enabled (`CONFIG_SCHED_CLASS_EXT`). Build with
 
 ## Current limitations
 
-- The cgroup weight is applied per task, not through a per-cgroup load
-  normalizer. Nested groups multiply their shares, but the exact
-  per-level ordering of the kernel hierarchy is not reproduced.
+- The cgroup hierarchy is folded into one effective weight per task, as
+  `scx_eevdf` does with a single runqueue. Nested shares multiply
+  correctly, but the exact per-level ordering of the kernel hierarchy is
+  not reproduced. A cgroup deeper than 32 levels uses its bottom 32
+  levels, the cgroup v2 cap.
+- Group loads are not decayed. A group that becomes empty updates on its
+  next member, which can under-credit it briefly. This affects fairness,
+  not safety.
 - Placement reads the topology once at load. A CPU set change needs a
   restart, and multi-node behavior is written for several nodes but has
   only been checked on a single-node host.
-- Cgroup bandwidth (`cpu.max`) is not linked yet. Only `cpu.weight` and
-  `cpu.idle` affect the effective weight.
+- `cpu.max` is limited to 2048 managed cgroups and 32 levels of nesting
+  by the bandwidth library defaults. A larger tree is accounted but the
+  excess is not enforced.
+- A task in a throttled group is parked in the bandwidth library's arena
+  backlog. The scheduler therefore needs arena support from the kernel
+  and uses clang 22 or newer, like other arena-based schedulers.
 - A cgroup weight change affects a queued task at its next enqueue or
   dispatch. A running task keeps the slice it started with.
 - A CPU set or topology change requires a scheduler restart.
