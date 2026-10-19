@@ -237,11 +237,13 @@ Linux with `sched_ext` enabled (`CONFIG_SCHED_CLASS_EXT`). Build with
 - Group loads are not decayed. A group that becomes empty updates on its
   next member, which can under-credit it briefly. This affects fairness,
   not safety.
-- A live `cpu.weight` ratio has not been demonstrated. In the integration
-  smoke run, two groups at weight 100 and 1000 on one CPU received an
-  equal share. The folded arithmetic is unit-tested, but the BPF weight
-  path needs a controlled runtime check. `cpu.max` does hold a
-  50 ms / 100 ms group near 50 percent.
+- A live `cpu.weight` or `cpu.idle` ratio has not been demonstrated. In
+  the integration smoke run, groups at weight 100 and 200, and also a
+  `cpu.idle` group against a normal group, received equal shares on one
+  CPU. The reported effective weight also reached 1000000. The folded
+  arithmetic is unit-tested, but the BPF weight path needs a controlled
+  runtime check. `cpu.max` does hold a 50 ms / 100 ms group near
+  50 percent.
 - Placement reads the topology once at load. A CPU set change needs a
   restart, and multi-node behavior is written for several nodes but has
   only been checked on a single-node host.
