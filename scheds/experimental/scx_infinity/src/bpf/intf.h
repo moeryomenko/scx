@@ -295,6 +295,9 @@ struct inf_cgroup_weight_stats {
 	u64 load_underflows;
 	u64 nr_underflows;
 	u64 epoch;
+	u64 init_idle;
+	u64 idle_on;
+	u64 idle_off;
 };
 
 /* Arguments for the one-shot arena/library init syscall. */

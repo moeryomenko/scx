@@ -399,6 +399,9 @@ impl<'a> Scheduler<'a> {
         let mut w_load_underflows = 0u64;
         let mut w_nr_underflows = 0u64;
         let mut w_epoch = 0u64;
+        let mut w_init_idle = 0u64;
+        let mut w_idle_on = 0u64;
+        let mut w_idle_off = 0u64;
         if let Ok(Some(rows)) = self
             .skel
             .maps
@@ -423,6 +426,9 @@ impl<'a> Scheduler<'a> {
                 w_load_underflows += stats.load_underflows;
                 w_nr_underflows += stats.nr_underflows;
                 w_epoch = w_epoch.max(stats.epoch);
+                w_init_idle += stats.init_idle;
+                w_idle_on += stats.idle_on;
+                w_idle_off += stats.idle_off;
             }
         }
 
@@ -458,7 +464,8 @@ impl<'a> Scheduler<'a> {
              cpu_moves={cgrp_cpu_moves} weight: joins={w_joins} leaves={w_leaves} \
              reweights={w_reweights} moves={w_moves} refolds={w_refolds} \
              underflow={w_load_underflows} nr_underflow={w_nr_underflows} \
-             epoch={w_epoch} queue: steals={steals} \
+             epoch={w_epoch} init_idle={w_init_idle} idle_on={w_idle_on} \
+             idle_off={w_idle_off} queue: steals={steals} \
              llc={steal_llc} node={steal_node} yield_to={yield_to_moves} \
              reweight={reweight_moves} stale={stale_pops} \
              lost={lost_state_errors} requeues={requeues} \

@@ -483,6 +483,8 @@ scx_cgroup_weight_init(struct cgroup *cgrp		 __arg_trusted,
 	group.idle	= bpf_core_field_exists(args->sched_idle) &&
 			  args->sched_idle;
 	group.level	= BPF_CORE_READ(cgrp, level);
+	if (group.idle)
+		SCW_STAT_INC(init_idle);
 	group.parent_id = group.level ? scw_parent_cgid(cgrp) : 0;
 
 	if (bpf_map_update_elem(&scw_groups, &cgid, &group, BPF_ANY))
@@ -571,6 +573,11 @@ __hidden void scx_cgroup_weight_set_idle(struct cgroup *cgrp __arg_trusted,
 	cgid = scw_cgroup_id(cgrp);
 	if (!cgid)
 		return;
+
+	if (idle)
+		SCW_STAT_INC(idle_on);
+	else
+		SCW_STAT_INC(idle_off);
 
 	g = scw_group_of(cgid);
 	if (g) {

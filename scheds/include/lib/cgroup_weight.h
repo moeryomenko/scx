@@ -61,6 +61,10 @@ struct scx_cgroup_weight_stats {
 	u64 load_underflows;
 	u64 nr_underflows;
 	u64 epoch;
+	/* Groups that arrived already idle and live idle changes. */
+	u64 init_idle;
+	u64 idle_on;
+	u64 idle_off;
 };
 
 /*
