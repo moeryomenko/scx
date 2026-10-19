@@ -202,6 +202,7 @@ setup_cgroups() {
         record FAIL cgroup "cannot create group b"
         exit 1
     fi
+    cleanup_push 'stop_all_workers'
     if (( KEEP )); then
         note cgroup "keep requested; groups at $CGROUP_PARENT"
     fi
@@ -234,15 +235,17 @@ start_burn() {
     local -r cg="$1"
     local -r tag="$2"
 
-    start_worker "$cg" "$CPU" "$HARNESS_TMP/${tag}.log" "$WORKLOAD" burn 3600
+    start_worker "$cg" "$CPU" "$HARNESS_TMP/${tag}.log" "$WORKLOAD" burn 3600 \
+        >/dev/null
 }
 
 start_pair() {
-    if ! PAIR_A_PID=$(start_burn "$CG_A" worker_a); then
+    if ! start_burn "$CG_A" worker_a; then
         record FAIL worker "cannot start worker a"
         return 1
     fi
-    if ! start_burn "$CG_B" worker_b >/dev/null; then
+    PAIR_A_PID=$HARNESS_LAST_PID
+    if ! start_burn "$CG_B" worker_b; then
         record FAIL worker "cannot start worker b"
         return 1
     fi
@@ -647,6 +650,8 @@ main() {
     local trial
 
     harness_init cgroup
+    mkdir -p "$HARNESS_TMP/config"
+    export XDG_CONFIG_HOME="$HARNESS_TMP/config"
     if [[ -n "$OUT" ]]; then
         HARNESS_JSON_OUT=$OUT
         : >"$OUT"

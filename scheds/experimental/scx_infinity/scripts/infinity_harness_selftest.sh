@@ -124,8 +124,30 @@ is_equal "stat_value reads reweight without matching reweights" "5" "$(stat_valu
 is_equal "stat_value returns 0 for a missing key" "0" "$(stat_value "$WORK/scheduler.log" absent)"
 is_equal "stat_value returns 0 for a missing log" "0" "$(stat_value "$WORK/missing.log" head)"
 
+# worker registration ------------------------------------------------
+mkdir "$WORK/fakecg"
+: >"$WORK/fakecg/cgroup.procs"
+if start_worker "$WORK/fakecg" 0 "$WORK/sleep.log" sleep 30 >/dev/null; then
+    pid=$HARNESS_LAST_PID
+    if ((${#HARNESS_WORKER_PIDS[@]} == 1)) &&
+       [[ "${HARNESS_WORKER_PIDS[0]}" == "$pid" ]]; then
+        ok "start_worker registers the PID in the parent shell"
+    else
+        not_ok "start_worker registers the PID in the parent shell"
+    fi
+    stop_all_workers
+    if ! kill -0 "$pid" 2>/dev/null && ((${#HARNESS_WORKER_PIDS[@]} == 0)); then
+        ok "stop_all_workers removes a registered worker"
+    else
+        not_ok "stop_all_workers removes a registered worker"
+    fi
+else
+    not_ok "start_worker starts a test worker" "taskset or sleep failed"
+fi
+
 # fail-closed entry points --------------------------------------------
-for script in infinity_cgroup_harness.sh infinity_queue_stress.sh infinity_numa_placement.sh; do
+for script in infinity_feature_preflight.sh infinity_cgroup_harness.sh \
+    infinity_queue_stress.sh infinity_numa_placement.sh; do
     if "$SCRIPT_DIR/$script" --help >/dev/null 2>&1; then
         ok "$script --help succeeds"
     else

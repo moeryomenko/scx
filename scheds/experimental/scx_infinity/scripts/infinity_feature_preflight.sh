@@ -23,7 +23,7 @@
 # read-only and also runs on a host.
 #
 # Output: one JSON object per line. The last line is the summary. Exit
-# codes: 0 PASS, 1 BLOCKED, 2 usage error.
+# codes: 0 PASS, 2 BLOCKED or usage error.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -84,14 +84,21 @@ if (( REQUIRE_VM )); then
     fi
     if (( detected == 0 )); then
         json_line BLOCKED "no virtual machine detected; --require-vm is set"
-        exit 1
+        exit 2
     fi
 fi
 
 ROOT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)
 if [[ -z "$ROOT" || ! -x "$ROOT/scripts/infinity_vm_preflight.sh" ]]; then
     json_line BLOCKED "repository preflight scripts/infinity_vm_preflight.sh is missing"
-    exit 1
+    exit 2
 fi
 
-exec "$ROOT/scripts/infinity_vm_preflight.sh" --json --strict "${PASSTHROUGH[@]}"
+set +e
+"$ROOT/scripts/infinity_vm_preflight.sh" --json --strict "${PASSTHROUGH[@]}"
+rc=$?
+set -e
+if (( rc == 1 )); then
+    exit 2
+fi
+exit "$rc"

@@ -190,6 +190,7 @@ setup_cgroup() {
         record FAIL cgroup "cannot create the stress cgroup"
         exit 1
     fi
+    cleanup_push 'stop_all_workers'
 }
 
 start_one() {
@@ -449,11 +450,12 @@ phase_reweight() {
 
     changes0=$(stat_value "$SCHED_LOG" weight_changes)
     refolds0=$(stat_value "$SCHED_LOG" refolds)
-    if ! pid=$(start_worker "$CG_STRESS" 0 "$HARNESS_TMP/reweight_worker.log" \
-        "$WORKLOAD" burn "$DURATION"); then
+    if ! start_worker "$CG_STRESS" 0 "$HARNESS_TMP/reweight_worker.log" \
+        "$WORKLOAD" burn "$DURATION" >/dev/null; then
         record FAIL reweight "cannot start the reweight worker"
         return
     fi
+    pid=$HARNESS_LAST_PID
     sleep 1
     if ! renice 5 -p "$pid" >/dev/null 2>&1; then
         stop_all_workers
@@ -571,6 +573,8 @@ teardown() {
 
 main() {
     harness_init queue_stress
+    mkdir -p "$HARNESS_TMP/config"
+    export XDG_CONFIG_HOME="$HARNESS_TMP/config"
     if [[ -n "$OUT" ]]; then
         HARNESS_JSON_OUT=$OUT
         : >"$OUT"

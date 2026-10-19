@@ -192,6 +192,7 @@ setup_cgroup() {
         record FAIL cgroup "cannot create the burn cgroup"
         exit 1
     fi
+    cleanup_push 'stop_all_workers'
 }
 
 # Run one probe. Args: start_cpu tag mask [broaden]
@@ -412,6 +413,8 @@ teardown() {
 
 main() {
     harness_init numa_placement
+    mkdir -p "$HARNESS_TMP/config"
+    export XDG_CONFIG_HOME="$HARNESS_TMP/config"
     if [[ -n "$OUT" ]]; then
         HARNESS_JSON_OUT=$OUT
         : >"$OUT"

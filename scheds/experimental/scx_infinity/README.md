@@ -300,7 +300,8 @@ sudo scripts/infinity_vm_preflight.sh --json --strict
 The repository preflight checks `sched_ext`, the BPF arena, the cgroup v2
 cpu controller, `cpu.idle` and the sched_ext cgroup callbacks. Strict
 mode requires the runtime file, not the kernel configuration alone. The
-harness wrapper adds the VM gate:
+harness wrapper adds the VM gate. It has no FAIL state: a missing feature
+is BLOCKED with exit 2.
 
 ```
 sudo \

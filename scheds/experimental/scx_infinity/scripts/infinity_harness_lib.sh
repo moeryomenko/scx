@@ -33,6 +33,7 @@ HARNESS_BLOCKED=0
 HARNESS_CGROUP_ROOT=""
 HARNESS_CGROUP_SUBTREE_ADDED=0
 HARNESS_WORKER_PIDS=()
+HARNESS_LAST_PID=""
 HARNESS_SCHED_PID=""
 HARNESS_SCHED_RC=""
 HARNESS_CLEANUP=()
@@ -432,6 +433,7 @@ start_worker() {
         return 1
     fi
     HARNESS_WORKER_PIDS+=("$pid")
+    HARNESS_LAST_PID=$pid
     printf '%s\n' "$pid"
 }
 
