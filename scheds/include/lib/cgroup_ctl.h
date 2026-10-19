@@ -56,24 +56,29 @@ int  scx_cgroup_ctl_set_bandwidth(struct cgroup *cgrp __arg_trusted,
  * cache. @base_weight and @cpu describe the weight contribution only when
  * @queued is set; otherwise the task is not accounted in a group.
  */
-int  scx_cgroup_ctl_move(struct task_struct *p __arg_trusted, u64 taskc,
-			 struct cgroup *from __arg_trusted,
-			 struct cgroup *to __arg_trusted, s32 cpu,
-			 u64 base_weight, bool queued);
+int scx_cgroup_ctl_move(struct task_struct *p __arg_trusted, u64 taskc,
+			struct cgroup *from __arg_trusted,
+			struct cgroup *to __arg_trusted, s32 cpu,
+			u64 base_weight, bool queued);
 
-int  scx_cgroup_ctl_throttled(struct task_struct *p __arg_trusted, u64 taskc);
-int  scx_cgroup_ctl_put_aside(struct task_struct *p __arg_trusted, u64 taskc,
-			      u64 vtime);
-int  scx_cgroup_ctl_reenqueue(void);
-int  scx_cgroup_ctl_consume(struct task_struct *p __arg_trusted, u64 taskc,
-			    u64 consumed_ns);
-int  scx_cgroup_ctl_cancel(u64 taskc, u64 flags);
+int scx_cgroup_ctl_throttled(struct task_struct *p __arg_trusted, u64 taskc);
+int scx_cgroup_ctl_put_aside(struct task_struct *p __arg_trusted, u64 taskc,
+			     u64 vtime);
+int scx_cgroup_ctl_reenqueue(void);
+int scx_cgroup_ctl_consume(struct task_struct *p __arg_trusted, u64 taskc,
+			   u64 consumed_ns);
+int scx_cgroup_ctl_cancel(u64 taskc, u64 flags);
 
-int  scx_cgroup_ctl_weight(struct task_struct *p __arg_trusted, s32 cpu,
-			   bool joining, struct scx_cgroup_weight_info *out);
-int  scx_cgroup_ctl_weight_fold(struct cgroup *cgrp __arg_trusted, s32 cpu,
-				u64 base_weight, bool joining,
-				struct scx_cgroup_weight_info *out);
+int scx_cgroup_ctl_weight(struct task_struct *p __arg_trusted, s32 cpu,
+			  bool joining, struct scx_cgroup_weight_info *out);
+int scx_cgroup_ctl_weight_fold(struct cgroup *cgrp __arg_trusted, s32 cpu,
+			       u64 base_weight, bool joining,
+			       struct scx_cgroup_weight_info *out);
+int scx_cgroup_ctl_weight_refresh(struct task_struct *p __arg_trusted, s32 cpu,
+				  u64				 base_weight,
+				  struct scx_cgroup_weight_info *out);
+/* Epoch of the last cpu.weight or cpu.idle change. */
+u64  scx_cgroup_ctl_epoch(void);
 void scx_cgroup_ctl_join(struct task_struct *p __arg_trusted, s32 cpu,
 			 u64 base_weight);
 void scx_cgroup_ctl_leave(struct task_struct *p __arg_trusted, s32 cpu,

@@ -184,6 +184,28 @@ __hidden int scx_cgroup_ctl_weight_fold(struct cgroup *cgrp __arg_trusted,
 	return scx_cgroup_weight_fold(cgrp, cpu, base_weight, joining, out);
 }
 
+__hidden int scx_cgroup_ctl_weight_refresh(struct task_struct *p __arg_trusted,
+					   s32 cpu, u64 base_weight,
+					   struct scx_cgroup_weight_info *out)
+{
+	if (!ctl_weight_enabled && out) {
+		out->weight = base_weight ? base_weight : 1;
+		out->scale  = SCX_CGROUP_WEIGHT_ONE;
+		out->idle   = 0;
+		return 0;
+	}
+
+	return scx_cgroup_weight_refresh(p, cpu, base_weight, out);
+}
+
+__hidden u64 scx_cgroup_ctl_epoch(void)
+{
+	if (!ctl_weight_enabled)
+		return 0;
+
+	return scx_cgroup_weight_epoch();
+}
+
 __hidden void scx_cgroup_ctl_join(struct task_struct *p __arg_trusted, s32 cpu,
 				  u64 base_weight)
 {

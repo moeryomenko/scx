@@ -255,7 +255,19 @@ struct inf_stats {
 	u64 cgrp_throttled;
 	u64 cgrp_reenqueued;
 	u64 cgrp_eff_weight;
+	u64 cgrp_eff_min;
+	u64 cgrp_eff_max;
+	u64 cgrp_eff_samples;
 	u64 cgrp_scale;
+	u64 cgrp_refolds;
+	u64 deq_core_sched_exec;
+	u64 deq_sleep;
+	u64 deq_sched_change;
+	u64 deq_keep;
+	u64 q_sleep;
+	u64 q_sched_change;
+	u64 q_keep;
+	u64 cgrp_cpu_moves;
 	u64 steals;
 	u64 steal_llc;
 	u64 steal_node;
@@ -270,21 +282,19 @@ struct inf_stats {
 };
 
 /*
- * Mirror of the shared cgroup library counters, read from
- * scx_cgroup_global_stor and scx_cgroup_weight_stor. A static assertion
- * in main.bpf.c keeps the layout identical to lib/cgroup_weight.h.
+ * Mirror of lib/cgroup_weight.bpf.c's counter map. A static assertion in
+ * main.bpf.c keeps the layout identical to struct
+ * scx_cgroup_weight_stats in lib/cgroup_weight.h.
  */
-struct inf_cgroup_global_stats {
-	u64 throttle_events;
-	s64 nr_throttled_groups;
-	u64 nr_cgroups;
-};
-
 struct inf_cgroup_weight_stats {
-	u64 samples;
-	u64 sum;
-	u64 min;
-	u64 max;
+	u64 joins;
+	u64 leaves;
+	u64 reweights;
+	u64 moves;
+	u64 refolds;
+	u64 load_underflows;
+	u64 nr_underflows;
+	u64 epoch;
 };
 
 /* Arguments for the one-shot arena/library init syscall. */

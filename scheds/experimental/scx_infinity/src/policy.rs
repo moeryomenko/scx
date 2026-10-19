@@ -136,6 +136,99 @@ pub fn should_preempt(head_slot: bool, victim_slice: u64, preempt_margin_ns: u64
     head_slot && victim_slice > preempt_margin_ns
 }
 
+/// Why a task left the BPF scheduler's custody. Mirrors the flags that
+/// `ops.dequeue()` and `ops.quiescent()` receive from the core.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeqReason {
+    /// The core ran a task that was still queued. The task stays runnable.
+    CoreSchedExec,
+    /// The task is no longer runnable.
+    Sleep,
+    /// The task left for a property change or a class change.
+    SchedChange,
+    /// Any other custody transfer or dispatch pop.
+    Other,
+}
+
+/// True when the reason ends a runnable period, so the group load drops.
+///
+/// Only a sleep or a property change ends the period. A core-scheduled
+/// execution and a plain dispatch pop both leave a runnable task.
+pub fn dequeue_ends_runnable(reason: DeqReason) -> bool {
+    matches!(reason, DeqReason::Sleep | DeqReason::SchedChange)
+}
+
+/// One cgroup's account on one CPU. Mirrors the join, leave and fold of
+/// `lib/cgroup_weight.bpf.c` so the transition matrix can be tested
+/// without a kernel.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GroupAccount {
+    /// `cpu.weight` (shares) of the group.
+    pub shares: u64,
+    /// Sum of the joined member weights, including a running member.
+    pub load: u64,
+    /// Number of joined tasks in the group or below it.
+    pub nr: u64,
+    /// True while a task of this group is counted on this CPU.
+    pub joined: bool,
+}
+
+impl GroupAccount {
+    pub fn new(shares: u64) -> Self {
+        Self {
+            shares: shares.max(1),
+            ..Default::default()
+        }
+    }
+
+    /// Count a first enqueue of a runnable period. A repeat is a no-op.
+    pub fn join(&mut self, base: u64) {
+        if self.joined {
+            return;
+        }
+        self.nr += 1;
+        self.load += base;
+        self.joined = true;
+    }
+
+    /// Drop a task at the end of a runnable period. A repeat is a no-op.
+    pub fn leave(&mut self, base: u64) {
+        if !self.joined {
+            return;
+        }
+        self.nr = self.nr.saturating_sub(1);
+        self.load = self.load.saturating_sub(base);
+        self.joined = false;
+    }
+
+    /// Apply a dequeue or quiescent reason. Returns true when the load
+    /// dropped.
+    pub fn on_dequeue(&mut self, reason: DeqReason, base: u64) -> bool {
+        if !dequeue_ends_runnable(reason) || !self.joined {
+            return false;
+        }
+        self.leave(base);
+        true
+    }
+
+    /// A cgroup move: leave this group and join @to.
+    pub fn on_move(&mut self, base: u64, to: &mut GroupAccount) {
+        self.leave(base);
+        to.join(base);
+    }
+
+    /// A live `cpu.weight` change. A running task refolds at its next
+    /// enqueue or dispatch, so the new share is visible immediately here.
+    pub fn set_shares(&mut self, shares: u64) {
+        self.shares = shares.max(1);
+    }
+
+    /// Effective weight of a member of this group on this CPU.
+    pub fn effective_weight(&self, base: u64, idle: bool) -> u64 {
+        effective_weight(base as u32, &[(self.shares.max(1), self.load)], idle)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +418,133 @@ mod tests {
         for victim_slice in [margin + 1, QUANTUM_DEFAULT_NS, QUANTUM_MAX_NS] {
             assert!(should_preempt(true, victim_slice, margin));
         }
+    }
+
+    #[test]
+    fn the_dequeue_matrix_keeps_a_running_task_and_drops_a_sleeper() {
+        assert!(!dequeue_ends_runnable(DeqReason::CoreSchedExec));
+        assert!(!dequeue_ends_runnable(DeqReason::Other));
+        assert!(dequeue_ends_runnable(DeqReason::Sleep));
+        assert!(dequeue_ends_runnable(DeqReason::SchedChange));
+    }
+
+    #[test]
+    fn a_running_task_keeps_its_group_load() {
+        let mut a = GroupAccount::new(100);
+
+        a.join(100);
+        assert_eq!(a.load, 100);
+        assert_eq!(a.nr, 1);
+
+        /* The core runs a still-queued task: the period continues. */
+        assert!(!a.on_dequeue(DeqReason::CoreSchedExec, 100));
+        /* A plain dispatch pop also continues the period. */
+        assert!(!a.on_dequeue(DeqReason::Other, 100));
+
+        assert_eq!(a.load, 100);
+        assert_eq!(a.effective_weight(100, false), 100);
+        assert_eq!(a.effective_weight(200, false), 200);
+    }
+
+    #[test]
+    fn a_sleeper_drops_the_load_once_across_dequeue_and_quiescent() {
+        let mut a = GroupAccount::new(100);
+
+        a.join(100);
+        assert!(a.on_dequeue(DeqReason::Sleep, 100));
+        assert_eq!(a.load, 0);
+        assert_eq!(a.nr, 0);
+
+        /* A task the scheduler dispatched is seen by quiescent, not by
+         * dequeue; the second drop is a no-op either way. */
+        assert!(!a.on_dequeue(DeqReason::Sleep, 100));
+        assert_eq!(a.load, 0);
+    }
+
+    #[test]
+    fn a_property_change_drops_the_load_and_the_next_enqueue_rejoins() {
+        let mut a = GroupAccount::new(100);
+
+        a.join(100);
+        assert!(a.on_dequeue(DeqReason::SchedChange, 100));
+        assert_eq!(a.load, 0);
+
+        a.join(100);
+        assert_eq!(a.load, 100);
+        assert_eq!(a.effective_weight(100, false), 100);
+    }
+
+    #[test]
+    fn a_cgroup_move_transfers_the_load_between_groups() {
+        let mut from = GroupAccount::new(100);
+        let mut to = GroupAccount::new(200);
+
+        from.join(100);
+        assert_eq!(from.load, 100);
+        assert_eq!(to.load, 0);
+
+        from.on_move(100, &mut to);
+        assert_eq!(from.load, 0);
+        assert_eq!(from.nr, 0);
+        assert_eq!(to.load, 100);
+        assert_eq!(to.nr, 1);
+        /* The moved task now folds against the destination shares. */
+        assert_eq!(to.effective_weight(100, false), 200);
+    }
+
+    #[test]
+    fn a_live_share_change_moves_the_effective_weight() {
+        let mut a = GroupAccount::new(100);
+
+        a.join(100);
+        assert_eq!(a.effective_weight(100, false), 100);
+
+        /* The share change is seen at the next fold. */
+        a.set_shares(200);
+        assert_eq!(a.effective_weight(100, false), 200);
+        assert_eq!(a.effective_weight(50, false), 100);
+    }
+
+    #[test]
+    fn two_pinned_groups_hold_the_weight_ratio() {
+        let mut a = GroupAccount::new(100);
+        let mut b = GroupAccount::new(200);
+
+        a.join(100);
+        b.join(200);
+
+        let wa = a.effective_weight(100, false);
+        let wb = b.effective_weight(200, false);
+        assert_eq!(wa, 100);
+        assert_eq!(wb, 200);
+        assert_eq!(wb, 2 * wa);
+    }
+
+    #[test]
+    fn an_idle_group_keeps_the_idle_weight_across_a_live_change() {
+        let mut a = GroupAccount::new(100);
+
+        a.join(100);
+        assert_eq!(a.effective_weight(100, true), CGROUP_WEIGHT_IDLE);
+
+        a.set_shares(2000);
+        assert_eq!(a.effective_weight(100, true), CGROUP_WEIGHT_IDLE);
+        assert_eq!(a.effective_weight(10000, true), CGROUP_WEIGHT_IDLE);
+    }
+
+    #[test]
+    fn the_group_load_never_goes_negative() {
+        let mut a = GroupAccount::new(100);
+
+        /* A leave without a join is a no-op, not an underflow. */
+        a.leave(100);
+        assert_eq!(a.load, 0);
+        assert_eq!(a.nr, 0);
+
+        a.join(100);
+        a.leave(100);
+        a.leave(100);
+        assert_eq!(a.load, 0);
+        assert_eq!(a.nr, 0);
     }
 }

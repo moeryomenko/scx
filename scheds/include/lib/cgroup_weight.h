@@ -38,8 +38,29 @@ struct scx_cgroup_init_args;
 #define SCX_CGROUP_WEIGHT_NR_CGRP_MAX 4096
 #define SCX_CGROUP_WEIGHT_NR_CPU_ENTRIES 65536
 
+/* Upper bound of the per-CPU contribution sync on a shares change. */
+#define SCX_CGROUP_WEIGHT_MAX_CPUS 1024
+
 struct scx_cgroup_weight_config {
 	int verbose;
+};
+
+/*
+ * Accounting counters. @joins and @leaves bracket a task's runnable
+ * period, @reweights counts a nice-weight change, @refolds counts a task
+ * that refolded after an epoch change, and @load_underflows counts a
+ * subtract that would have driven a per-CPU load or task count below
+ * zero. @epoch is the value of the last change.
+ */
+struct scx_cgroup_weight_stats {
+	u64 joins;
+	u64 leaves;
+	u64 reweights;
+	u64 moves;
+	u64 refolds;
+	u64 load_underflows;
+	u64 nr_underflows;
+	u64 epoch;
 };
 
 /*
@@ -82,6 +103,14 @@ int scx_cgroup_weight_task(struct task_struct *p __arg_trusted, s32 cpu,
 int scx_cgroup_weight_fold(struct cgroup *cgrp __arg_trusted, s32 cpu,
 			   u64 base_weight, bool joining,
 			   struct scx_cgroup_weight_info *out);
+
+/* Epoch of the last weight or idle change. */
+u64 scx_cgroup_weight_epoch(void);
+
+/* Refold an already joined task after an epoch change. */
+int scx_cgroup_weight_refresh(struct task_struct *p __arg_trusted, s32 cpu,
+			      u64			     base_weight,
+			      struct scx_cgroup_weight_info *out);
 
 /*
  * Account @base_weight of @p at @cpu. @join and @leave are paired across the

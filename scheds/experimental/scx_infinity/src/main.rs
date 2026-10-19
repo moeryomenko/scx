@@ -8,6 +8,8 @@
 mod bpf_skel;
 pub use bpf_skel::*;
 pub mod bpf_intf;
+#[cfg(test)]
+mod cgroup;
 mod config;
 #[cfg(test)]
 mod model;
@@ -308,7 +310,19 @@ impl<'a> Scheduler<'a> {
         let mut cgrp_throttled = 0u64;
         let mut cgrp_reenqueued = 0u64;
         let mut cgrp_eff_weight = 0u64;
+        let mut cgrp_eff_min = 0u64;
+        let mut cgrp_eff_max = 0u64;
+        let mut cgrp_eff_samples = 0u64;
         let mut cgrp_scale = 0u64;
+        let mut cgrp_refolds = 0u64;
+        let mut deq_core_sched_exec = 0u64;
+        let mut deq_sleep = 0u64;
+        let mut deq_sched_change = 0u64;
+        let mut deq_keep = 0u64;
+        let mut q_sleep = 0u64;
+        let mut q_sched_change = 0u64;
+        let mut q_keep = 0u64;
+        let mut cgrp_cpu_moves = 0u64;
         let mut steals = 0u64;
         let mut steal_llc = 0u64;
         let mut steal_node = 0u64;
@@ -344,7 +358,25 @@ impl<'a> Scheduler<'a> {
                 cgrp_throttled += stats.cgrp_throttled;
                 cgrp_reenqueued += stats.cgrp_reenqueued;
                 cgrp_eff_weight = cgrp_eff_weight.max(stats.cgrp_eff_weight);
+                if stats.cgrp_eff_min != 0 {
+                    cgrp_eff_min = if cgrp_eff_min == 0 {
+                        stats.cgrp_eff_min
+                    } else {
+                        cgrp_eff_min.min(stats.cgrp_eff_min)
+                    };
+                }
+                cgrp_eff_max = cgrp_eff_max.max(stats.cgrp_eff_max);
+                cgrp_eff_samples += stats.cgrp_eff_samples;
                 cgrp_scale = cgrp_scale.max(stats.cgrp_scale);
+                cgrp_refolds += stats.cgrp_refolds;
+                deq_core_sched_exec += stats.deq_core_sched_exec;
+                deq_sleep += stats.deq_sleep;
+                deq_sched_change += stats.deq_sched_change;
+                deq_keep += stats.deq_keep;
+                q_sleep += stats.q_sleep;
+                q_sched_change += stats.q_sched_change;
+                q_keep += stats.q_keep;
+                cgrp_cpu_moves += stats.cgrp_cpu_moves;
                 steals += stats.steals;
                 steal_llc += stats.steal_llc;
                 steal_node += stats.steal_node;
@@ -356,6 +388,41 @@ impl<'a> Scheduler<'a> {
                 weight_changes += stats.weight_changes;
                 reweight_queued += stats.reweight_queued;
                 weight_queued_cpu += stats.weight_queued_cpu;
+            }
+        }
+
+        let mut w_joins = 0u64;
+        let mut w_leaves = 0u64;
+        let mut w_reweights = 0u64;
+        let mut w_moves = 0u64;
+        let mut w_refolds = 0u64;
+        let mut w_load_underflows = 0u64;
+        let mut w_nr_underflows = 0u64;
+        let mut w_epoch = 0u64;
+        if let Ok(Some(rows)) = self
+            .skel
+            .maps
+            .scw_stats_stor
+            .lookup_percpu(&key, libbpf_rs::MapFlags::ANY)
+        {
+            for row in rows {
+                if row.len() < std::mem::size_of::<bpf_intf::inf_cgroup_weight_stats>() {
+                    continue;
+                }
+                /* SAFETY: the map value is inf_cgroup_weight_stats and the length is checked. */
+                let stats = unsafe {
+                    std::ptr::read_unaligned(
+                        row.as_ptr() as *const bpf_intf::inf_cgroup_weight_stats
+                    )
+                };
+                w_joins += stats.joins;
+                w_leaves += stats.leaves;
+                w_reweights += stats.reweights;
+                w_moves += stats.moves;
+                w_refolds += stats.refolds;
+                w_load_underflows += stats.load_underflows;
+                w_nr_underflows += stats.nr_underflows;
+                w_epoch = w_epoch.max(stats.epoch);
             }
         }
 
@@ -382,7 +449,16 @@ impl<'a> Scheduler<'a> {
              expiries={expiries} preemptions={preemptions} yields={yields} \
              depth={depth} cgrp: throttled={cgrp_throttled} \
              reenqueued={cgrp_reenqueued} eff_weight={cgrp_eff_weight} \
-             scale_q10={cgrp_scale} queue: steals={steals} \
+             eff_min={cgrp_eff_min} eff_max={cgrp_eff_max} \
+             eff_samples={cgrp_eff_samples} scale_q10={cgrp_scale} \
+             refolds={cgrp_refolds} deq: sleep={deq_sleep} \
+             sched_change={deq_sched_change} core_exec={deq_core_sched_exec} \
+             keep={deq_keep} qui: sleep={q_sleep} \
+             sched_change={q_sched_change} keep={q_keep} \
+             cpu_moves={cgrp_cpu_moves} weight: joins={w_joins} leaves={w_leaves} \
+             reweights={w_reweights} moves={w_moves} refolds={w_refolds} \
+             underflow={w_load_underflows} nr_underflow={w_nr_underflows} \
+             epoch={w_epoch} queue: steals={steals} \
              llc={steal_llc} node={steal_node} yield_to={yield_to_moves} \
              reweight={reweight_moves} stale={stale_pops} \
              lost={lost_state_errors} requeues={requeues} \

@@ -58,7 +58,52 @@ struct {
 	__type(key, struct scw_cpu_key);
 	__type(value, struct scw_cpu_load);
 	__uint(max_entries, SCX_CGROUP_WEIGHT_NR_CPU_ENTRIES);
-} scw_cpu_loads		   SEC(".maps");
+} scw_cpu_loads SEC(".maps");
+
+/*
+ * Per-CPU accounting counters. A shares or idle change bumps @epoch once,
+ * and a task that folds after that sees a different value at its next
+ * enqueue or dispatch. The counters make a lifecycle bug visible instead of
+ * a silent ratio error.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct scx_cgroup_weight_stats);
+} scw_stats_stor SEC(".maps");
+
+/* Global change counter. Only a fold compares this value. */
+static u64					       scw_epoch;
+
+static __always_inline struct scx_cgroup_weight_stats *scw_stats(void)
+{
+	u32 key = 0;
+
+	return bpf_map_lookup_elem(&scw_stats_stor, &key);
+}
+
+#define SCW_STAT_INC(field)                                            \
+	do {                                                           \
+		struct scx_cgroup_weight_stats *__stats = scw_stats(); \
+		if (__stats)                                           \
+			__sync_fetch_and_add(&__stats->field, 1);      \
+	} while (0)
+
+static __always_inline void scw_epoch_bump(void)
+{
+	struct scx_cgroup_weight_stats *stats = scw_stats();
+	u64				epoch;
+
+	epoch = __sync_fetch_and_add(&scw_epoch, 1) + 1;
+	if (stats)
+		WRITE_ONCE(stats->epoch, epoch);
+}
+
+__hidden u64 scx_cgroup_weight_epoch(void)
+{
+	return READ_ONCE(scw_epoch);
+}
 
 static __always_inline u64 scw_cgroup_id(struct cgroup *cgrp)
 {
@@ -217,11 +262,21 @@ static void scw_nr_add(struct cgroup *cgrp, s32 cpu, s64 delta)
 		if (!g || !g->present)
 			continue;
 		load = scw_cpu_get(cgid, cpu, true);
-		if (load)
-			__sync_fetch_and_add(&load->nr, delta);
+		if (load) {
+			if (delta < 0) {
+				u64 prev =
+					__sync_fetch_and_add(&load->nr, delta);
+
+				if (prev < (u64)(-delta)) {
+					WRITE_ONCE(load->nr, 0);
+					SCW_STAT_INC(nr_underflows);
+				}
+			} else {
+				__sync_fetch_and_add(&load->nr, delta);
+			}
+		}
 	}
 }
-
 /*
  * Bring each group on the path from @cgid up in line with its task count:
  * a non-empty group contributes its share to its parent, an empty one
@@ -275,23 +330,55 @@ static void scw_load_add(u64 cgid, s32 cpu, s64 delta)
 	if (!load)
 		return;
 
-	__sync_fetch_and_add(&load->load, delta);
+	if (delta < 0) {
+		u64 prev = __sync_fetch_and_add(&load->load, delta);
+
+		if (prev < (u64)(-delta)) {
+			WRITE_ONCE(load->load, 0);
+			SCW_STAT_INC(load_underflows);
+		}
+	} else {
+		__sync_fetch_and_add(&load->load, delta);
+	}
 	scw_contrib_sync(cgid, cpu);
+}
+
+/*
+ * Re-apply @cgid's new shares to every CPU where it has joined tasks. The
+ * contribution is per (cgroup, CPU), so a shares change must move each
+ * parent load it feeds, not just the CPU that happened to write the file.
+ * The walk is bounded by the compile-time CPU ceiling; a shares write is
+ * rare and the bound keeps the verifier path flat.
+ */
+static void scw_sync_group(u64 cgid)
+{
+	u32 cpu;
+
+	bpf_for(cpu, 0, SCX_CGROUP_WEIGHT_MAX_CPUS)
+	{
+		struct scw_cpu_load *load;
+
+		load = scw_cpu_get(cgid, (s32)cpu, false);
+		if (load && READ_ONCE(load->nr))
+			scw_contrib_sync(cgid, (s32)cpu);
+	}
 }
 
 /*
  * Fold the hierarchy into the effective weight of @p on @cpu.
  *
  * @joining counts the task and the shares of the empty groups it joins, so
- * the result equals the loads after the matching scw_join_path(). A missing
- * group (no cpu controller) is a pass-through: its weight stays the base
- * weight until the first group that has a context.
+ * the result equals the loads after the matching scw_join_path(). With
+ * @joining false the task is already in the loads and adds nothing, so a
+ * refresh does not count it twice. A missing group (no cpu controller) is a
+ * pass-through: its weight stays the base weight until the first group that
+ * has a context.
  */
 static int scw_fold(struct cgroup *cgrp, s32 cpu, u64 base, bool joining,
 		    struct scx_cgroup_weight_info *out)
 {
 	u64 product = SCX_CGROUP_WEIGHT_ONE;
-	u64 add	    = base;
+	u64 add	    = joining ? base : 0;
 	u32 idle    = 0;
 	int i, level;
 
@@ -323,8 +410,15 @@ static int scw_fold(struct cgroup *cgrp, s32 cpu, u64 base, bool joining,
 
 		load  = scw_cpu_get(cgid, cpu, false);
 		total = (load ? READ_ONCE(load->load) : 0) + add;
+		/*
+		 * An empty level must not scale the task. The shares are the
+		 * denominator, as in src/policy.rs hierarchy_scale(), so a zero
+		 * load gives a product of one. Using one as the denominator
+		 * multiplied the weight by the shares and produced the live
+		 * weights above one million seen in the revision 2 runs.
+		 */
 		if (!total)
-			total = 1;
+			total = shares;
 
 		/*
 		 * A group whose load is below its share scales a member up.
@@ -394,6 +488,7 @@ scx_cgroup_weight_init(struct cgroup *cgrp		 __arg_trusted,
 	if (bpf_map_update_elem(&scw_groups, &cgid, &group, BPF_ANY))
 		return -ENOMEM;
 
+	scw_epoch_bump();
 	return 0;
 }
 
@@ -420,6 +515,7 @@ __hidden void scx_cgroup_weight_exit(struct cgroup *cgrp __arg_trusted)
 	WRITE_ONCE(g->present, 0);
 	WRITE_ONCE(g->weight, 1);
 	WRITE_ONCE(g->idle, 0);
+	scw_epoch_bump();
 }
 
 __hidden void scx_cgroup_weight_set_weight(struct cgroup *cgrp __arg_trusted,
@@ -444,6 +540,8 @@ __hidden void scx_cgroup_weight_set_weight(struct cgroup *cgrp __arg_trusted,
 	g = scw_group_of(cgid);
 	if (g) {
 		WRITE_ONCE(g->weight, weight ? weight : 100);
+		scw_sync_group(cgid);
+		scw_epoch_bump();
 		return;
 	}
 
@@ -451,6 +549,8 @@ __hidden void scx_cgroup_weight_set_weight(struct cgroup *cgrp __arg_trusted,
 	fresh.level	= BPF_CORE_READ(cgrp, level);
 	fresh.parent_id = fresh.level ? scw_parent_cgid(cgrp) : 0;
 	bpf_map_update_elem(&scw_groups, &cgid, &fresh, BPF_ANY);
+	scw_sync_group(cgid);
+	scw_epoch_bump();
 }
 
 __hidden void scx_cgroup_weight_set_idle(struct cgroup *cgrp __arg_trusted,
@@ -475,6 +575,7 @@ __hidden void scx_cgroup_weight_set_idle(struct cgroup *cgrp __arg_trusted,
 	g = scw_group_of(cgid);
 	if (g) {
 		WRITE_ONCE(g->idle, idle ? 1 : 0);
+		scw_epoch_bump();
 		return;
 	}
 
@@ -482,6 +583,7 @@ __hidden void scx_cgroup_weight_set_idle(struct cgroup *cgrp __arg_trusted,
 	fresh.level	= BPF_CORE_READ(cgrp, level);
 	fresh.parent_id = fresh.level ? scw_parent_cgid(cgrp) : 0;
 	bpf_map_update_elem(&scw_groups, &cgid, &fresh, BPF_ANY);
+	scw_epoch_bump();
 }
 
 __hidden int scx_cgroup_weight_task(struct task_struct *p __arg_trusted,
@@ -522,6 +624,35 @@ __hidden int scx_cgroup_weight_fold(struct cgroup *cgrp __arg_trusted, s32 cpu,
 	return scw_fold(cgrp, cpu, base_weight, joining, out);
 }
 
+/*
+ * Refold a task that is already counted in its group. @joining is false, so
+ * the task does not add itself to the denominator a second time. The caller
+ * compares the epoch first; this function only does the arithmetic.
+ */
+__hidden int scx_cgroup_weight_refresh(struct task_struct *p __arg_trusted,
+				       s32 cpu, u64 base_weight,
+				       struct scx_cgroup_weight_info *out)
+{
+	struct cgroup *cgrp;
+
+	if (!p || !out)
+		return -EINVAL;
+
+	out->weight = 1;
+	out->scale  = SCX_CGROUP_WEIGHT_ONE;
+	out->idle   = 0;
+
+	if (!base_weight)
+		base_weight = 1;
+
+	cgrp = scw_task_cgroup(p);
+	if (!cgrp)
+		return 0;
+
+	SCW_STAT_INC(refolds);
+	return scw_fold(cgrp, cpu, base_weight, false, out);
+}
+
 __hidden void scx_cgroup_weight_join(struct task_struct *p __arg_trusted,
 				     s32 cpu, u64 base_weight)
 {
@@ -538,6 +669,7 @@ __hidden void scx_cgroup_weight_join(struct task_struct *p __arg_trusted,
 
 	scw_nr_add(cgrp, cpu, 1);
 	scw_load_add(cgid, cpu, (s64)base_weight);
+	SCW_STAT_INC(joins);
 }
 
 __hidden void scx_cgroup_weight_leave(struct task_struct *p __arg_trusted,
@@ -557,6 +689,7 @@ __hidden void scx_cgroup_weight_leave(struct task_struct *p __arg_trusted,
 	/* Drop the count first, so an emptying group sheds its share too. */
 	scw_nr_add(cgrp, cpu, -1);
 	scw_load_add(cgid, cpu, -(s64)base_weight);
+	SCW_STAT_INC(leaves);
 }
 
 __hidden void scx_cgroup_weight_reweight(struct task_struct *p __arg_trusted,
@@ -578,6 +711,7 @@ __hidden void scx_cgroup_weight_reweight(struct task_struct *p __arg_trusted,
 		return;
 
 	scw_load_add(cgid, cpu, (s64)new_weight - (s64)old_weight);
+	SCW_STAT_INC(reweights);
 }
 
 __hidden void scx_cgroup_weight_move(struct cgroup *from __arg_trusted,
@@ -604,4 +738,6 @@ __hidden void scx_cgroup_weight_move(struct cgroup *from __arg_trusted,
 			scw_load_add(cgid, cpu, (s64)base_weight);
 		}
 	}
+
+	SCW_STAT_INC(moves);
 }

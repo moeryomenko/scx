@@ -153,6 +153,9 @@ static u32	    inf_nr_queues;
 /* intf.h carries the same layout for the loader's arena sizing. */
 _Static_assert(sizeof(struct task_ctx) == sizeof(struct inf_task_ctx_layout),
 	       "task_ctx layout mirror in intf.h is out of sync");
+_Static_assert(sizeof(struct inf_cgroup_weight_stats) ==
+		       sizeof(struct scx_cgroup_weight_stats),
+	       "cgroup weight counter mirror in intf.h is out of sync");
 #ifdef INF_QUEUE_LIST
 _Static_assert(sizeof(struct inf_list_node) <= INF_QUEUE_NODE_BYTES,
 	       "queue-list node does not fit the shared layout");
@@ -210,6 +213,27 @@ static struct inf_stats *inf_stats(void)
 		if (__stats)                                      \
 			__sync_fetch_and_add(&__stats->field, 1); \
 	} while (0)
+
+/*
+ * Record the effective weight a fold produced. The minimum and maximum are
+ * the diagnostics for a live cpu.weight or cpu.idle change: a ratio bug
+ * shows as an unchanged maximum.
+ */
+static __always_inline void inf_stats_weight(u64 w)
+{
+	struct inf_stats *stats = inf_stats();
+
+	if (!stats)
+		return;
+
+	__sync_fetch_and_add(&stats->cgrp_eff_samples, 1);
+	WRITE_ONCE(stats->cgrp_eff_weight, w);
+	if (!READ_ONCE(stats->cgrp_eff_min) ||
+	    w < READ_ONCE(stats->cgrp_eff_min))
+		WRITE_ONCE(stats->cgrp_eff_min, w);
+	if (w > READ_ONCE(stats->cgrp_eff_max))
+		WRITE_ONCE(stats->cgrp_eff_max, w);
+}
 
 /* Charge the queue before the node becomes visible in it. */
 static __always_inline void inf_queue_charge(struct inf_cpu_ctx *cctx, u64 w)
@@ -299,21 +323,62 @@ static __always_inline u64 inf_quantum(u64 w, u64 total)
  * Effective weight of @p on @cpu through the shared cgroup library. The
  * library folds every cpu.weight level, honours cpu.idle and reports the
  * fixed-point group scale for later reweights.
+ *
+ * The epoch is read before the fold and stored with the result. A change
+ * that lands in the middle of the fold leaves the stored epoch stale, so
+ * the next enqueue or dispatch folds again instead of trusting a torn
+ * result.
  */
 static __always_inline u64 inf_effective_weight(struct task_struct *p, s32 cpu,
 						bool joining, task_ctx *tctx)
 {
 	struct scx_cgroup_weight_info info = {};
+	u64			      epoch;
 	u64			      w;
 
+	epoch = scx_cgroup_ctl_epoch();
 	scx_cgroup_ctl_weight(p, cpu, joining, &info);
 	w = info.weight ? info.weight : 1;
+	if (w > INF_WEIGHT_CAP)
+		w = INF_WEIGHT_CAP;
 
 	if (tctx) {
-		tctx->group_scale = info.scale;
-		tctx->idle	  = info.idle;
+		tctx->group_scale  = info.scale;
+		tctx->idle	   = info.idle;
+		tctx->weight_epoch = epoch;
 	}
 	return w;
+}
+
+/*
+ * Refold a task whose stored fold predates the current cgroup epoch. The
+ * task is already counted in its group, so the fold does not add it again.
+ * @cpu must be the CPU the group load is charged to.
+ */
+static __always_inline u64 inf_refresh_fold(struct task_struct *p, s32 cpu,
+					    u64 base, task_ctx *tctx)
+{
+	struct scx_cgroup_weight_info info = {};
+	u64			      epoch;
+	u64			      w;
+
+	epoch = scx_cgroup_ctl_epoch();
+	scx_cgroup_ctl_weight_refresh(p, cpu, base, &info);
+	w = info.weight ? info.weight : 1;
+	if (w > INF_WEIGHT_CAP)
+		w = INF_WEIGHT_CAP;
+
+	tctx->group_scale  = info.scale;
+	tctx->idle	   = info.idle;
+	tctx->weight_epoch = epoch;
+	INF_STAT_INC(cgrp_refolds);
+	inf_stats_weight(w);
+	return w;
+}
+
+static __always_inline bool inf_weight_stale(task_ctx *tctx)
+{
+	return tctx->weight_epoch != scx_cgroup_ctl_epoch();
 }
 
 /* Reweight a task from its new base weight and stored group scale. */
@@ -328,6 +393,8 @@ static __always_inline u64 inf_reweight(u64 base, u64 scale, u32 idle)
 
 	base = (base * scale + (SCX_CGROUP_WEIGHT_ONE / 2)) >>
 	       SCX_CGROUP_WEIGHT_SHIFT;
+	if (base > INF_WEIGHT_CAP)
+		base = INF_WEIGHT_CAP;
 	return base ? base : 1;
 }
 
@@ -775,7 +842,8 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 			if (tctx->joined) {
 				scx_cgroup_ctl_leave(p, tctx->group_cpu,
 						     tctx->base_weight);
-				tctx->joined = 0;
+				tctx->joined	= 0;
+				tctx->group_cpu = -1;
 			}
 			if (!scx_cgroup_ctl_put_aside(p, (u64)tctx, 0)) {
 				tctx->state	 = INF_TASK_PARKED;
@@ -819,32 +887,14 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 					  SCX_ENQ_LAST | SCX_ENQ_PREEMPT));
 
 	/*
-	 * The task's cgroup load counts it from the first enqueue until the
-	 * matching dequeue, so a rotation through expiry does not join twice.
-	 */
-	if (!tctx->joined) {
-		w	     = inf_effective_weight(p, cpu, true, tctx);
-		tctx->weight = w;
-		scx_cgroup_ctl_join(p, cpu, base);
-		tctx->joined	= 1;
-		tctx->group_cpu = cpu;
-		newly_joined	= true;
-		if (stats) {
-			stats->cgrp_eff_weight = w;
-			stats->cgrp_scale      = tctx->group_scale;
-		}
-	} else {
-		w = tctx->weight ? tctx->weight : base;
-	}
-
-	q   = inf_quantum(w, READ_ONCE(cctx->w_sum) + w);
-	key = head ? inf_head_key(cctx) : inf_tail_key(cctx);
-
-	/*
 	 * The task claims no queue membership when ops.enqueue() runs. A
 	 * stale claim means a previous move did not finish; remove the node
 	 * from wherever it claims to be and release that charge before the
 	 * new insert, so no task is lost and no weight is charged twice.
+	 *
+	 * This runs before the fold: the charge to release is the one the
+	 * queue took with the stored weight, so the stored weight must still
+	 * be the old one.
 	 */
 	if (tctx->queued_cpu >= 0) {
 		s32		    old_cpu   = tctx->queued_cpu;
@@ -870,6 +920,51 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 		if (tctx->state == INF_TASK_QUEUED)
 			tctx->state = INF_TASK_IDLE;
 	}
+
+	/*
+	 * The task's cgroup load counts it from the first enqueue until the
+	 * matching dequeue, so a rotation through expiry does not join twice.
+	 * A joined task whose group changed since its last fold refolds here
+	 * with joining = false: its own weight is already in the load.
+	 */
+	if (!tctx->joined) {
+		w	     = inf_effective_weight(p, cpu, true, tctx);
+		tctx->weight = w;
+		scx_cgroup_ctl_join(p, cpu, base);
+		tctx->joined	= 1;
+		tctx->group_cpu = cpu;
+		newly_joined	= true;
+		inf_stats_weight(w);
+		if (stats)
+			stats->cgrp_scale = tctx->group_scale;
+	} else {
+		bool moved = false;
+
+		/*
+		 * The group load is per (cgroup, CPU). A joined task that
+		 * arrives on another CPU carries its contribution with it,
+		 * because the load on the old CPU no longer describes a
+		 * runnable task there. Move it before the fold so the new
+		 * level is already correct.
+		 */
+		if (tctx->group_cpu >= 0 && tctx->group_cpu != cpu) {
+			scx_cgroup_ctl_leave(p, tctx->group_cpu, base);
+			scx_cgroup_ctl_join(p, cpu, base);
+			tctx->group_cpu = cpu;
+			moved		= true;
+			INF_STAT_INC(cgrp_cpu_moves);
+		}
+
+		if (moved || inf_weight_stale(tctx)) {
+			w	     = inf_refresh_fold(p, cpu, base, tctx);
+			tctx->weight = w;
+		} else {
+			w = tctx->weight ? tctx->weight : base;
+		}
+	}
+
+	q   = inf_quantum(w, READ_ONCE(cctx->w_sum) + w);
+	key = head ? inf_head_key(cctx) : inf_tail_key(cctx);
 
 	/* Charge the queue before the insert so the pop sees this weight. */
 	inf_queue_charge(cctx, w);
@@ -1082,6 +1177,23 @@ static __noinline bool inf_dispatch_local(s32 cpu, struct inf_cpu_ctx *cctx)
 		return false;
 	}
 
+	/*
+	 * The pop released the old charge. A task whose group changed since
+	 * its last fold gets the new weight before its slice is computed, so
+	 * the first quantum after a live cpu.weight or cpu.idle change is
+	 * already correct.
+	 */
+	if (inf_weight_stale(tctx)) {
+		u64 base = tctx->base_weight ?
+				   tctx->base_weight :
+				   (p->scx.weight ? p->scx.weight : 1);
+
+		w	 = inf_refresh_fold(
+			p, tctx->group_cpu >= 0 ? tctx->group_cpu : cpu, base,
+			tctx);
+		tctx->weight = w;
+	}
+
 	/* The task is out of the queue, so the remaining weight normalizes. */
 	q		       = inf_quantum(w, READ_ONCE(cctx->w_sum) + w);
 	tctx->queued_cpu       = -1;
@@ -1175,6 +1287,19 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 
 	tctx->queued_cpu = -1;
 	inf_queue_uncharge(pcctx, w);
+
+	/* The peer pop released the old charge; refold before the slice. */
+	if (inf_weight_stale(tctx)) {
+		u64 base = tctx->base_weight ?
+				   tctx->base_weight :
+				   (p->scx.weight ? p->scx.weight : 1);
+
+		w	 = inf_refresh_fold(
+			p, tctx->group_cpu >= 0 ? tctx->group_cpu : peer, base,
+			tctx);
+		tctx->weight = w;
+	}
+
 	tctx->state    = INF_TASK_DISPATCHED;
 	q	       = inf_quantum(w, READ_ONCE(dcctx->w_sum) + w);
 	tctx->slice_ns = q;
@@ -1366,6 +1491,7 @@ static __noinline void inf_resolve_pending(struct task_struct *p,
 void BPF_STRUCT_OPS(infinity_dequeue, struct task_struct *p, u64 deq_flags)
 {
 	task_ctx *tctx;
+	bool	  core_exec, ended;
 
 	TOUCH_ARENA();
 
@@ -1373,10 +1499,35 @@ void BPF_STRUCT_OPS(infinity_dequeue, struct task_struct *p, u64 deq_flags)
 	if (!tctx)
 		return;
 
-	/* The task stops being runnable: drop its cgroup contribution. */
-	if (tctx->joined) {
+	/*
+	 * Count the reason before the lifecycle decision. The counters are the
+	 * runtime proof for the group-load rule: only a sleep or a property
+	 * change ends the runnable period.
+	 */
+	if (deq_flags & SCX_DEQ_CORE_SCHED_EXEC)
+		INF_STAT_INC(deq_core_sched_exec);
+	else if (deq_flags & SCX_DEQ_SLEEP)
+		INF_STAT_INC(deq_sleep);
+	else if (deq_flags & SCX_DEQ_SCHED_CHANGE)
+		INF_STAT_INC(deq_sched_change);
+	else
+		INF_STAT_INC(deq_keep);
+
+	/*
+	 * Only a sleep or a property change ends the runnable period. A
+	 * core-scheduled execution and the flags-0 custody transfer of this
+	 * kernel both leave a runnable task that is no longer in BPF custody,
+	 * so its group load must stay: a running task that left the load made
+	 * both groups look empty and equal shares followed.
+	 */
+	core_exec = !!(deq_flags & SCX_DEQ_CORE_SCHED_EXEC);
+	ended	  = !core_exec &&
+		    (deq_flags & (SCX_DEQ_SLEEP | SCX_DEQ_SCHED_CHANGE));
+
+	if (ended && tctx->joined) {
 		scx_cgroup_ctl_leave(p, tctx->group_cpu, tctx->base_weight);
-		tctx->joined = 0;
+		tctx->joined	= 0;
+		tctx->group_cpu = -1;
 	}
 
 	if (tctx->queued_cpu >= 0) {
@@ -1391,12 +1542,58 @@ void BPF_STRUCT_OPS(infinity_dequeue, struct task_struct *p, u64 deq_flags)
 
 	/*
 	 * SCX_DEQ_CORE_SCHED_EXEC means the core ran a task that was still
-	 * queued. It stays runnable, so it moves to RUNNING. Every other
-	 * flag ends the runnable period.
+	 * queued. It stays runnable, so it moves to RUNNING. A sleep or a
+	 * property change ends the runnable period. A custody-only dequeue
+	 * keeps the state the dispatch or running hook set.
 	 */
-	if (deq_flags & SCX_DEQ_CORE_SCHED_EXEC)
+	if (core_exec)
 		tctx->state = INF_TASK_RUNNING;
-	else if (tctx->state != INF_TASK_EXITING)
+	else if (ended && tctx->state != INF_TASK_EXITING)
+		tctx->state = INF_TASK_IDLE;
+}
+
+/*
+ * The core calls ops.quiescent() when a task leaves the runqueue for any
+ * reason. A task that the scheduler already dispatched is no longer in BPF
+ * custody, so ops.dequeue() does not run for it: this is the only callback
+ * that sees a running task go to sleep. End the runnable period here once,
+ * as the state table requires. A dequeue that already dropped the load
+ * cleared @joined, so this is idempotent.
+ */
+void BPF_STRUCT_OPS(infinity_quiescent, struct task_struct *p, u64 deq_flags)
+{
+	task_ctx *tctx;
+
+	TOUCH_ARENA();
+
+	tctx = inf_task_ctx(p);
+	if (!tctx)
+		return;
+
+	if (deq_flags & SCX_DEQ_SLEEP)
+		INF_STAT_INC(q_sleep);
+	else if (deq_flags & SCX_DEQ_SCHED_CHANGE)
+		INF_STAT_INC(q_sched_change);
+	else
+		INF_STAT_INC(q_keep);
+
+	/*
+	 * A core-scheduled execution and the flags-0 custody transfer both
+	 * leave a runnable task that is only out of BPF custody, so the group
+	 * load must stay. Only a sleep or a property change ends the runnable
+	 * period; a dequeue that already ran cleared @joined, so this is
+	 * idempotent.
+	 */
+	if (!(deq_flags & (SCX_DEQ_SLEEP | SCX_DEQ_SCHED_CHANGE)))
+		return;
+
+	if (!tctx->joined)
+		return;
+
+	scx_cgroup_ctl_leave(p, tctx->group_cpu, tctx->base_weight);
+	tctx->joined	= 0;
+	tctx->group_cpu = -1;
+	if (tctx->state != INF_TASK_EXITING && tctx->state != INF_TASK_QUEUED)
 		tctx->state = INF_TASK_IDLE;
 }
 
@@ -1420,13 +1617,29 @@ void BPF_STRUCT_OPS(infinity_set_weight, struct task_struct *p, u32 weight)
 
 	INF_STAT_INC(weight_changes);
 
-	old_base = tctx->base_weight;
-	new_base = weight ? weight : 1;
-	old	 = tctx->weight;
-	new	 = inf_reweight(new_base, tctx->group_scale, tctx->idle);
+	old_base	  = tctx->base_weight;
+	new_base	  = weight ? weight : 1;
+	old		  = tctx->weight;
 	tctx->base_weight = new_base;
-	tctx->weight	  = new;
-	tctx->slice_ns	  = inf_quantum(new, new);
+
+	/*
+	 * A group change since the last fold makes the stored scale stale.
+	 * Refold with the new base now; otherwise apply the new base to the
+	 * stored scale. Either way the value is stored before the queue
+	 * charge moves, so a pop never sees a weight the queue did not take.
+	 */
+	if (inf_weight_stale(tctx)) {
+		s32 fcpu = tctx->group_cpu >= 0 ? tctx->group_cpu :
+						  tctx->queued_cpu;
+
+		if (fcpu < 0)
+			fcpu = scx_bpf_task_cpu(p);
+		new = inf_refresh_fold(p, fcpu, new_base, tctx);
+	} else {
+		new = inf_reweight(new_base, tctx->group_scale, tctx->idle);
+	}
+	tctx->weight   = new;
+	tctx->slice_ns = inf_quantum(new, new);
 
 	if (tctx->joined)
 		scx_cgroup_ctl_reweight(p, tctx->group_cpu, old_base, new_base);
@@ -1743,8 +1956,11 @@ s32 BPF_STRUCT_OPS(infinity_exit_task, struct task_struct *p,
 
 	tctx->state = INF_TASK_EXITING;
 
-	if (tctx->joined)
+	if (tctx->joined) {
 		scx_cgroup_ctl_leave(p, tctx->group_cpu, tctx->base_weight);
+		tctx->joined	= 0;
+		tctx->group_cpu = -1;
+	}
 
 	/*
 	 * Remove the task from its scheduler queue and release the charge
@@ -1826,6 +2042,7 @@ void BPF_STRUCT_OPS(infinity_cgroup_move, struct task_struct *p,
 {
 	struct scx_cgroup_weight_info info = {};
 	task_ctx		     *tctx;
+	u64			      epoch;
 	int			      ret;
 
 	TOUCH_ARENA();
@@ -1834,8 +2051,9 @@ void BPF_STRUCT_OPS(infinity_cgroup_move, struct task_struct *p,
 	if (!tctx)
 		return;
 
-	ret = scx_cgroup_ctl_move(p, (u64)tctx, from, to, tctx->group_cpu,
-				  tctx->base_weight, tctx->joined != 0);
+	epoch = scx_cgroup_ctl_epoch();
+	ret   = scx_cgroup_ctl_move(p, (u64)tctx, from, to, tctx->group_cpu,
+				    tctx->base_weight, tctx->joined != 0);
 	if (ret)
 		scx_bpf_error("Failed to move a task between cgroups: %d", ret);
 
@@ -1847,9 +2065,13 @@ void BPF_STRUCT_OPS(infinity_cgroup_move, struct task_struct *p,
 	if (tctx->joined) {
 		scx_cgroup_ctl_weight_fold(to, tctx->group_cpu,
 					   tctx->base_weight, false, &info);
-		tctx->weight	  = info.weight ? info.weight : 1;
-		tctx->group_scale = info.scale;
-		tctx->idle	  = info.idle;
+		tctx->weight = info.weight ? info.weight : 1;
+		if (tctx->weight > INF_WEIGHT_CAP)
+			tctx->weight = INF_WEIGHT_CAP;
+		tctx->group_scale  = info.scale;
+		tctx->idle	   = info.idle;
+		tctx->weight_epoch = epoch;
+		inf_stats_weight(tctx->weight);
 	}
 }
 
@@ -1947,6 +2169,7 @@ SCX_OPS_DEFINE(infinity_ops, .select_cpu = (void *)infinity_select_cpu,
 	       .dequeue		     = (void *)infinity_dequeue,
 	       .running		     = (void *)infinity_running,
 	       .stopping	     = (void *)infinity_stopping,
+	       .quiescent	     = (void *)infinity_quiescent,
 	       .set_weight	     = (void *)infinity_set_weight,
 	       .yield		     = (void *)infinity_yield,
 	       .cgroup_init	     = (void *)infinity_cgroup_init,
