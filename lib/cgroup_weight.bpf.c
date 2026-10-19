@@ -374,6 +374,13 @@ scx_cgroup_weight_init(struct cgroup *cgrp		 __arg_trusted,
 	if (!cgrp || !args)
 		return -EINVAL;
 
+	/*
+	 * The root cgroup has no group of its own: fair.c weighs a task at
+	 * the root by its nice weight, with no shares/load scaling.
+	 */
+	if (!BPF_CORE_READ(cgrp, level))
+		return 0;
+
 	cgid = scw_cgroup_id(cgrp);
 	if (!cgid)
 		return -EINVAL;
@@ -428,6 +435,8 @@ __hidden void scx_cgroup_weight_set_weight(struct cgroup *cgrp __arg_trusted,
 
 	if (!cgrp)
 		return;
+	if (!BPF_CORE_READ(cgrp, level))
+		return;
 	cgid = scw_cgroup_id(cgrp);
 	if (!cgid)
 		return;
@@ -456,6 +465,8 @@ __hidden void scx_cgroup_weight_set_idle(struct cgroup *cgrp __arg_trusted,
 	u64 cgid;
 
 	if (!cgrp)
+		return;
+	if (!BPF_CORE_READ(cgrp, level))
 		return;
 	cgid = scw_cgroup_id(cgrp);
 	if (!cgid)
@@ -496,6 +507,19 @@ __hidden int scx_cgroup_weight_task(struct task_struct *p __arg_trusted,
 		return 0;
 
 	return scw_fold(cgrp, cpu, base, joining, out);
+}
+
+__hidden int scx_cgroup_weight_fold(struct cgroup *cgrp __arg_trusted, s32 cpu,
+				    u64 base_weight, bool joining,
+				    struct scx_cgroup_weight_info *out)
+{
+	if (!cgrp || !out)
+		return -EINVAL;
+
+	if (!base_weight)
+		base_weight = 1;
+
+	return scw_fold(cgrp, cpu, base_weight, joining, out);
 }
 
 __hidden void scx_cgroup_weight_join(struct task_struct *p __arg_trusted,

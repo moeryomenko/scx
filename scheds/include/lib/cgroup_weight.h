@@ -75,6 +75,15 @@ int scx_cgroup_weight_task(struct task_struct *p __arg_trusted, s32 cpu,
 			   bool joining, struct scx_cgroup_weight_info *out);
 
 /*
+ * Fold the hierarchy of @cgrp for a task of @base_weight. The cgroup_move
+ * op uses this with the destination cgroup, because the task's own cgroup
+ * pointer can still name the source at that point.
+ */
+int scx_cgroup_weight_fold(struct cgroup *cgrp __arg_trusted, s32 cpu,
+			   u64 base_weight, bool joining,
+			   struct scx_cgroup_weight_info *out);
+
+/*
  * Account @base_weight of @p at @cpu. @join and @leave are paired across the
  * task's runnable period; @reweight moves only the task's own contribution
  * after a nice change.

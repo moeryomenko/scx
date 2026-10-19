@@ -195,17 +195,15 @@ impl<'a> Scheduler<'a> {
         skel.struct_ops.infinity_ops_mut().exit_dump_len = opts.exit_dump_len;
 
         /*
-         * cpu.max support is probed before load. A kernel without
-         * ops.cgroup_set_bandwidth() clears the callback and leaves
-         * cpu.weight and cpu.idle working.
+         * Probe cpu.max support before load. The probe also clears the
+         * callback on a kernel without ops.cgroup_set_bandwidth(), so the
+         * scheduler still loads with cpu.weight and cpu.idle only.
          */
-        let bw_support = if opts.no_cpu_max {
+        let bw_support = setup_cgroup_bw(skel.open_object_mut(), "infinity_cgroup_set_bandwidth")?;
+        let cpu_bw = !opts.no_cpu_max && bw_support != CgroupBwSupport::Unsupported;
+        if opts.no_cpu_max {
             info!("cpu.max disabled by --no-cpu-max");
-            CgroupBwSupport::Unsupported
-        } else {
-            setup_cgroup_bw(skel.open_object_mut(), "infinity_cgroup_set_bandwidth")?
-        };
-        let cpu_bw = bw_support != CgroupBwSupport::Unsupported;
+        }
 
         if cpu_bw {
             let nr_llcs = topo.all_llcs.len();

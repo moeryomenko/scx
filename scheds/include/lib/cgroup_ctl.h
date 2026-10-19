@@ -71,6 +71,9 @@ int  scx_cgroup_ctl_cancel(u64 taskc, u64 flags);
 
 int  scx_cgroup_ctl_weight(struct task_struct *p __arg_trusted, s32 cpu,
 			   bool joining, struct scx_cgroup_weight_info *out);
+int  scx_cgroup_ctl_weight_fold(struct cgroup *cgrp __arg_trusted, s32 cpu,
+				u64 base_weight, bool joining,
+				struct scx_cgroup_weight_info *out);
 void scx_cgroup_ctl_join(struct task_struct *p __arg_trusted, s32 cpu,
 			 u64 base_weight);
 void scx_cgroup_ctl_leave(struct task_struct *p __arg_trusted, s32 cpu,

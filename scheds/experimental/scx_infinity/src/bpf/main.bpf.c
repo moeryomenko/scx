@@ -1089,10 +1089,12 @@ void BPF_STRUCT_OPS(infinity_cgroup_move, struct task_struct *p,
 
 	/*
 	 * The task is now accounted on the new path; refresh the folded
-	 * weight for its next quantum.
+	 * weight for its next quantum from the destination cgroup, which the
+	 * task's own pointer may not name yet.
 	 */
 	if (tctx->joined) {
-		scx_cgroup_ctl_weight(p, tctx->group_cpu, false, &info);
+		scx_cgroup_ctl_weight_fold(to, tctx->group_cpu,
+					   tctx->base_weight, false, &info);
 		tctx->weight	  = info.weight ? info.weight : 1;
 		tctx->group_scale = info.scale;
 		tctx->idle	  = info.idle;
