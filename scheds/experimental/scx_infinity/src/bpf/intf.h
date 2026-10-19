@@ -56,6 +56,14 @@ typedef signed long    s64;
 #define INF_MAX_CGROUPS 2048
 #define INF_MAX_NODES 64
 
+/*
+ * Arena allocation size for the bandwidth task context. The struct holds
+ * struct scx_task_cgroup_bw plus the pid the enqueue callback needs; the
+ * extra room keeps the allocation above both and is checked by a static
+ * assertion in main.bpf.c.
+ */
+#define INF_BW_TASK_CTX_SIZE 256
+
 /* A CPU id that cannot name a valid CPU, used for a missing SMT sibling. */
 #define INF_NO_CPU 0xffffffffU
 /* Distance reported for a node pair that the loader did not seed. */
@@ -132,20 +140,29 @@ struct inf_node_topo {
 	u32 distance[INF_MAX_NODES];
 };
 
-struct inf_task_ctx {
+/*
+ * Userspace mirror of the BPF task context size. The real struct embeds
+ * `struct scx_task_cgroup_bw` at offset 0, which cannot be exported through
+ * this header; only its size is needed to initialize the arena allocator.
+ * A static assertion in main.bpf.c keeps the two in sync.
+ */
+#define INF_CGROUP_BW_CTX_SIZE 120
+
+struct inf_task_ctx_layout {
+	u8  cg_bw[INF_CGROUP_BW_CTX_SIZE];
+	u64 base_weight;
 	u64 weight;
 	u64 group_scale;
-	u64 cgid;
 	u64 slice_ns;
+	u64 last_running_ns;
 	s32 queued_cpu;
+	s32 group_cpu;
+	u32 joined;
 	u32 yielded;
 	u32 wake_fork;
 	u32 idle;
-};
-
-struct inf_cgrp_ctx {
-	u64 weight;
-	u64 idle;
+	u32 pid;
+	u32 pad;
 };
 
 struct inf_stats {
@@ -155,6 +172,35 @@ struct inf_stats {
 	u64 expiries;
 	u64 preemptions;
 	u64 yields;
+	u64 cgrp_throttled;
+	u64 cgrp_reenqueued;
+	u64 cgrp_eff_weight;
+	u64 cgrp_scale;
+};
+
+/*
+ * Mirror of the shared cgroup library counters, read from
+ * scx_cgroup_global_stor and scx_cgroup_weight_stor. A static assertion
+ * in main.bpf.c keeps the layout identical to lib/cgroup_weight.h.
+ */
+struct inf_cgroup_global_stats {
+	u64 throttle_events;
+	s64 nr_throttled_groups;
+	u64 nr_cgroups;
+};
+
+struct inf_cgroup_weight_stats {
+	u64 samples;
+	u64 sum;
+	u64 min;
+	u64 max;
+};
+
+/* Arguments for the one-shot arena/library init syscall. */
+struct inf_arena_init_args {
+	u64 static_pages;
+	u64 task_ctx_size;
+	u64 nr_llcs;
 };
 
 #endif /* __SCX_INFINITY_INTF_H */

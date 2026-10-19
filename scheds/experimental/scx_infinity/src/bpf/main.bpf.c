@@ -18,22 +18,38 @@
  * tail path.
  *
  * The slice is proportional to the task's effective weight over the
- * contending weight on the target CPU, with a 1 ns floor, and is
- * recomputed when the task is popped. The effective weight is the kernel
- * task weight scaled by the task's cgroup weight when the running kernel
- * exposes scx_bpf_task_cgroup(). A cgroup in cpu.idle mode gets the
- * SCHED_IDLE weight.
+ * contending weight on the target CPU. The effective weight folds the
+ * cgroup hierarchy in through the shared cgroup control library: nested
+ * cpu.weight, cpu.idle and cpu.max are all enforced by
+ * lib/cgroup_ctl.bpf.c, which wraps lib/cgroup_bw.bpf.c and
+ * lib/cgroup_weight.bpf.c.
+ *
+ * The task context lives in the BPF arena because the bandwidth library
+ * parks throttled tasks on an arena queue with the task context embedded in
+ * it.
  */
 #include <scx/common.bpf.h>
 #include <scx/compat.bpf.h>
+#include <lib/cgroup_ctl.h>
+#include <lib/sdt_task.h>
 #include "intf.h"
 
 char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
 
-/* Possible CPU count, written by the loader before load. */
-const volatile u32 nr_cpu_ids = 0;
+/*
+ * Possible CPU count comes from the shared lib/bitmap.bpf.c definition; the
+ * loader publishes it through the rodata `nr_cpu_ids` field before load.
+ */
+extern const volatile u32 nr_cpu_ids;
+
+/*
+ * Whether cpu.max is enforced. The loader clears it with --no-cpu-max or
+ * when the running kernel has no support. cpu.weight and cpu.idle are
+ * always on.
+ */
+const volatile bool enable_cpu_bw = true;
 
 /*
  * Live configuration. The loader replaces the single entry with one map
@@ -45,13 +61,6 @@ struct {
 	__type(key, u32);
 	__type(value, struct inf_cfg);
 } cfg_stor SEC(".maps");
-
-struct {
-	__uint(type, BPF_MAP_TYPE_TASK_STORAGE);
-	__uint(map_flags, BPF_F_NO_PREALLOC);
-	__type(key, int);
-	__type(value, struct inf_task_ctx);
-} task_ctx_stor SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
@@ -80,13 +89,6 @@ struct {
 } node_topo_stor SEC(".maps");
 
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, INF_MAX_CGROUPS);
-	__type(key, u64);
-	__type(value, struct inf_cgrp_ctx);
-} cgrp_stor SEC(".maps");
-
-struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, u32);
@@ -94,13 +96,43 @@ struct {
 } stats_stor SEC(".maps");
 
 /*
- * The compat header wraps scx_bpf_task_cgroup() in a macro that only
- * tests the cid-form ___new symbol. Declare the plain kfunc directly so
- * that a kernel which exposes it gains cgroup weight and cpu.idle.
+ * Per-task context, allocated in the arena by scx_task_alloc(). The
+ * bandwidth context must stay first: REGISTER_SCX_CGROUP_BW_ENQUEUE_CB()
+ * and the scx_cgroup_bw_* API cast the context to scx_task_common at offset
+ * 0.
  */
-#undef scx_bpf_task_cgroup
-struct cgroup *scx_bpf_task_cgroup(struct task_struct *p) __ksym __weak;
-void	       bpf_cgroup_release(struct cgroup *cgrp) __ksym __weak;
+struct task_ctx {
+	struct scx_task_cgroup_bw cg_bw; /* MUST be first */
+	u64 base_weight; /* p->scx.weight at the last change */
+	u64 weight; /* effective weight, hierarchy folded in */
+	u64 group_scale; /* folded shares/load product, Q10 */
+	u64 slice_ns; /* last assigned quantum */
+	u64 last_running_ns; /* clock at the last ops.running() */
+	s32 queued_cpu; /* DSQ CPU, -1 when not queued */
+	s32 group_cpu; /* CPU the group load is charged to */
+	u32 joined; /* 1 while the cgroup load counts this task */
+	u32 yielded;
+	u32 wake_fork;
+	u32 idle;
+	u32 pid;
+	u32 pad;
+};
+
+typedef struct task_ctx __arena task_ctx;
+
+/* intf.h carries the same layout for the loader's arena sizing. */
+_Static_assert(sizeof(struct task_ctx) == sizeof(struct inf_task_ctx_layout),
+	       "task_ctx layout mirror in intf.h is out of sync");
+
+static task_ctx *inf_task_ctx(struct task_struct *p)
+{
+	return (task_ctx *)__scx_task_data(p);
+}
+
+static task_ctx *inf_task_ctx_alloc(struct task_struct *p)
+{
+	return (task_ctx *)scx_task_alloc(p);
+}
 
 static struct inf_cpu_ctx *inf_cpu_ctx(s32 cpu)
 {
@@ -112,22 +144,16 @@ static struct inf_cpu_ctx *inf_cpu_ctx(s32 cpu)
 	return bpf_map_lookup_elem(&cpu_ctx_stor, &key);
 }
 
-static struct inf_task_ctx *inf_task_ctx(struct task_struct *p)
-{
-	return bpf_task_storage_get(&task_ctx_stor, p, 0,
-				    BPF_LOCAL_STORAGE_GET_F_CREATE);
-}
-
-static struct inf_task_ctx *inf_task_ctx_lookup(struct task_struct *p)
-{
-	return bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
-}
-
 static struct inf_stats *inf_stats(void)
 {
 	u32 key = 0;
 
 	return bpf_map_lookup_elem(&stats_stor, &key);
+}
+
+static __always_inline bool inf_cpu_bw_enabled(void)
+{
+	return enable_cpu_bw;
 }
 
 /*
@@ -176,95 +202,44 @@ static __always_inline u64 inf_quantum(u64 w, u64 total)
 }
 
 /*
- * Read the task's cgroup weight. Returns 100 (the kernel default share)
- * when the kernel has no scx_bpf_task_cgroup() or the task is outside a
- * known cgroup. The returned scale is in the kernel's 1..10000 range.
+ * Effective weight of @p on @cpu through the shared cgroup library. The
+ * library folds every cpu.weight level, honours cpu.idle and reports the
+ * fixed-point group scale for later reweights.
  */
-static __always_inline u64 inf_cgroup_scale(struct task_struct *p, u64 *cgid,
-					    u32 *idle_out)
+static __always_inline u64 inf_effective_weight(struct task_struct *p, s32 cpu,
+						bool joining, task_ctx *tctx)
 {
-	struct cgroup	    *cgrp = NULL;
-	struct inf_cgrp_ctx *cg;
-	u64		     id	   = 0;
-	u64		     scale = 100;
+	struct scx_cgroup_weight_info info = {};
+	u64			      w;
 
-	if (cgid)
-		*cgid = 0;
-	if (idle_out)
-		*idle_out = 0;
+	scx_cgroup_ctl_weight(p, cpu, joining, &info);
+	w = info.weight ? info.weight : 1;
 
-	if (bpf_ksym_exists(scx_bpf_task_cgroup))
-		cgrp = scx_bpf_task_cgroup(p);
-	if (!cgrp)
-		return scale;
-
-	id = BPF_CORE_READ(cgrp, kn, id);
-	if (id) {
-		cg = bpf_map_lookup_elem(&cgrp_stor, &id);
-		if (cg) {
-			if (READ_ONCE(cg->idle)) {
-				if (idle_out)
-					*idle_out = 1;
-				scale = 3;
-			} else if (READ_ONCE(cg->weight)) {
-				scale = READ_ONCE(cg->weight);
-			}
-		}
+	if (tctx) {
+		tctx->group_scale = info.scale;
+		tctx->idle	  = info.idle;
 	}
-	bpf_cgroup_release(cgrp);
-
-	if (cgid)
-		*cgid = id;
-	return scale;
+	return w;
 }
 
-/*
- * Effective weight = task weight scaled by the cgroup share. A cgroup in
- * cpu.idle mode uses the SCHED_IDLE weight of 3 instead of its share.
- */
-static __always_inline u64 inf_effective_weight(struct task_struct *p,
-						u64 *cgid, u64 *scale_out,
-						u32 *idle_out)
-{
-	u64 scale;
-	u64 w;
-	u32 idle = 0;
-
-	scale	 = inf_cgroup_scale(p, cgid, &idle);
-	if (idle) {
-		if (scale_out)
-			*scale_out = scale;
-		if (idle_out)
-			*idle_out = 1;
-		return 3;
-	}
-
-	w = p->scx.weight;
-	if (w == 0)
-		w = 1;
-	if (scale_out)
-		*scale_out = scale;
-	if (idle_out)
-		*idle_out = 0;
-	w = (w * scale + 50) / 100;
-	return w ? w : 1;
-}
-
-/* Reweight a task without touching the cgroup map. */
+/* Reweight a task from its new base weight and stored group scale. */
 static __always_inline u64 inf_reweight(u64 base, u64 scale, u32 idle)
 {
 	if (idle)
-		return 3;
+		return SCX_CGROUP_WEIGHT_IDLE;
 	if (base == 0)
 		base = 1;
 	if (scale == 0)
-		scale = 100;
-	return (base * scale + 50) / 100;
+		scale = SCX_CGROUP_WEIGHT_ONE;
+
+	base = (base * scale + (SCX_CGROUP_WEIGHT_ONE / 2)) >>
+	       SCX_CGROUP_WEIGHT_SHIFT;
+	return base ? base : 1;
 }
 
 static __always_inline u64 inf_task_weight(struct task_struct *p)
 {
-	struct inf_task_ctx *tctx = inf_task_ctx_lookup(p);
+	task_ctx *tctx = inf_task_ctx(p);
 
 	if (tctx && tctx->weight)
 		return tctx->weight;
@@ -301,27 +276,30 @@ static __always_inline u32 inf_nr_cpu_ids(void)
  * Preempt only a fresh wakeup that took a head slot. The newcomer must be
  * heavier than the running task and the victim must retain at least the
  * configured preemption margin, so a task that is about to expire
- * finishes instead of taking an IPI.
+ * finishes instead of taking an IPI. A task under a cpu.idle cgroup never
+ * preempts.
  */
 static __always_inline void inf_maybe_preempt(struct task_struct *p, s32 cpu,
 					      u64 enq_flags, bool head, u64 w)
 {
-	struct inf_task_ctx *tctx;
-	struct task_struct  *victim;
-	struct inf_stats    *stats;
-	u64		     reserve;
-	u64		     victim_w;
+	task_ctx	   *tctx;
+	struct task_struct *victim;
+	struct inf_stats   *stats;
+	u64		    reserve;
+	u64		    victim_w;
 
 	if (!head || !(enq_flags & SCX_ENQ_WAKEUP))
 		return;
 	if (p->policy != INF_SCHED_NORMAL && p->policy != INF_SCHED_EXT)
 		return;
 
-	tctx = inf_task_ctx_lookup(p);
+	tctx = inf_task_ctx(p);
 	if (tctx && tctx->wake_fork) {
 		tctx->wake_fork = 0;
 		return;
 	}
+	if (tctx && tctx->idle)
+		return;
 
 	victim = __COMPAT_scx_bpf_cpu_curr(cpu);
 	if (!victim || victim == p)
@@ -415,7 +393,7 @@ struct inf_pick_score {
 
 /* Idle candidates: lower class, then nearer node, then faster CPU. */
 static __noinline bool inf_score_better(const struct inf_pick_score *a,
-					     const struct inf_pick_score *b)
+					const struct inf_pick_score *b)
 {
 	if (a->cls != b->cls)
 		return a->cls < b->cls;
@@ -430,8 +408,8 @@ static __noinline bool inf_score_better(const struct inf_pick_score *a,
 
 /* Capacity fallback: a CPU below the spill threshold wins first. */
 static __noinline bool inf_capacity_better(const struct inf_pick_score *a,
-						const struct inf_pick_score *b,
-						u32 spill)
+					   const struct inf_pick_score *b,
+					   u32				spill)
 {
 	bool a_fits = a->depth < spill;
 	bool b_fits = b->depth < spill;
@@ -473,7 +451,7 @@ s32 BPF_STRUCT_OPS(infinity_select_cpu, struct task_struct *p, s32 prev_cpu,
 	struct inf_node_topo *node_row = NULL;
 	struct inf_pick_score best     = { .cpu = -1 };
 	struct inf_pick_score cap      = { .cpu = -1 };
-	struct inf_task_ctx  *tctx;
+	task_ctx	     *tctx;
 	u32		      ncpu, mode, spill;
 	u32		      local_node = 0, local_llc = 0;
 	u32		      nkey;
@@ -647,39 +625,74 @@ s32 BPF_STRUCT_OPS(infinity_select_cpu, struct task_struct *p, s32 prev_cpu,
 	return local_cpu;
 }
 
-void BPF_STRUCT_OPS(infinity_enqueue, struct task_struct *p, u64 enq_flags)
+/*
+ * Shared enqueue path. @reenq marks a call from the bandwidth callback: the
+ * cgroup has just become unthrottled, so the throttle check is skipped.
+ */
+static int inf_enqueue_common(struct task_struct *p, u64 enq_flags, bool reenq)
 {
-	struct inf_cpu_ctx  *cctx;
-	struct inf_task_ctx *tctx;
-	struct inf_stats    *stats;
-	u64		     key;
-	u64		     q;
-	u64		     w;
-	u32		     seq;
-	bool		     head = false;
-	bool		     wake = !!(enq_flags & SCX_ENQ_WAKEUP);
-	bool		     exempt;
-	bool		     expired;
-	s32		     cpu;
+	struct inf_cpu_ctx *cctx;
+	task_ctx	   *tctx;
+	struct inf_stats   *stats;
+	u64		    key;
+	u64		    q;
+	u64		    w;
+	u64		    base;
+	u32		    seq;
+	bool		    head = false;
+	bool		    wake = !!(enq_flags & SCX_ENQ_WAKEUP);
+	bool		    exempt;
+	bool		    expired;
+	bool		    newly_joined = false;
+	s32		    cpu;
+	int		    ret;
+
+	if (!p)
+		return -EINVAL;
 
 	cpu = scx_bpf_task_cpu(p);
 	if (cpu < 0 || (u32)cpu >= inf_nr_cpu_ids())
 		cpu = bpf_get_smp_processor_id();
 	if (cpu < 0 || (u32)cpu >= inf_nr_cpu_ids())
-		return;
+		return -EINVAL;
 
 	cctx = inf_cpu_ctx(cpu);
 	tctx = inf_task_ctx(p);
 	if (!cctx || !tctx)
-		return;
+		return -EINVAL;
 
-	stats	     = inf_stats();
-	w	     = inf_effective_weight(p, &tctx->cgid, &tctx->group_scale,
-					    &tctx->idle);
-	tctx->weight = w;
+	stats = inf_stats();
+	base  = tctx->base_weight ? tctx->base_weight :
+				    (p->scx.weight ? p->scx.weight : 1);
 
-	expired	     = !READ_ONCE(p->scx.slice) && !wake &&
-		       !(enq_flags & SCX_ENQ_HEAD);
+	/*
+	 * A task in a throttled cgroup is parked in the bandwidth backlog and
+	 * is not on any of our queues. Its weight contribution is dropped
+	 * until the callback re-enqueues it.
+	 */
+	if (inf_cpu_bw_enabled() && !reenq) {
+		ret = scx_cgroup_ctl_throttled(p, (u64)tctx);
+		if (ret == -EAGAIN) {
+			if (tctx->joined) {
+				scx_cgroup_ctl_leave(p, tctx->group_cpu,
+						     tctx->base_weight);
+				tctx->joined = 0;
+			}
+			if (!scx_cgroup_ctl_put_aside(p, (u64)tctx, 0)) {
+				if (stats)
+					__sync_fetch_and_add(
+						&stats->cgrp_throttled, 1);
+				return 0;
+			}
+			/*
+			 * A failed put-aside must not lose the task: fall
+			 * through and enqueue it normally.
+			 */
+		}
+	}
+
+	expired = !READ_ONCE(p->scx.slice) && !wake &&
+		  !(enq_flags & SCX_ENQ_HEAD);
 	if (expired && !tctx->yielded && stats)
 		__sync_fetch_and_add(&stats->expiries, 1);
 
@@ -706,14 +719,37 @@ void BPF_STRUCT_OPS(infinity_enqueue, struct task_struct *p, u64 enq_flags)
 		 (enq_flags & (SCX_ENQ_HEAD | SCX_ENQ_REENQ | SCX_ENQ_LAST |
 			       SCX_ENQ_PREEMPT));
 
-	q      = inf_quantum(w, READ_ONCE(cctx->w_sum) + w);
-	key    = head ? inf_head_key(cctx) : inf_tail_key(cctx);
+	/*
+	 * The task's cgroup load counts it from the first enqueue until the
+	 * matching dequeue, so a rotation through expiry does not join twice.
+	 */
+	if (!tctx->joined) {
+		w	     = inf_effective_weight(p, cpu, true, tctx);
+		tctx->weight = w;
+		scx_cgroup_ctl_join(p, cpu, base);
+		tctx->joined	= 1;
+		tctx->group_cpu = cpu;
+		newly_joined	= true;
+		if (stats) {
+			stats->cgrp_eff_weight = w;
+			stats->cgrp_scale      = tctx->group_scale;
+		}
+	} else {
+		w = tctx->weight ? tctx->weight : base;
+	}
+
+	q   = inf_quantum(w, READ_ONCE(cctx->w_sum) + w);
+	key = head ? inf_head_key(cctx) : inf_tail_key(cctx);
 
 	/* Charge the queue before the insert so the pop sees this weight. */
 	__sync_fetch_and_add(&cctx->w_sum, (s64)w);
 	if (!scx_bpf_dsq_insert_vtime(p, (u64)cpu, q, key, 0)) {
 		__sync_fetch_and_add(&cctx->w_sum, -(s64)w);
-		return;
+		if (newly_joined) {
+			scx_cgroup_ctl_leave(p, cpu, base);
+			tctx->joined = 0;
+		}
+		return -EINVAL;
 	}
 	__sync_fetch_and_add(&cctx->depth, 1);
 
@@ -735,7 +771,35 @@ void BPF_STRUCT_OPS(infinity_enqueue, struct task_struct *p, u64 enq_flags)
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 
 	inf_maybe_preempt(p, cpu, enq_flags, head, w);
+	return 0;
 }
+
+void BPF_STRUCT_OPS(infinity_enqueue, struct task_struct *p, u64 enq_flags)
+{
+	inf_enqueue_common(p, enq_flags, false);
+}
+
+/*
+ * Bandwidth callback: a group that throttled @p has time again. Re-enqueue
+ * through the normal path so the task re-enters through the 7:1 gate and
+ * rejoins its cgroup load.
+ */
+int inf_bw_enqueue(struct task_struct *p __arg_trusted, u64 ctx)
+{
+	struct inf_stats *stats;
+
+	if (!inf_cpu_bw_enabled())
+		return 0;
+
+	inf_enqueue_common(p, SCX_ENQ_REENQ, true);
+
+	stats = inf_stats();
+	if (stats)
+		__sync_fetch_and_add(&stats->cgrp_reenqueued, 1);
+
+	return 0;
+}
+REGISTER_SCX_CGROUP_BW_ENQUEUE_CB(inf_bw_enqueue);
 
 /*
  * Pop the head of the CPU's own vtime DSQ, recompute its slice against
@@ -743,19 +807,23 @@ void BPF_STRUCT_OPS(infinity_enqueue, struct task_struct *p, u64 enq_flags)
  */
 void BPF_STRUCT_OPS(infinity_dispatch, s32 cpu, struct task_struct *prev)
 {
-	struct inf_cpu_ctx  *cctx;
-	struct inf_task_ctx *tctx;
-	struct task_struct  *p;
-	u64		     q;
-	u64		     w;
+	struct inf_cpu_ctx *cctx;
+	task_ctx	   *tctx;
+	struct task_struct *p;
+	u64		    q;
+	u64		    w;
 
 	cctx = inf_cpu_ctx(cpu);
 	if (!cctx)
 		return;
 
+	/* Re-enqueue backlogged tasks of cgroups that got time again. */
+	if (inf_cpu_bw_enabled())
+		scx_cgroup_ctl_reenqueue();
+
 	p = __COMPAT_scx_bpf_dsq_peek((u64)cpu);
 	if (p) {
-		tctx = inf_task_ctx_lookup(p);
+		tctx = inf_task_ctx(p);
 		w    = tctx && tctx->weight ? tctx->weight : inf_task_weight(p);
 		q    = inf_quantum(w, READ_ONCE(cctx->w_sum));
 		scx_bpf_task_set_slice(p, q);
@@ -780,7 +848,7 @@ void BPF_STRUCT_OPS(infinity_dispatch, s32 cpu, struct task_struct *prev)
 	 * trip through enqueue.
 	 */
 	if (prev && !READ_ONCE(prev->scx.slice)) {
-		tctx = inf_task_ctx_lookup(prev);
+		tctx = inf_task_ctx(prev);
 		w = tctx && tctx->weight ? tctx->weight : inf_task_weight(prev);
 		q = inf_quantum(w, READ_ONCE(cctx->w_sum) + w);
 		scx_bpf_task_set_slice(prev, q);
@@ -789,15 +857,24 @@ void BPF_STRUCT_OPS(infinity_dispatch, s32 cpu, struct task_struct *prev)
 
 void BPF_STRUCT_OPS(infinity_dequeue, struct task_struct *p, u64 deq_flags)
 {
-	struct inf_cpu_ctx  *cctx;
-	struct inf_task_ctx *tctx;
-	u64		     w;
-	s32		     cpu;
+	struct inf_cpu_ctx *cctx;
+	task_ctx	   *tctx;
+	u64		    w;
+	s32		    cpu;
 
 	(void)deq_flags;
 
-	tctx = inf_task_ctx_lookup(p);
-	if (!tctx || tctx->queued_cpu < 0)
+	tctx = inf_task_ctx(p);
+	if (!tctx)
+		return;
+
+	/* The task stops being runnable: drop its cgroup contribution. */
+	if (tctx->joined) {
+		scx_cgroup_ctl_leave(p, tctx->group_cpu, tctx->base_weight);
+		tctx->joined = 0;
+	}
+
+	if (tctx->queued_cpu < 0)
 		return;
 
 	cpu		 = tctx->queued_cpu;
@@ -814,22 +891,30 @@ void BPF_STRUCT_OPS(infinity_dequeue, struct task_struct *p, u64 deq_flags)
 
 void BPF_STRUCT_OPS(infinity_set_weight, struct task_struct *p, u32 weight)
 {
-	struct inf_cpu_ctx  *cctx;
-	struct inf_task_ctx *tctx;
-	u64		     old;
-	u64		     new;
-	s32		     cpu;
+	struct inf_cpu_ctx *cctx;
+	task_ctx	   *tctx;
+	u64		    old_base;
+	u64		    new_base;
+	u64		    old;
+	u64		    new;
+	s32		    cpu;
 
-	tctx = inf_task_ctx_lookup(p);
+	tctx = inf_task_ctx(p);
 	if (!tctx)
 		return;
 
-	old	       = tctx->weight;
-	new	       = inf_reweight(weight, tctx->group_scale, tctx->idle);
-	tctx->weight   = new;
-	tctx->slice_ns = inf_quantum(new, new);
+	old_base = tctx->base_weight;
+	new_base = weight ? weight : 1;
+	old	 = tctx->weight;
+	new	 = inf_reweight(new_base, tctx->group_scale, tctx->idle);
+	tctx->base_weight = new_base;
+	tctx->weight	  = new;
+	tctx->slice_ns	  = inf_quantum(new, new);
 
-	cpu	       = tctx->queued_cpu;
+	if (tctx->joined)
+		scx_cgroup_ctl_reweight(p, tctx->group_cpu, old_base, new_base);
+
+	cpu = tctx->queued_cpu;
 	if (cpu < 0)
 		return;
 	cctx = inf_cpu_ctx(cpu);
@@ -851,8 +936,8 @@ void BPF_STRUCT_OPS(infinity_set_weight, struct task_struct *p, u32 weight)
 bool BPF_STRUCT_OPS(infinity_yield, struct task_struct *from,
 		    struct task_struct *to)
 {
-	struct inf_stats    *stats;
-	struct inf_task_ctx *tctx;
+	struct inf_stats *stats;
+	task_ctx	 *tctx;
 
 	(void)to;
 
@@ -861,7 +946,7 @@ bool BPF_STRUCT_OPS(infinity_yield, struct task_struct *from,
 
 	/* Yield forfeits the remaining slice; the core re-enqueues. */
 	scx_bpf_task_set_slice(from, 0);
-	tctx = inf_task_ctx_lookup(from);
+	tctx = inf_task_ctx(from);
 	if (tctx)
 		tctx->yielded = 1;
 
@@ -872,140 +957,173 @@ bool BPF_STRUCT_OPS(infinity_yield, struct task_struct *from,
 	return false;
 }
 
+void BPF_STRUCT_OPS(infinity_running, struct task_struct *p)
+{
+	task_ctx *tctx = inf_task_ctx(p);
+
+	if (tctx)
+		tctx->last_running_ns = scx_bpf_now();
+}
+
+void BPF_STRUCT_OPS(infinity_stopping, struct task_struct *p, bool runnable)
+{
+	task_ctx *tctx = inf_task_ctx(p);
+	u64	  now, delta;
+
+	(void)runnable;
+
+	if (!tctx)
+		return;
+
+	now		      = scx_bpf_now();
+	delta		      = now - tctx->last_running_ns;
+	tctx->last_running_ns = now;
+
+	if (delta && inf_cpu_bw_enabled())
+		scx_cgroup_ctl_consume(p, (u64)tctx, delta);
+}
+
+s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init_task, struct task_struct *p,
+			     struct scx_init_task_args *args)
+{
+	task_ctx *tctx;
+	int	  i;
+
+	(void)args;
+
+	tctx = inf_task_ctx_alloc(p);
+	if (!tctx)
+		return -ENOMEM;
+
+	/* Zero the whole context, then seed the live fields. */
+	bpf_for(i, 0, (int)sizeof(*tctx))
+	{
+		((char __arena *)tctx)[i] = 0;
+	}
+
+	tctx->base_weight     = p->scx.weight ? p->scx.weight : 1;
+	tctx->weight	      = tctx->base_weight;
+	tctx->group_scale     = SCX_CGROUP_WEIGHT_ONE;
+	tctx->slice_ns	      = 0;
+	tctx->last_running_ns = scx_bpf_now();
+	tctx->queued_cpu      = -1;
+	tctx->group_cpu	      = -1;
+	tctx->joined	      = 0;
+	tctx->yielded	      = 0;
+	tctx->wake_fork	      = 0;
+	tctx->idle	      = 0;
+	tctx->pid	      = p->pid;
+	return 0;
+}
+
+s32 BPF_STRUCT_OPS(infinity_exit_task, struct task_struct *p,
+		   struct scx_exit_task_args *args)
+{
+	task_ctx *tctx = inf_task_ctx(p);
+
+	(void)args;
+
+	if (tctx) {
+		if (tctx->joined)
+			scx_cgroup_ctl_leave(p, tctx->group_cpu,
+					     tctx->base_weight);
+		/*
+		 * Mark the task dead in the bandwidth queues before freeing the
+		 * context; concurrent drains holding the task must finish.
+		 */
+		if (inf_cpu_bw_enabled())
+			scx_cgroup_ctl_cancel((u64)tctx,
+					      SCX_CGROUP_BW_CANCEL_DROP);
+	}
+
+	scx_task_free_rcu(p);
+	return 0;
+}
+
 s32 BPF_STRUCT_OPS(infinity_cgroup_init, struct cgroup *cgrp,
 		   struct scx_cgroup_init_args *args)
 {
-	struct inf_cgrp_ctx cg = {
-		.weight = 100,
-		.idle	= 0,
-	};
-	u64 id;
-
-	if (!cgrp || !args)
-		return 0;
-
-	id = BPF_CORE_READ(cgrp, kn, id);
-	if (!id)
-		return 0;
-
-	cg.weight = args->weight ? args->weight : 100;
-	cg.idle = bpf_core_field_exists(args->sched_idle) && args->sched_idle ?
-			  1 :
-			  0;
-	bpf_map_update_elem(&cgrp_stor, &id, &cg, BPF_ANY);
-	return 0;
+	return scx_cgroup_ctl_cgroup_init(cgrp, args);
 }
 
 void BPF_STRUCT_OPS(infinity_cgroup_exit, struct cgroup *cgrp)
 {
-	u64 id;
-
-	if (!cgrp)
-		return;
-	id = BPF_CORE_READ(cgrp, kn, id);
-	if (id)
-		bpf_map_delete_elem(&cgrp_stor, &id);
+	scx_cgroup_ctl_cgroup_exit(cgrp);
 }
 
 void BPF_STRUCT_OPS(infinity_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
 {
-	struct inf_cgrp_ctx *cg;
-	struct inf_cgrp_ctx  ncg = {
-		.weight = 100,
-		.idle	= 0,
-	};
-	u64 id;
-
-	if (!cgrp)
-		return;
-	id = BPF_CORE_READ(cgrp, kn, id);
-	if (!id)
-		return;
-
-	cg = bpf_map_lookup_elem(&cgrp_stor, &id);
-	if (cg) {
-		WRITE_ONCE(cg->weight, weight ? weight : 100);
-		return;
-	}
-
-	ncg.weight = weight ? weight : 100;
-	bpf_map_update_elem(&cgrp_stor, &id, &ncg, BPF_ANY);
+	scx_cgroup_ctl_set_weight(cgrp, weight);
 }
 
 void BPF_STRUCT_OPS(infinity_cgroup_set_idle, struct cgroup *cgrp, bool idle)
 {
-	struct inf_cgrp_ctx *cg;
-	struct inf_cgrp_ctx  ncg = {
-		.weight = 100,
-		.idle	= 0,
-	};
-	u64 id;
+	scx_cgroup_ctl_set_idle(cgrp, idle);
+}
 
-	if (!cgrp)
-		return;
-	id = BPF_CORE_READ(cgrp, kn, id);
-	if (!id)
-		return;
+void BPF_STRUCT_OPS(infinity_cgroup_set_bandwidth, struct cgroup *cgrp,
+		    u64 period_us, u64 quota_us, u64 burst_us)
+{
+	int ret = scx_cgroup_ctl_set_bandwidth(cgrp, period_us, quota_us,
+					       burst_us);
 
-	cg = bpf_map_lookup_elem(&cgrp_stor, &id);
-	if (cg) {
-		WRITE_ONCE(cg->idle, idle ? 1 : 0);
-		return;
-	}
-
-	ncg.idle = idle ? 1 : 0;
-	bpf_map_update_elem(&cgrp_stor, &id, &ncg, BPF_ANY);
+	if (ret)
+		scx_bpf_error("Failed to set cgroup bandwidth: %d", ret);
 }
 
 void BPF_STRUCT_OPS(infinity_cgroup_move, struct task_struct *p,
 		    struct cgroup *from, struct cgroup *to)
 {
-	struct inf_task_ctx *tctx;
-
-	(void)from;
-	(void)to;
-
-	/* Force the next enqueue to read the new cgroup. */
-	tctx = inf_task_ctx_lookup(p);
-	if (!tctx)
-		return;
-	tctx->cgid	  = 0;
-	tctx->group_scale = 0;
-	tctx->idle	  = 0;
-}
-
-s32 BPF_STRUCT_OPS(infinity_init_task, struct task_struct *p,
-		   struct scx_init_task_args *args)
-{
-	struct inf_task_ctx *tctx;
-
-	(void)args;
+	struct scx_cgroup_weight_info info = {};
+	task_ctx		     *tctx;
+	int			      ret;
 
 	tctx = inf_task_ctx(p);
 	if (!tctx)
-		return -ENOMEM;
+		return;
 
-	tctx->weight	  = p->scx.weight ? p->scx.weight : 1;
-	tctx->group_scale = 100;
-	tctx->cgid	  = 0;
-	tctx->slice_ns	  = 0;
-	tctx->queued_cpu  = -1;
-	tctx->yielded	  = 0;
-	tctx->wake_fork	  = 0;
-	tctx->idle	  = 0;
-	return 0;
+	ret = scx_cgroup_ctl_move(p, (u64)tctx, from, to, tctx->group_cpu,
+				  tctx->base_weight, tctx->joined != 0);
+	if (ret)
+		scx_bpf_error("Failed to move a task between cgroups: %d", ret);
+
+	/*
+	 * The task is now accounted on the new path; refresh the folded
+	 * weight for its next quantum.
+	 */
+	if (tctx->joined) {
+		scx_cgroup_ctl_weight(p, tctx->group_cpu, false, &info);
+		tctx->weight	  = info.weight ? info.weight : 1;
+		tctx->group_scale = info.scale;
+		tctx->idle	  = info.idle;
+	}
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init)
 {
-	struct inf_cpu_ctx *cctx;
-	u32		    ncpu = inf_nr_cpu_ids();
-	u32		    key;
-	s32		    cpu;
-	int		    ret;
+	struct inf_cpu_ctx	    *cctx;
+	struct scx_cgroup_ctl_config ctl = {
+		.verbose   = 0,
+		.enable_bw = enable_cpu_bw,
+	};
+	u32 ncpu = inf_nr_cpu_ids();
+	u32 key;
+	s32 cpu;
+	int ret;
 
 	if (ncpu > INF_MAX_CPUS)
 		ncpu = INF_MAX_CPUS;
+
+	/*
+	 * Bring up cpu.weight and cpu.idle, and cpu.max when the loader kept
+	 * it on. A kernel without cpu.max support leaves the weight half
+	 * usable, so the scheduler still loads.
+	 */
+	ret = scx_cgroup_ctl_lib_init(&ctl);
+	if (ret) {
+		scx_bpf_error("failed to initialize cgroup control: %d", ret);
+		return ret;
+	}
 
 	/*
 	 * Array maps start zeroed. Seed both key runs before any CPU can
@@ -1050,17 +1168,21 @@ void BPF_STRUCT_OPS(infinity_exit, struct scx_exit_info *ei)
 }
 
 SCX_OPS_DEFINE(infinity_ops, .select_cpu = (void *)infinity_select_cpu,
-	       .enqueue		  = (void *)infinity_enqueue,
-	       .dispatch	  = (void *)infinity_dispatch,
-	       .dequeue		  = (void *)infinity_dequeue,
-	       .set_weight	  = (void *)infinity_set_weight,
-	       .yield		  = (void *)infinity_yield,
-	       .cgroup_init	  = (void *)infinity_cgroup_init,
-	       .cgroup_exit	  = (void *)infinity_cgroup_exit,
-	       .cgroup_set_weight = (void *)infinity_cgroup_set_weight,
-	       .cgroup_set_idle	  = (void *)infinity_cgroup_set_idle,
-	       .cgroup_move	  = (void *)infinity_cgroup_move,
-	       .init_task	  = (void *)infinity_init_task,
+	       .enqueue		     = (void *)infinity_enqueue,
+	       .dispatch	     = (void *)infinity_dispatch,
+	       .dequeue		     = (void *)infinity_dequeue,
+	       .running		     = (void *)infinity_running,
+	       .stopping	     = (void *)infinity_stopping,
+	       .set_weight	     = (void *)infinity_set_weight,
+	       .yield		     = (void *)infinity_yield,
+	       .cgroup_init	     = (void *)infinity_cgroup_init,
+	       .cgroup_exit	     = (void *)infinity_cgroup_exit,
+	       .cgroup_set_weight    = (void *)infinity_cgroup_set_weight,
+	       .cgroup_set_idle	     = (void *)infinity_cgroup_set_idle,
+	       .cgroup_set_bandwidth = (void *)infinity_cgroup_set_bandwidth,
+	       .cgroup_move	     = (void *)infinity_cgroup_move,
+	       .init_task	     = (void *)infinity_init_task,
+	       .exit_task	     = (void *)infinity_exit_task,
 	       .init = (void *)infinity_init, .exit = (void *)infinity_exit,
 	       .flags	   = SCX_OPS_ENQ_LAST | SCX_OPS_ENQ_EXITING,
 	       .timeout_ms = 20000, .name = "infinity");

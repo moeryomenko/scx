@@ -73,22 +73,43 @@ pub fn gate_tail(seq: u32) -> bool {
     seq == u32::MAX || (seq & GATE_MASK) == GATE_MASK
 }
 
-/// Effective weight from the kernel task weight and the cgroup share.
+/// Fixed-point scale of the folded cgroup hierarchy.
+pub const CGROUP_WEIGHT_SHIFT: u32 = 10;
+/// Fixed-point one for [`CGROUP_WEIGHT_SHIFT`].
+pub const CGROUP_WEIGHT_ONE: u64 = 1 << CGROUP_WEIGHT_SHIFT;
+/// SCHED_IDLE weight of a task under a `cpu.idle` cgroup.
+pub const CGROUP_WEIGHT_IDLE: u64 = 3;
+
+/// Fold one `shares / load` level into a fixed-point product.
 ///
-/// `group_weight` is the cgroup `cpu.weight` in the kernel range 1..10000.
-/// A zero input means the default share of 100. A cgroup in `cpu.idle`
-/// mode uses the SCHED_IDLE weight of 3 instead.
-pub fn effective_weight(base: u32, group_weight: u32, idle: bool) -> u64 {
+/// Mirrors the BPF `scw_fold()` step. `levels` runs from the task's own
+/// group up to the root, and each entry is the group's `cpu.weight` as
+/// `shares` and its load on the CPU as `load`.
+pub fn hierarchy_scale(levels: &[(u64, u64)]) -> u64 {
+    let mut product = u128::from(CGROUP_WEIGHT_ONE);
+
+    for &(shares, load) in levels {
+        let shares = shares.max(1);
+        let load = load.max(1);
+        /* Mirrors the BPF cap that keeps the product inside 64 bits. */
+        product = product.min(1u128 << 20);
+        product = product * u128::from(shares) / u128::from(load);
+    }
+
+    (product as u64).max(1)
+}
+
+/// Effective weight from the kernel task weight and the folded hierarchy.
+///
+/// A cgroup in `cpu.idle` mode at any level uses the SCHED_IDLE weight of 3
+/// instead of the folded share.
+pub fn effective_weight(base: u32, levels: &[(u64, u64)], idle: bool) -> u64 {
     if idle {
-        return 3;
+        return CGROUP_WEIGHT_IDLE;
     }
     let base = if base == 0 { 1 } else { u64::from(base) };
-    let group = if group_weight == 0 {
-        100
-    } else {
-        u64::from(group_weight)
-    };
-    ((base * group + 50) / 100).max(1)
+    let scale = hierarchy_scale(levels);
+    ((base * scale + CGROUP_WEIGHT_ONE / 2) >> CGROUP_WEIGHT_SHIFT).max(1)
 }
 
 /// A fresh wakeup preempts only when it is heavier than the running task
@@ -181,16 +202,43 @@ mod tests {
 
     #[test]
     fn effective_weight_follows_the_cgroup_ratio() {
-        let a = effective_weight(100, 100, false);
-        let b = effective_weight(100, 200, false);
-        assert_eq!(a, 100);
-        assert_eq!(b, 200);
+        /* Two equal members: one at shares 100, one at shares 200. */
+        let a = effective_weight(1024, &[(100, 300)], false);
+        let b = effective_weight(1024, &[(200, 300)], false);
+        assert_eq!(a, 341);
+        assert_eq!(b, 682);
         assert_eq!(a * 2, b);
     }
 
     #[test]
+    fn nested_groups_multiply_their_shares() {
+        /* 100/100 at the leaf and 200/100 at the parent: 2x in total. */
+        let nested = effective_weight(1024, &[(100, 100), (200, 100)], false);
+        let flat = effective_weight(1024, &[(200, 100)], false);
+        assert_eq!(nested, flat);
+        assert_eq!(nested, 2048);
+    }
+
+    #[test]
+    fn an_empty_group_contributes_nothing_to_its_parent() {
+        /* A child that is not in the parent's load does not scale it. */
+        assert_eq!(hierarchy_scale(&[(100, 100)]), CGROUP_WEIGHT_ONE);
+        assert_eq!(effective_weight(100, &[(100, 100)], false), 100);
+    }
+
+    #[test]
+    fn rounding_is_stable_across_a_three_way_split() {
+        let levels = [(100, 300)];
+        let weights: Vec<u64> = (0..3)
+            .map(|base| effective_weight(base * 100 + 100, &levels, false))
+            .collect();
+        assert_eq!(weights, vec![33, 67, 100]);
+    }
+
+    #[test]
     fn idle_cgroup_uses_the_sched_idle_weight() {
-        assert_eq!(effective_weight(10000, 10000, true), 3);
+        assert_eq!(effective_weight(10000, &[(100, 100)], true), 3);
+        assert_eq!(effective_weight(1, &[(10000, 3)], true), 3);
     }
 
     #[test]

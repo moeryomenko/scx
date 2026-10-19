@@ -26,12 +26,18 @@ The core policy is a bounded last-in-first-out queue:
 - The slice is `quantum * weight / contending_weight`, with a 1 ns floor.
   The contending weight is the sum of the effective weights on the target
   CPU. The slice is recomputed when the task is popped.
-- The effective weight is the kernel task weight scaled by the cgroup
-  `cpu.weight` when the running kernel exposes `scx_bpf_task_cgroup()`.
-  A cgroup in `cpu.idle` mode gets the `SCHED_IDLE` weight of 3.
+- The effective weight folds the cgroup hierarchy in through the shared
+  cgroup control library (`lib/cgroup_ctl.bpf.c`). Every nested
+  `cpu.weight` level scales the task weight by `shares / load`, and any
+  `cpu.idle` group at or above the task uses the `SCHED_IDLE` weight of 3.
+- `cpu.max` quota, period and burst come from the existing bandwidth
+  library (`lib/cgroup_bw.bpf.c`). A task in a throttled group is parked
+  on the library's arena backlog and re-enqueued through the same 7:1
+  gate when the group gets time again.
 - A fresh wakeup preempts only when it is heavier than the running task
   and the victim retains at least the configured preemption margin.
-  Yield forfeits the remaining slice and re-enters at the tail.
+  Yield forfeits the remaining slice and re-enters at the tail. A task
+  under a `cpu.idle` cgroup never preempts.
 
 The queue order, the 7:1 gate and the slice-expiry rules are fixed. Only
 the settings below can change at run time.
@@ -61,7 +67,7 @@ carry none of it.
 ```
 scx_infinity [--config PATH] [--exit-dump-len N] [--quantum-us N]
              [--placement MODE] [--no-smt] [--spill-threshold N]
-             [--preempt-margin-us N] [--verbose] [--version]
+             [--preempt-margin-us N] [--no-cpu-max] [--verbose] [--version]
 ```
 
 - `--config PATH`: read this TOML file instead of the default XDG path.
@@ -80,6 +86,9 @@ scx_infinity [--config PATH] [--exit-dump-len N] [--quantum-us N]
   the threshold. Overrides the file.
 - `--preempt-margin-us N`: minimum remaining victim slice for a wakeup
   preemption, 0 to 1000. Default 100. Overrides the file.
+- `--no-cpu-max`: do not enforce `cpu.max`; `cpu.weight` and `cpu.idle`
+  stay active. A kernel without `ops.cgroup_set_bandwidth()` disables the
+  same path automatically.
 - `--verbose`: enable libbpf and loader diagnostics.
 - `--version`: print the scheduler version and exit.
 
@@ -137,12 +146,17 @@ The loader prints one line per second:
 
 ```
 inserts: head=... tail=... exempt=... expiries=... preemptions=... yields=... depth=...
+cgrp: throttled=... reenqueued=... eff_weight=... scale_q10=...
 ```
 
 `head_inserts` and `tail_inserts` count only regular gated enqueues, so
 their ratio approaches 7:1. `exempt_inserts` counts wakeups, core head
 hints, expiries, requeues and forced progress. `depth` sums the per-CPU
 queue depths when the line is printed.
+
+The cgroup part counts `cpu.max` throttled enqueues and reenqueues, and
+reports the largest effective group weight and folded group scale seen on
+any CPU. `scale_q10` is the shares/load product in 1/1024 units.
 
 ## Requirements
 

@@ -28,9 +28,12 @@ use clap::Parser;
 use config::LiveConfig;
 use config::Overrides;
 use libbpf_rs::MapCore;
+use libbpf_rs::skel::OpenSkel;
+use libbpf_rs::skel::Skel;
 use log::error;
 use log::info;
 use placement::PlacementMode;
+use scx_arena::ArenaLib;
 use scx_utils::NR_CPU_IDS;
 use scx_utils::Topology;
 use scx_utils::UserExitInfo;
@@ -41,9 +44,12 @@ use scx_utils::scx_ops_open;
 use scx_utils::try_set_rlimit_infinity;
 use scx_utils::uei_exited;
 use scx_utils::uei_report;
+use scx_utils::{CgroupBwSupport, resize_cgroup_bw, setup_cgroup_bw};
 
 const SCHEDULER_NAME: &str = "scx_infinity";
 const STATS_INTERVAL: Duration = Duration::from_millis(100);
+/// cgroup v2 caps nesting at 32 levels.
+const CGROUP_TREE_HEIGHT_MAX: u32 = 32;
 
 /// scx_infinity: experimental sched_ext scheduler.
 ///
@@ -90,6 +96,10 @@ struct Opts {
     /// Enable verbose output, including libbpf details.
     #[clap(short = 'v', long, action = clap::ArgAction::SetTrue)]
     verbose: bool,
+
+    /// Do not enforce cpu.max. cpu.weight and cpu.idle stay on.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    no_cpu_max: bool,
 
     /// Print scheduler version and exit.
     #[clap(short = 'V', long, action = clap::ArgAction::SetTrue)]
@@ -150,6 +160,8 @@ struct Scheduler<'a> {
     overrides: Overrides,
     live: LiveConfig,
     generation: u32,
+    /* Kept alive for as long as the scheduler uses the arena. */
+    _arenalib: ArenaLib,
 }
 
 impl<'a> Scheduler<'a> {
@@ -182,6 +194,29 @@ impl<'a> Scheduler<'a> {
 
         skel.struct_ops.infinity_ops_mut().exit_dump_len = opts.exit_dump_len;
 
+        /*
+         * cpu.max support is probed before load. A kernel without
+         * ops.cgroup_set_bandwidth() clears the callback and leaves
+         * cpu.weight and cpu.idle working.
+         */
+        let bw_support = if opts.no_cpu_max {
+            info!("cpu.max disabled by --no-cpu-max");
+            CgroupBwSupport::Unsupported
+        } else {
+            setup_cgroup_bw(skel.open_object_mut(), "infinity_cgroup_set_bandwidth")?
+        };
+        let cpu_bw = bw_support != CgroupBwSupport::Unsupported;
+
+        if cpu_bw {
+            let nr_llcs = topo.all_llcs.len();
+            resize_cgroup_bw(
+                skel.open_object_mut(),
+                bpf_intf::INF_MAX_CGROUPS,
+                CGROUP_TREE_HEIGHT_MAX,
+                nr_llcs,
+            )?;
+        }
+
         let rodata = skel
             .maps
             .rodata_data
@@ -190,8 +225,28 @@ impl<'a> Scheduler<'a> {
         rodata.nr_cpu_ids = (*NR_CPU_IDS)
             .try_into()
             .context("CPU count does not fit in u32")?;
+        rodata.enable_cpu_bw = cpu_bw;
+        if cpu_bw {
+            /*
+             * Match the map sizes set above and keep the built-in idle
+             * tracking, which this scheduler uses for placement.
+             */
+            rodata.nr_cgrp_max = bpf_intf::INF_MAX_CGROUPS;
+            rodata.tree_height_max = CGROUP_TREE_HEIGHT_MAX;
+            rodata.bw_kick_builtin_idle = true;
+        }
 
         let mut skel = scx_ops_load!(skel, infinity_ops, uei)?;
+
+        /*
+         * The task context lives in the BPF arena; the bandwidth library
+         * parks throttled tasks on an arena queue that embeds it. The
+         * arena must be set up before the scheduler attaches.
+         */
+        let task_size = std::mem::size_of::<bpf_intf::inf_task_ctx_layout>();
+        let arenalib = ArenaLib::setup(skel.object_mut(), task_size, 0, *NR_CPU_IDS)
+            .context("failed to initialize the BPF arena")?;
+
         topology::seed(&mut skel, &topo)?;
         write_config(&mut skel, &live, 1)?;
         let struct_ops = Some(scx_ops_attach!(skel, infinity_ops)?);
@@ -205,6 +260,7 @@ impl<'a> Scheduler<'a> {
             overrides: opts.overrides(),
             live,
             generation: 1,
+            _arenalib: arenalib,
         })
     }
 
@@ -248,6 +304,10 @@ impl<'a> Scheduler<'a> {
         let mut expiries = 0u64;
         let mut preemptions = 0u64;
         let mut yields = 0u64;
+        let mut cgrp_throttled = 0u64;
+        let mut cgrp_reenqueued = 0u64;
+        let mut cgrp_eff_weight = 0u64;
+        let mut cgrp_scale = 0u64;
 
         let key = 0u32.to_ne_bytes();
         if let Ok(Some(rows)) = self
@@ -269,6 +329,10 @@ impl<'a> Scheduler<'a> {
                 expiries += stats.expiries;
                 preemptions += stats.preemptions;
                 yields += stats.yields;
+                cgrp_throttled += stats.cgrp_throttled;
+                cgrp_reenqueued += stats.cgrp_reenqueued;
+                cgrp_eff_weight = cgrp_eff_weight.max(stats.cgrp_eff_weight);
+                cgrp_scale = cgrp_scale.max(stats.cgrp_scale);
             }
         }
 
@@ -293,7 +357,9 @@ impl<'a> Scheduler<'a> {
         info!(
             "inserts: head={head} tail={tail} exempt={exempt} \
              expiries={expiries} preemptions={preemptions} yields={yields} \
-             depth={depth}"
+             depth={depth} cgrp: throttled={cgrp_throttled} \
+             reenqueued={cgrp_reenqueued} eff_weight={cgrp_eff_weight} \
+             scale_q10={cgrp_scale}"
         );
     }
 
@@ -454,5 +520,15 @@ mod tests {
     #[test]
     fn cli_rejects_a_bad_placement() {
         assert!(Opts::try_parse_from(["scx_infinity", "--placement", "bad"]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_no_cpu_max() {
+        let opts = Opts::try_parse_from(["scx_infinity", "--no-cpu-max"]).unwrap();
+
+        assert!(opts.no_cpu_max);
+
+        let default = Opts::try_parse_from(["scx_infinity"]).unwrap();
+        assert!(!default.no_cpu_max);
     }
 }
