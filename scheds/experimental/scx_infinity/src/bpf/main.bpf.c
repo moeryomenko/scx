@@ -283,21 +283,23 @@ static __always_inline u32 inf_nr_cpu_ids(void)
 }
 
 /*
- * Preempt only a fresh wakeup that took a head slot. A wakeup that the
- * gate placed on the tail does not preempt, because it is already behind
- * the running task in queue order. The newcomer must be heavier than the
- * running task and the victim must retain at least the configured
- * preemption margin, so a task that is about to expire finishes instead of
- * taking an IPI. A task under a cpu.idle cgroup never preempts.
+ * Preempt only a fresh wakeup that took a head slot. The reference
+ * Infinity 7.2.6-7 policy preempts on the head-arrival condition alone.
+ * One consequence is that a lighter newcomer can preempt a heavier
+ * victim, because pick order, not weight, decides the wakeup winner. A
+ * wakeup that the gate placed on the tail does not preempt, because it is
+ * already behind the running task in queue order. The victim must retain
+ * more than the configured preemption margin, so a task that is about to
+ * expire finishes instead of taking an IPI. A task under a cpu.idle cgroup
+ * never preempts.
  */
 static __always_inline void inf_maybe_preempt(struct task_struct *p, s32 cpu,
-					      u64 enq_flags, bool head, u64 w)
+					      u64 enq_flags, bool head)
 {
 	task_ctx	   *tctx;
 	struct task_struct *victim;
 	struct inf_stats   *stats;
 	u64		    reserve;
-	u64		    victim_w;
 
 	if (!head || !(enq_flags & SCX_ENQ_WAKEUP))
 		return;
@@ -316,10 +318,6 @@ static __always_inline void inf_maybe_preempt(struct task_struct *p, s32 cpu,
 	if (!victim || victim == p)
 		return;
 	if (!(victim->scx.flags & SCX_TASK_QUEUED))
-		return;
-
-	victim_w = inf_task_weight(victim);
-	if (w <= victim_w)
 		return;
 
 	{
@@ -780,7 +778,7 @@ static int inf_enqueue_common(struct task_struct *p, u64 enq_flags, bool reenq)
 	else if (cpu != bpf_get_smp_processor_id())
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 
-	inf_maybe_preempt(p, cpu, enq_flags, head, w);
+	inf_maybe_preempt(p, cpu, enq_flags, head);
 	return 0;
 }
 

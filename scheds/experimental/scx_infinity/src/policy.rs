@@ -126,16 +126,14 @@ pub fn effective_weight(base: u32, levels: &[(u64, u64)], idle: bool) -> u64 {
     ((base * scale + CGROUP_WEIGHT_ONE / 2) >> CGROUP_WEIGHT_SHIFT).max(1)
 }
 
-/// A fresh wakeup preempts only when the enqueue took a head slot, the
-/// wakeup is heavier than the running task, and the victim still retains
-/// the configured preemption margin.
-pub fn should_preempt(
-    newcomer_weight: u64,
-    victim_weight: u64,
-    victim_slice: u64,
-    preempt_margin_ns: u64,
-) -> bool {
-    newcomer_weight > victim_weight && victim_slice > preempt_margin_ns
+/// A fresh wakeup preempts only when the enqueue took a head slot and the
+/// victim still retains more than the configured preemption margin.
+///
+/// The newcomer weight is not part of the decision, because the reference
+/// Infinity 7.2.6-7 policy preempts on head arrival alone. A lighter
+/// wakeup can therefore preempt a heavier victim.
+pub fn should_preempt(head_slot: bool, victim_slice: u64, preempt_margin_ns: u64) -> bool {
+    head_slot && victim_slice > preempt_margin_ns
 }
 
 #[cfg(test)]
@@ -303,13 +301,29 @@ mod tests {
     }
 
     #[test]
-    fn preemption_needs_a_heavier_newcomer_and_a_live_victim() {
+    fn preemption_needs_a_head_slot_and_a_live_victim_slice() {
         let margin = PREEMPT_MARGIN_DEFAULT_NS;
-        assert!(should_preempt(200, 100, margin + 1, margin));
+        assert!(should_preempt(true, margin + 1, margin));
         /* The victim must strictly exceed the margin. */
-        assert!(!should_preempt(200, 100, margin, margin));
-        assert!(!should_preempt(100, 200, QUANTUM_DEFAULT_NS, margin));
-        assert!(!should_preempt(200, 100, margin - 1, margin));
-        assert!(should_preempt(200, 100, 1, 0));
+        assert!(!should_preempt(true, margin, margin));
+        assert!(!should_preempt(true, margin - 1, margin));
+        assert!(should_preempt(true, 1, 0));
+        /* A wakeup that the gate placed on the tail never preempts. */
+        assert!(!should_preempt(false, QUANTUM_DEFAULT_NS, margin));
+    }
+
+    #[test]
+    fn the_preemption_decision_ignores_the_newcomer_weight() {
+        /* The reference Infinity 7.2.6-7 policy preempts on head arrival
+         * alone, so a lighter wakeup preempts a heavier victim. The
+         * helper has no weight input and one head-slot value decides the
+         * outcome for every victim slice above the margin. This test pins
+         * that the removed weight comparison has no path back into the
+         * decision. */
+        let margin = PREEMPT_MARGIN_DEFAULT_NS;
+
+        for victim_slice in [margin + 1, QUANTUM_DEFAULT_NS, QUANTUM_MAX_NS] {
+            assert!(should_preempt(true, victim_slice, margin));
+        }
     }
 }

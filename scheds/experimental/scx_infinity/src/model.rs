@@ -354,6 +354,44 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_task_keeps_its_position_on_reweight() {
+        let mut queue = QueueModel::new();
+        queue.enqueue_regular(1, 100);
+        queue.enqueue_regular(2, 100);
+        queue.enqueue_regular(3, 100);
+        assert_eq!(queue.rank(1), Some(2));
+
+        assert!(queue.set_weight(1, 400));
+
+        /* Deviation 2: the weight changes, the DSQ position does not. A
+         * reference dequeue and reinsert through the gate would move the
+         * task to a new position. */
+        assert_eq!(queue.rank(3), Some(0));
+        assert_eq!(queue.rank(2), Some(1));
+        assert_eq!(queue.rank(1), Some(2));
+        assert_eq!(queue.w_sum, 600);
+    }
+
+    #[test]
+    fn yield_rotates_only_the_donor_to_the_tail() {
+        let mut queue = QueueModel::new();
+        queue.enqueue_regular(1, 100);
+        queue.enqueue_regular(2, 100);
+        queue.enqueue_regular(3, 100);
+        assert_eq!(queue.rank(1), Some(2));
+
+        assert!(queue.rotate_to_tail(3));
+
+        /* Deviation 1: the donor forfeits its slice and rotates to the
+         * tail. A queued target keeps its position, so it does not move to
+         * the head as a two-argument yield in the reference would. */
+        assert_eq!(queue.rank(3), Some(2));
+        assert_eq!(queue.rank(2), Some(0));
+        assert_eq!(queue.rank(1), Some(1));
+        assert_ne!(queue.rank(1), Some(0));
+    }
+
+    #[test]
     fn the_queue_weight_is_the_quantum_normalizer() {
         let mut queue = QueueModel::new();
         queue.enqueue_regular(1, 100);

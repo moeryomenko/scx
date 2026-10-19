@@ -56,11 +56,12 @@ The core policy is a bounded last-in-first-out queue:
   library (`lib/cgroup_bw.bpf.c`). A task in a throttled group is parked
   on the library's arena backlog and re-enqueued through the same 7:1
   gate when the group gets time again.
-- A fresh wakeup preempts only when the enqueue took a head slot, the
-  wakeup is heavier than the running task, and the victim retains at
-  least the configured preemption margin. A wakeup that took a tail slot
-  does not preempt. Yield forfeits the remaining slice and re-enters at
-  the tail. A task under a `cpu.idle` cgroup never preempts.
+- A fresh wakeup preempts only when the enqueue took a head slot and the
+  victim retains more than the configured preemption margin. The wakeup
+  weight is not a condition, so a lighter wakeup preempts a heavier
+  victim. A wakeup that took a tail slot does not preempt. Yield
+  forfeits the remaining slice and re-enters at the tail. A task under a
+  `cpu.idle` cgroup never preempts.
 
 The queue order, the 7:1 gate and the slice-expiry rules are fixed. Only
 the settings below can change at run time.
@@ -221,15 +222,33 @@ separate gate and is not part of this tree.
 ## Unverified: multi-node NUMA
 
 The placement code reads the node distance matrix, ranks remote nodes
-and spills across nodes. Only a single-node host has run this
-scheduler. Two-node behavior, cross-node spill and the seeded distance
-values are unverified until a multi-node host runs the smoke and
-benchmark suites.
+and places tasks across nodes. Only a single-node host has run this
+scheduler. Two-node behavior, cross-node placement and the seeded
+distance values are unverified until a multi-node host runs the smoke
+and benchmark suites.
 
 ## Requirements
 
 Linux with `sched_ext` enabled (`CONFIG_SCHED_CLASS_EXT`). Build with
 `cargo build -p scx_infinity`.
+
+## Deviations from the reference
+
+The reference is the Infinity 7.2.6-7 fair patch. These behaviors differ
+from it. None of them is equivalent behavior:
+
+1. Two-argument yield does not move a queued target to the head. The
+   donor forfeits its slice and rotates to the tail, and the target
+   keeps its queue position. `ops.yield()` cannot reorder a DSQ.
+2. A queued task keeps its DSQ position on reweight. The new weight
+   changes the contending weight and the next slice, not the current
+   position. `ops.set_weight()` cannot reorder a DSQ.
+3. Dispatch does not spill from peer LLC or node DSQs. Placement picks
+   the target CPU at enqueue and the task waits on that CPU's DSQ. A
+   busy CPU does not move its queued work to an idle peer at dispatch.
+4. Group load is not decayed, and live `cpu.weight` and `cpu.idle`
+   ratios remain unverified. A group that becomes empty updates on its
+   next member, and until then a stale load can under-credit it.
 
 ## Current limitations
 
@@ -238,16 +257,13 @@ Linux with `sched_ext` enabled (`CONFIG_SCHED_CLASS_EXT`). Build with
   correctly, but the exact per-level ordering of the kernel hierarchy is
   not reproduced. A cgroup deeper than 32 levels uses its bottom 32
   levels, the cgroup v2 cap.
-- Group loads are not decayed. A group that becomes empty updates on its
-  next member, which can under-credit it briefly. This affects fairness,
-  not safety.
 - A live `cpu.weight` or `cpu.idle` ratio has not been demonstrated. In
   the integration smoke run, groups at weight 100 and 200, and also a
   `cpu.idle` group against a normal group, received equal shares on one
   CPU. The reported effective weight also reached 1000000. The folded
   arithmetic is unit-tested, but the BPF weight path needs a controlled
   runtime check. `cpu.max` does hold a 50 ms / 100 ms group near
-  50 percent.
+  50 percent. See deviation 4.
 - Placement reads the topology once at load. A CPU set change needs a
   restart, and multi-node behavior is written for several nodes but has
   only been checked on a single-node host.
@@ -257,8 +273,9 @@ Linux with `sched_ext` enabled (`CONFIG_SCHED_CLASS_EXT`). Build with
 - A task in a throttled group is parked in the bandwidth library's arena
   backlog. The scheduler therefore needs arena support from the kernel
   and uses clang 22 or newer, like other arena-based schedulers.
-- A cgroup weight change affects a queued task at its next enqueue or
-  dispatch. A running task keeps the slice it started with.
+- A cgroup weight change is applied to a queued task without a queue
+  position change, and a running task keeps the slice it started with.
+  See deviation 2.
 - A CPU set or topology change requires a scheduler restart.
 - The previous CPU is reused only when it is idle. The frozen
   specification also allowed a shallow previous queue. This tree keeps
