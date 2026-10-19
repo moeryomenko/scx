@@ -78,6 +78,10 @@ mod tests {
         fn path(&self) -> &Path {
             &self.path
         }
+
+        fn write(&self, contents: &str) {
+            fs::write(&self.path, contents).unwrap();
+        }
     }
 
     impl Drop for TempFile {
@@ -185,6 +189,28 @@ stats_interval_ms = 500
         assert!(result.is_err());
         assert_eq!(map.updates, 0);
         assert_eq!(map.value, Some(LiveConfig::default()));
+    }
+
+    #[test]
+    fn a_valid_reload_followed_by_a_bad_one_keeps_the_first_value() {
+        let file = TempFile::new("quantum_ns = 2000000\n");
+        let mut map = FakeMap::default();
+
+        reload(Some(file.path()), &Overrides::default(), |cfg| {
+            map.publish(cfg)
+        })
+        .unwrap();
+        assert_eq!(map.updates, 1);
+        assert_eq!(map.value.unwrap().quantum_ns, 2_000_000);
+
+        file.write("quantum_ns = 50\n");
+        let result = reload(Some(file.path()), &Overrides::default(), |cfg| {
+            map.publish(cfg)
+        });
+
+        assert!(result.is_err());
+        assert_eq!(map.updates, 1);
+        assert_eq!(map.value.unwrap().quantum_ns, 2_000_000);
     }
 
     #[test]

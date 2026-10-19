@@ -33,6 +33,13 @@ typedef signed long    s64;
 #define INF_QUANTUM_MIN_NS 100000ULL
 #define INF_QUANTUM_MAX_NS 4000000ULL
 
+/*
+ * A task below one tenth of the queue weight gets at least this slice,
+ * so a very light task cannot build a sub-microsecond slice. The floor
+ * never exceeds the base quantum.
+ */
+#define INF_QUANTUM_FLOOR_NS 100000ULL
+
 #define INF_PREEMPT_MARGIN_DEFAULT_NS 100000ULL
 #define INF_PREEMPT_MARGIN_MAX_NS 1000000ULL
 #define INF_STATS_INTERVAL_DEFAULT_MS 1000ULL

@@ -23,6 +23,9 @@ pub const PREEMPT_MARGIN_DEFAULT_NS: u64 = 100_000;
 /// Highest accepted preemption margin, 1 ms.
 pub const PREEMPT_MARGIN_MAX_NS: u64 = 1_000_000;
 
+/// Slice floor for a task far below the queue weight, 100 us.
+pub const QUANTUM_FLOOR_NS: u64 = 100_000;
+
 /// One tail insert in every eight regular enqueues.
 pub const GATE_MASK: u32 = 7;
 /// Weight cap mirrored by the BPF core.
@@ -48,12 +51,17 @@ pub fn quantum_us_to_ns(us: u64) -> Result<u64, String> {
 /// Weighted quantum:
 ///
 /// ```text
-/// q = max(base * weight / total, 1)
+/// q = max(base * weight / total, floor)
 /// ```
 ///
 /// `total` includes the task itself. A zero weight is the lightest task
 /// and a zero total means the task is alone. Weights cap at `WEIGHT_CAP`,
 /// which keeps the BPF product inside 64 bits.
+///
+/// A task whose weight is below one tenth of the queue weight gets at
+/// least `QUANTUM_FLOOR_NS` (100 us), so a very light task cannot build a
+/// sub-microsecond slice and a reschedule storm. The floor never exceeds
+/// the base quantum.
 pub fn quantum_ns(base: u64, weight: u64, total: u64) -> u64 {
     let weight = weight.clamp(1, WEIGHT_CAP);
     let total = total.max(weight);
@@ -61,8 +69,12 @@ pub fn quantum_ns(base: u64, weight: u64, total: u64) -> u64 {
     if base == 0 {
         return 1;
     }
-    let q = (u128::from(base) * u128::from(weight) / u128::from(total)).min(u128::from(u64::MAX));
-    (q as u64).max(1)
+    let mut q = (u128::from(base) * u128::from(weight) / u128::from(total))
+        .min(u128::from(u64::MAX)) as u64;
+    if weight.saturating_mul(10) < total {
+        q = q.max(QUANTUM_FLOOR_NS.min(base));
+    }
+    q.max(1)
 }
 
 /// True when a regular enqueue takes the tail slot instead of the head.
@@ -90,7 +102,9 @@ pub fn hierarchy_scale(levels: &[(u64, u64)]) -> u64 {
 
     for &(shares, load) in levels {
         let shares = shares.max(1);
-        let load = load.max(1);
+        /* Mirrors the BPF library: an empty groupload uses its shares,
+         * so the level does not scale the task. */
+        let load = if load == 0 { shares } else { load };
         /* Mirrors the BPF cap that keeps the product inside 64 bits. */
         product = product.min(1u128 << 20);
         product = product * u128::from(shares) / u128::from(load);
@@ -120,7 +134,7 @@ pub fn should_preempt(
     victim_slice: u64,
     preempt_margin_ns: u64,
 ) -> bool {
-    newcomer_weight > victim_weight && victim_slice >= preempt_margin_ns
+    newcomer_weight > victim_weight && victim_slice > preempt_margin_ns
 }
 
 #[cfg(test)]
@@ -137,6 +151,10 @@ mod tests {
         assert_eq!(QUANTUM_MAX_NS, crate::bpf_intf::INF_QUANTUM_MAX_NS as u64);
         assert_eq!(GATE_MASK, crate::bpf_intf::INF_GATE_MASK);
         assert_eq!(WEIGHT_CAP, crate::bpf_intf::INF_WEIGHT_CAP as u64);
+        assert_eq!(
+            QUANTUM_FLOOR_NS,
+            crate::bpf_intf::INF_QUANTUM_FLOOR_NS as u64
+        );
         assert_eq!(
             PREEMPT_MARGIN_DEFAULT_NS,
             crate::bpf_intf::INF_PREEMPT_MARGIN_DEFAULT_NS as u64
@@ -158,9 +176,10 @@ mod tests {
     }
 
     #[test]
-    fn quantum_is_one_for_a_zero_weight_and_a_zero_total() {
+    fn quantum_is_the_base_for_a_zero_weight_and_a_zero_total() {
         assert_eq!(quantum_ns(QUANTUM_DEFAULT_NS, 0, 0), QUANTUM_DEFAULT_NS);
-        assert_eq!(quantum_ns(QUANTUM_DEFAULT_NS, 0, 1000), 1000);
+        /* A zero weight becomes one, far below one tenth of the total. */
+        assert_eq!(quantum_ns(QUANTUM_DEFAULT_NS, 0, 1000), QUANTUM_FLOOR_NS);
     }
 
     #[test]
@@ -176,8 +195,25 @@ mod tests {
     }
 
     #[test]
-    fn quantum_never_rounds_to_zero() {
-        assert_eq!(quantum_ns(QUANTUM_DEFAULT_NS, 1, u64::MAX), 1);
+    fn quantum_floor_holds_a_tiny_weight_at_one_hundred_microseconds() {
+        assert_eq!(
+            quantum_ns(QUANTUM_DEFAULT_NS, 1, u64::MAX),
+            QUANTUM_FLOOR_NS
+        );
+        assert_eq!(
+            quantum_ns(QUANTUM_DEFAULT_NS, 1, QUANTUM_DEFAULT_NS as u64),
+            QUANTUM_FLOOR_NS
+        );
+    }
+
+    #[test]
+    fn quantum_floor_does_not_apply_at_one_tenth_of_the_queue_weight() {
+        /* 100 / 1000 is exactly one tenth, so the proportional slice
+         * stands. One unit below it takes the floor, one above keeps the
+         * proportional slice. */
+        assert_eq!(quantum_ns(QUANTUM_DEFAULT_NS, 100, 1_000), QUANTUM_FLOOR_NS);
+        assert_eq!(quantum_ns(QUANTUM_DEFAULT_NS, 99, 1_000), QUANTUM_FLOOR_NS);
+        assert_eq!(quantum_ns(QUANTUM_DEFAULT_NS, 101, 1_000), 101_000);
     }
 
     #[test]
@@ -242,9 +278,35 @@ mod tests {
     }
 
     #[test]
+    fn idle_at_any_level_overrides_every_weight_share() {
+        /* Kernel cfs_rq_is_idle() applies at every level, so an idle
+         * ancestor wins over a heavy leaf share. */
+        let levels = [(10000, 1), (1, 10000), (5000, 5000)];
+        assert_eq!(effective_weight(10000, &levels, true), CGROUP_WEIGHT_IDLE);
+    }
+
+    #[test]
+    fn hierarchy_scale_is_the_product_of_the_levels() {
+        /* 1/2 at the leaf and 1/4 at the parent give 1/8. */
+        assert_eq!(hierarchy_scale(&[(100, 200), (100, 400)]), 128);
+        assert_eq!(
+            effective_weight(1024, &[(100, 200), (100, 400)], false),
+            128
+        );
+    }
+
+    #[test]
+    fn a_zero_load_does_not_divide_by_zero() {
+        assert_eq!(hierarchy_scale(&[(100, 0)]), CGROUP_WEIGHT_ONE);
+        assert_eq!(effective_weight(1024, &[(100, 0)], false), 1024);
+    }
+
+    #[test]
     fn preemption_needs_a_heavier_newcomer_and_a_live_victim() {
         let margin = PREEMPT_MARGIN_DEFAULT_NS;
-        assert!(should_preempt(200, 100, margin, margin));
+        assert!(should_preempt(200, 100, margin + 1, margin));
+        /* The victim must strictly exceed the margin. */
+        assert!(!should_preempt(200, 100, margin, margin));
         assert!(!should_preempt(100, 200, QUANTUM_DEFAULT_NS, margin));
         assert!(!should_preempt(200, 100, margin - 1, margin));
         assert!(should_preempt(200, 100, 1, 0));

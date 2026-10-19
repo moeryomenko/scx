@@ -4,6 +4,24 @@ Experimental sched_ext scheduler for the Infinity fair policy.
 
 **Status: experimental. Not ready for general use.**
 
+## Scope
+
+The scheduler replaces the fair class for `SCHED_NORMAL`, `SCHED_BATCH`,
+`SCHED_IDLE` and `SCHED_EXT` tasks. It enforces `cpu.weight`, `cpu.idle`
+and `cpu.max` (quota, period and burst) from cgroup v2. Placement is
+locality-first across the previous CPU, the local LLC, the local NUMA
+node and a capacity-ranked remote CPU.
+
+Out of scope:
+
+- Native RT, deadline and stop scheduling. The kernel keeps those
+  classes above sched_ext, and this scheduler never sees those tasks.
+- DRM GPU scheduling. GPU work and the driver runqueues stay outside
+  this scheduler.
+- A virtual runtime tree, EEVDF lag or deadlines.
+- Sub-schedulers, the cid form and `scx_prio`.
+- Live CPU hotplug. A CPU set change needs a scheduler restart.
+
 ## Overview
 
 `scx_infinity` is a root scheduler that replaces the fair class for
@@ -23,9 +41,10 @@ The core policy is a bounded last-in-first-out queue:
   queued task between two tail insertions.
 - A fresh wakeup is exempt and enters at the head. An expired slice, a
   requeue, a forced-progress enqueue and a yield enter at the tail.
-- The slice is `quantum * weight / contending_weight`, with a 1 ns floor.
-  The contending weight is the sum of the effective weights on the target
-  CPU. The slice is recomputed when the task is popped.
+- The slice is `quantum * weight / contending_weight`, with a 100 us
+  floor for a task below one tenth of the queue weight. The contending
+  weight is the sum of the effective weights on the target CPU. The
+  slice is recomputed when the task is popped.
 - The effective weight folds the cgroup hierarchy in through the shared
   cgroup control library (`lib/cgroup_ctl.bpf.c`). Every nested
   `cpu.weight` level scales the task weight by `shares / load`, and any
@@ -62,7 +81,37 @@ map with the node, LLC, core, SMT sibling, primary-thread and capacity
 data. The placement policy stays in this scheduler; the shared utilities
 carry none of it.
 
-## Usage
+## Build
+
+```
+cargo build -p scx_infinity
+```
+
+The BPF object needs clang 22 or newer and a kernel built with
+`CONFIG_SCHED_CLASS_EXT`. The scheduler uses the BPF arena and the
+shared cgroup libraries. For a release binary:
+
+```
+cargo build --release -p scx_infinity
+```
+
+The compatibility harness runs with:
+
+```
+make -C lib/selftests/compat test
+```
+
+## Run
+
+```
+sudo ./target/release/scx_infinity
+```
+
+`scx_infinity --help` lists the options. Press Ctrl-C to unregister the
+scheduler. While it runs, `/sys/kernel/sched_ext/state` reads `enabled`.
+After a clean exit it reads `disabled`. A non-root run fails at load.
+
+## Command line
 
 ```
 scx_infinity [--config PATH] [--exit-dump-len N] [--quantum-us N]
@@ -158,6 +207,21 @@ The cgroup part counts `cpu.max` throttled enqueues and reenqueues, and
 reports the largest effective group weight and folded group scale seen on
 any CPU. `scale_q10` is the shares/load product in 1/1024 units.
 
+## Performance status
+
+This tree does not claim performance parity with native Infinity. The
+benchmark comparator runs a different kernel, so a cross-kernel result
+is directional, not a controlled A/B test. The benchmark rerun is a
+separate gate and is not part of this tree.
+
+## Unverified: multi-node NUMA
+
+The placement code reads the node distance matrix, ranks remote nodes
+and spills across nodes. Only a single-node host has run this
+scheduler. Two-node behavior, cross-node spill and the seeded distance
+values are unverified until a multi-node host runs the smoke and
+benchmark suites.
+
 ## Requirements
 
 Linux with `sched_ext` enabled (`CONFIG_SCHED_CLASS_EXT`). Build with
@@ -173,6 +237,11 @@ Linux with `sched_ext` enabled (`CONFIG_SCHED_CLASS_EXT`). Build with
 - Group loads are not decayed. A group that becomes empty updates on its
   next member, which can under-credit it briefly. This affects fairness,
   not safety.
+- A live `cpu.weight` ratio has not been demonstrated. In the integration
+  smoke run, two groups at weight 100 and 1000 on one CPU received an
+  equal share. The folded arithmetic is unit-tested, but the BPF weight
+  path needs a controlled runtime check. `cpu.max` does hold a
+  50 ms / 100 ms group near 50 percent.
 - Placement reads the topology once at load. A CPU set change needs a
   restart, and multi-node behavior is written for several nodes but has
   only been checked on a single-node host.
@@ -185,5 +254,9 @@ Linux with `sched_ext` enabled (`CONFIG_SCHED_CLASS_EXT`). Build with
 - A cgroup weight change affects a queued task at its next enqueue or
   dispatch. A running task keeps the slice it started with.
 - A CPU set or topology change requires a scheduler restart.
-- RT, deadline and stop tasks are not scheduled by this scheduler. The
-  kernel keeps those classes above sched_ext.
+- The previous CPU is reused only when it is idle. The frozen
+  specification also allowed a shallow previous queue. This tree keeps
+  the stricter locality rule.
+- Native RT and DRM GPU scheduling are outside this scheduler. RT,
+  deadline and stop tasks keep the kernel classes above sched_ext, and
+  GPU work stays with its driver.

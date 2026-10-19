@@ -423,6 +423,17 @@ mod tests {
     }
 
     #[test]
+    fn equal_node_distance_breaks_by_node_id() {
+        let mut view = view();
+        view.node_distances[0] = vec![10, 20, 20];
+        let mut req = request(view.cpus.len(), 1, 0);
+        req.idle_core[8] = true;
+        req.idle_core[12] = true;
+
+        assert_eq!(pick(&view, &req, PlacementMode::Auto, true, 4), Some(8));
+    }
+
+    #[test]
     fn idle_core_wins_over_an_idle_smt_sibling() {
         let view = view();
         let mut req = request(view.cpus.len(), 0, 0);

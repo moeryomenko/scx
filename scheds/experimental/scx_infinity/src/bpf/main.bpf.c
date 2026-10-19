@@ -187,6 +187,7 @@ static __always_inline u64 inf_cfg_quantum_ns(void)
 static __always_inline u64 inf_quantum(u64 w, u64 total)
 {
 	u64 base = inf_cfg_quantum_ns();
+	u64 floor;
 	u64 q;
 
 	if (w == 0)
@@ -198,6 +199,14 @@ static __always_inline u64 inf_quantum(u64 w, u64 total)
 	if (base == 0)
 		return 1;
 	q = base * w / total;
+	/*
+	 * A task below one tenth of the queue weight takes at least the
+	 * 100 us floor, which is itself capped by the base quantum. The
+	 * condition mirrors src/policy.rs `quantum_ns()`.
+	 */
+	floor = base < INF_QUANTUM_FLOOR_NS ? base : INF_QUANTUM_FLOOR_NS;
+	if (w * 10 < total && q < floor)
+		q = floor;
 	return q ? q : 1;
 }
 
@@ -316,7 +325,8 @@ static __always_inline void inf_maybe_preempt(struct task_struct *p, s32 cpu,
 
 		reserve = cfg ? READ_ONCE(cfg->preempt_margin_ns) : 0;
 	}
-	if (READ_ONCE(victim->scx.slice) < reserve)
+	/* The victim must retain strictly more than the margin. */
+	if (READ_ONCE(victim->scx.slice) <= reserve)
 		return;
 
 	scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT);

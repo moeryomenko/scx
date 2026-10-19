@@ -9,6 +9,8 @@ mod bpf_skel;
 pub use bpf_skel::*;
 pub mod bpf_intf;
 mod config;
+#[cfg(test)]
+mod model;
 mod placement;
 mod policy;
 mod reload;
