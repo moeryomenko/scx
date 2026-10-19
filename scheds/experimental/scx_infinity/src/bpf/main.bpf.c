@@ -1202,7 +1202,18 @@ static __noinline bool inf_dispatch_local(s32 cpu, struct inf_cpu_ctx *cctx)
 	tctx->reweight_pending = 0;
 
 	scx_bpf_task_set_slice(p, q);
-	scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, q, 0);
+	if (!scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, q, 0)) {
+		/*
+		 * The core refused the local insert. Put the node back on
+		 * this CPU instead of dropping a runnable task.
+		 */
+		tctx->state = INF_TASK_IDLE;
+		if (inf_requeue_task(p, tctx, cpu))
+			INF_STAT_INC(lost_state_errors);
+		bpf_task_release(p);
+		inf_queue_drop(node);
+		return false;
+	}
 
 	bpf_task_release(p);
 	inf_queue_drop(node);
@@ -1305,7 +1316,18 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 	tctx->slice_ns = q;
 
 	scx_bpf_task_set_slice(p, q);
-	scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, q, 0);
+	if (!scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, q, 0)) {
+		/*
+		 * The destination refused the insert. Return the task to
+		 * the source queue; never drop a runnable task here.
+		 */
+		tctx->state = INF_TASK_IDLE;
+		if (inf_requeue_task(p, tctx, peer))
+			INF_STAT_INC(lost_state_errors);
+		bpf_task_release(p);
+		inf_queue_drop(node);
+		return false;
+	}
 
 	bpf_task_release(p);
 	inf_queue_drop(node);
