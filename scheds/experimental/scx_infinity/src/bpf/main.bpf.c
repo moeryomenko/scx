@@ -1426,7 +1426,12 @@ void BPF_STRUCT_OPS(infinity_set_weight, struct task_struct *p, u32 weight)
 		scx_cgroup_ctl_reweight(p, tctx->group_cpu, old_base, new_base);
 
 	cpu = tctx->queued_cpu;
-	if (cpu < 0 || tctx->state != INF_TASK_QUEUED)
+	if (cpu < 0)
+		return;
+
+	INF_STAT_INC(weight_queued_cpu);
+
+	if (tctx->state != INF_TASK_QUEUED)
 		return;
 
 	INF_STAT_INC(reweight_queued);
@@ -1533,11 +1538,13 @@ static __noinline bool inf_yield_to(struct task_struct *from,
 		return false;
 
 	/* One writer owns the node. A lost race is a refusal, not a move. */
-	if (cmpxchg(&tctx->moving, 0, 1))
-		return false;
-
 	node = &tctx->qnode;
 	inf_queue_hold(node);
+	if (cmpxchg(&tctx->moving, 0, 1)) {
+		inf_queue_drop(node);
+		return false;
+	}
+
 	old_key = inf_queue_node_key(node);
 	slice	= tctx->slice_ns ? tctx->slice_ns : 1;
 	w	= tctx->weight ? tctx->weight : 1;
@@ -1555,8 +1562,8 @@ static __noinline bool inf_yield_to(struct task_struct *from,
 		} else {
 			INF_STAT_INC(lost_state_errors);
 		}
-		inf_queue_drop(node);
 		tctx->moving = 0;
+		inf_queue_drop(node);
 		return false;
 	}
 
@@ -1574,16 +1581,16 @@ static __noinline bool inf_yield_to(struct task_struct *from,
 			if (inf_requeue_task(to, tctx, tcpu))
 				INF_STAT_INC(lost_state_errors);
 		}
-		inf_queue_drop(node);
 		tctx->moving = 0;
+		inf_queue_drop(node);
 		return false;
 	}
 
 	tctx->queued_cpu = tcpu;
 	tctx->state	 = INF_TASK_QUEUED;
 	inf_resolve_pending(to, tctx);
-	inf_queue_drop(node);
 	tctx->moving = 0;
+	inf_queue_drop(node);
 	INF_STAT_INC(yield_to_moves);
 	return true;
 }

@@ -319,6 +319,7 @@ impl<'a> Scheduler<'a> {
         let mut requeues = 0u64;
         let mut weight_changes = 0u64;
         let mut reweight_queued = 0u64;
+        let mut weight_queued_cpu = 0u64;
 
         let key = 0u32.to_ne_bytes();
         if let Ok(Some(rows)) = self
@@ -354,6 +355,7 @@ impl<'a> Scheduler<'a> {
                 requeues += stats.requeues;
                 weight_changes += stats.weight_changes;
                 reweight_queued += stats.reweight_queued;
+                weight_queued_cpu += stats.weight_queued_cpu;
             }
         }
 
@@ -384,7 +386,8 @@ impl<'a> Scheduler<'a> {
              llc={steal_llc} node={steal_node} yield_to={yield_to_moves} \
              reweight={reweight_moves} stale={stale_pops} \
              lost={lost_state_errors} requeues={requeues} \
-             weight_changes={weight_changes} queued={reweight_queued}"
+             weight_changes={weight_changes} queued={reweight_queued} \
+             queued_cpu={weight_queued_cpu}"
         );
     }
 
