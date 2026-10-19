@@ -4,7 +4,7 @@ version = "1.1.4"
 authors = ["Maxim Eryomenko <maxim_eryomenko@rambler.ru>"]
 edition = "2024"
 rust-version = "1.91"
-description = "Experimental global FIFO sched_ext scheduler and scx_infinity skeleton."
+description = "Experimental bounded-LIFO sched_ext scheduler for the Infinity fair policy."
 license = "GPL-2.0-only"
 
 [dependencies]
