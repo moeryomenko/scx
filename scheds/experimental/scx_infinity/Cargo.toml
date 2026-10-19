@@ -1,0 +1,23 @@
+[package]
+name = "scx_infinity"
+version = "1.1.4"
+authors = ["Maxim Eryomenko <maxim_eryomenko@rambler.ru>"]
+edition = "2024"
+rust-version = "1.91"
+description = "Experimental global FIFO sched_ext scheduler and scx_infinity skeleton."
+license = "GPL-2.0-only"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env", "unicode", "wrap_help"] }
+ctrlc = { version = "3", features = ["termination"] }
+libbpf-rs = "=0.27.2"
+log = "0.4"
+scx_stats = { path = "../../../rust/scx_stats", version = "1.1.4" }
+scx_stats_derive = { path = "../../../rust/scx_stats/scx_stats_derive", version = "1.1.4" }
+scx_utils = { path = "../../../rust/scx_utils", version = "1.1.4" }
+serde = { version = "1", features = ["derive"] }
+simplelog = "0.12"
+
+[build-dependencies]
+scx_cargo = { path = "../../../rust/scx_cargo", version = "1.1.4" }
