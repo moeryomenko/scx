@@ -58,17 +58,18 @@ const CGROUP_TREE_HEIGHT_MAX: u32 = 32;
 
 /// scx_infinity: experimental sched_ext scheduler.
 ///
-/// A bounded-LIFO scheduler with a weighted quantum. The queue takes
-/// seven head inserts and one tail insert per eight gated enqueues.
+/// A bounded-LIFO scheduler with a hierarchical service order. The queue
+/// takes seven head inserts and one tail insert per eight gated enqueues.
 /// Wakeups pass the same gate, `SCX_ENQ_HEAD` is the only head-exempt
 /// hint, and expiry, requeue, forced progress and yield enter at the
-/// tail.
+/// tail. One `ops.tick` call is one service slot, so the slot comes from
+/// the measured kernel tick and is not a setting.
 ///
 /// The TOML file at $XDG_CONFIG_HOME/scx_infinity/config.toml (or
-/// $HOME/.config/scx_infinity/config.toml) holds the base quantum and the
-/// placement preferences. A command-line value overrides the file. The
-/// file is reloaded on SIGHUP; an invalid file is rejected as a whole and
-/// the active settings stay live.
+/// $HOME/.config/scx_infinity/config.toml) holds the placement
+/// preferences. A command-line value overrides the file. The file is
+/// reloaded on SIGHUP; an invalid file is rejected as a whole and the
+/// active settings stay live.
 #[derive(Debug, Parser)]
 struct Opts {
     /// Exit debug dump buffer length. 0 indicates default.
@@ -79,8 +80,9 @@ struct Opts {
     #[clap(long, value_name = "PATH")]
     config: Option<PathBuf>,
 
-    /// Infinity base quantum in microseconds, 100 to 4000.
-    #[clap(long, value_name = "N")]
+    /// Removed in revision 4. Declared only to reject it with a clear
+    /// migration message instead of a generic unknown-argument error.
+    #[clap(long, value_name = "N", hide = true)]
     quantum_us: Option<u64>,
 
     /// Placement preference: auto, llc, numa or machine.
@@ -126,7 +128,6 @@ impl Opts {
     /// The command-line values that override the configuration file.
     fn overrides(&self) -> Overrides {
         Overrides {
-            quantum_us: self.quantum_us,
             placement: self.placement,
             no_smt: self.no_smt,
             preempt_margin_us: self.preempt_margin_us,
@@ -137,8 +138,7 @@ impl Opts {
 
 fn describe(config: &LiveConfig) -> String {
     format!(
-        "quantum_ns={} placement={:?} smt={} preempt_margin_ns={} spill_threshold={} stats_interval_ms={}",
-        config.quantum_ns,
+        "placement={:?} smt={} preempt_margin_ns={} spill_threshold={} stats_interval_ms={}",
         config.placement,
         config.smt,
         config.preempt_margin_ns,
@@ -763,6 +763,12 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    /*
+     * A revision-3 script may still pass the removed option. Reject it
+     * before any file is read, so it is never accepted and ignored.
+     */
+    config::reject_removed_options(opts.quantum_us)?;
+
     let mut lcfg = simplelog::ConfigBuilder::new();
     lcfg.set_time_offset_to_local()
         .expect("Failed to set local time offset")
@@ -815,6 +821,8 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory;
+
     use super::*;
 
     #[test]
@@ -835,15 +843,23 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_quantum_us_into_an_override() {
+    fn cli_rejects_the_removed_quantum_option() {
         let opts = Opts::try_parse_from(["scx_infinity", "--quantum-us", "2000"]).unwrap();
-        let overrides = opts.overrides();
 
-        assert_eq!(overrides.quantum_us, Some(2000));
-        assert_eq!(
-            policy::quantum_us_to_ns(overrides.quantum_us.unwrap()).unwrap(),
-            2_000_000
-        );
+        let error = config::reject_removed_options(opts.quantum_us).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("--quantum-us"), "{message}");
+        assert!(message.contains("revision 4"), "{message}");
+        assert!(message.contains("measured kernel tick"), "{message}");
+    }
+
+    #[test]
+    fn the_help_hides_the_removed_quantum_option() {
+        let help = Opts::command().render_help().to_string();
+
+        assert!(!help.contains("quantum"), "{help}");
+        assert!(help.contains("--preempt-margin-us"), "{help}");
     }
 
     #[test]

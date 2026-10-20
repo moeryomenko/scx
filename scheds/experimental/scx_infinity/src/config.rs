@@ -15,6 +15,11 @@
 //! scheduler. A missing file means "use built-in defaults". Command-line
 //! values are applied after every file load, so an override also applies to
 //! a SIGHUP reload.
+//!
+//! The service slot is not a setting. One `ops.tick` call is one slot and
+//! the tick rate is measured at run time (specification sections 2.5 and
+//! 6.3), so a revision-3 `quantum_ns` key and the `--quantum-us` option are
+//! rejected as a whole and never accepted and ignored.
 
 use std::env;
 use std::fs;
@@ -43,10 +48,17 @@ pub const CONFIG_PATH: &str = "$XDG_CONFIG_HOME/scx_infinity/config.toml";
 /// Exact fallback path when `XDG_CONFIG_HOME` is unusable.
 pub const CONFIG_PATH_FALLBACK: &str = "$HOME/.config/scx_infinity/config.toml";
 
+/// Schema keys, named in the message that rejects a removed key.
+const ALLOWED_KEYS: &str = "placement, smt, preempt_margin_ns, spill_threshold, stats_interval_ms";
+/// Revision-3 key that revision 4 removed.
+const REMOVED_QUANTUM_KEY: &str = "quantum_ns";
+/// Why the removed key and option have no replacement.
+const SERVICE_SLOT_REASON: &str =
+    "one service slot is one measured kernel tick, so there is no quantum to set";
+
 /// Live settings. A missing file or a missing key keeps the default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiveConfig {
-    pub quantum_ns: u64,
     pub placement: PlacementMode,
     pub smt: bool,
     pub preempt_margin_ns: u64,
@@ -57,7 +69,6 @@ pub struct LiveConfig {
 impl Default for LiveConfig {
     fn default() -> Self {
         Self {
-            quantum_ns: policy::QUANTUM_DEFAULT_NS,
             placement: PlacementMode::Auto,
             smt: true,
             preempt_margin_ns: policy::PREEMPT_MARGIN_DEFAULT_NS,
@@ -70,14 +81,21 @@ impl Default for LiveConfig {
 impl LiveConfig {
     /// Convert to the single BPF `cfg_stor` value.
     pub fn to_bpf(self, generation: u32) -> bpf_intf::inf_cfg {
-        bpf_intf::inf_cfg {
-            quantum_ns: self.quantum_ns,
-            preempt_margin_ns: self.preempt_margin_ns,
-            placement_mode: self.placement.as_u32(),
-            smt_enabled: u32::from(self.smt),
-            spill_threshold: self.spill_threshold,
-            generation,
-        }
+        /*
+         * Zeroing first keeps this conversion independent of a C field that
+         * revision 4 stopped using: the header still declares the quantum
+         * slot in one commit and drops it in another. Every field the
+         * scheduler reads is assigned below.
+         */
+        /* SAFETY: inf_cfg is a plain C-layout struct of integers, for which
+         * an all-zero bit pattern is valid. */
+        let mut cfg: bpf_intf::inf_cfg = unsafe { std::mem::zeroed() };
+        cfg.preempt_margin_ns = self.preempt_margin_ns;
+        cfg.placement_mode = self.placement.as_u32();
+        cfg.smt_enabled = u32::from(self.smt);
+        cfg.spill_threshold = self.spill_threshold;
+        cfg.generation = generation;
+        cfg
     }
 }
 
@@ -85,8 +103,6 @@ impl LiveConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
-    #[serde(default = "default_quantum_ns")]
-    pub quantum_ns: u64,
     #[serde(default)]
     pub placement: PlacementMode,
     #[serde(default = "default_smt")]
@@ -103,7 +119,6 @@ impl Default for FileConfig {
     fn default() -> Self {
         let live = LiveConfig::default();
         Self {
-            quantum_ns: live.quantum_ns,
             placement: live.placement,
             smt: live.smt,
             preempt_margin_ns: live.preempt_margin_ns,
@@ -111,10 +126,6 @@ impl Default for FileConfig {
             stats_interval_ms: live.stats_interval_ms,
         }
     }
-}
-
-fn default_quantum_ns() -> u64 {
-    policy::QUANTUM_DEFAULT_NS
 }
 
 fn default_smt() -> bool {
@@ -136,7 +147,6 @@ fn default_stats_interval_ms() -> u64 {
 /// Values given on the command line. Each one wins over the file.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Overrides {
-    pub quantum_us: Option<u64>,
     pub placement: Option<PlacementMode>,
     pub no_smt: bool,
     pub preempt_margin_us: Option<u64>,
@@ -145,9 +155,6 @@ pub struct Overrides {
 
 impl Overrides {
     fn apply(&self, cfg: &mut LiveConfig) -> Result<()> {
-        if let Some(us) = self.quantum_us {
-            cfg.quantum_ns = policy::quantum_us_to_ns(us).map_err(anyhow::Error::msg)?;
-        }
         if let Some(placement) = self.placement {
             cfg.placement = placement;
         }
@@ -199,6 +206,33 @@ pub fn resolve_path(explicit: Option<&Path>) -> Option<PathBuf> {
     explicit.map(Path::to_path_buf).or_else(default_config_path)
 }
 
+/// Reject a revision-3 `quantum_ns` key with a message that names the
+/// revision-4 change, before the generic unknown-key error hides it.
+fn reject_removed_quantum(value: &toml::Value) -> Result<()> {
+    if value.get(REMOVED_QUANTUM_KEY).is_none() {
+        return Ok(());
+    }
+
+    bail!(
+        "`{REMOVED_QUANTUM_KEY}` was removed in revision 4: {SERVICE_SLOT_REASON}. Remove the key. Allowed keys: {ALLOWED_KEYS}"
+    )
+}
+
+/// Reject a command-line option that revision 4 removed.
+///
+/// The option stays declared and hidden, so a script that still passes it
+/// gets this migration message instead of clap's generic "unexpected
+/// argument" text.
+pub fn reject_removed_options(quantum_us: Option<u64>) -> Result<()> {
+    if let Some(us) = quantum_us {
+        bail!(
+            "--quantum-us {us} was removed in revision 4: {SERVICE_SLOT_REASON}. Remove the option."
+        );
+    }
+
+    Ok(())
+}
+
 /// Parse and validate a TOML file. A missing file is the default schema.
 pub fn load_file(path: &Path) -> Result<FileConfig> {
     let text = match fs::read_to_string(path) {
@@ -212,7 +246,12 @@ pub fn load_file(path: &Path) -> Result<FileConfig> {
         }
     };
 
-    let cfg: FileConfig = toml::from_str(&text)
+    let value: toml::Value = toml::from_str(&text)
+        .with_context(|| format!("failed to parse configuration {}", path.display()))?;
+    reject_removed_quantum(&value)
+        .with_context(|| format!("invalid configuration {}", path.display()))?;
+    let cfg: FileConfig = value
+        .try_into()
         .with_context(|| format!("failed to parse configuration {}", path.display()))?;
     validate_file(&cfg)?;
     Ok(cfg)
@@ -221,15 +260,6 @@ pub fn load_file(path: &Path) -> Result<FileConfig> {
 /// Validate every field and report all errors in one message.
 pub fn validate_file(cfg: &FileConfig) -> Result<()> {
     let mut errors = Vec::new();
-
-    if !(policy::QUANTUM_MIN_NS..=policy::QUANTUM_MAX_NS).contains(&cfg.quantum_ns) {
-        errors.push(format!(
-            "quantum_ns must be between {} and {}, got {}",
-            policy::QUANTUM_MIN_NS,
-            policy::QUANTUM_MAX_NS,
-            cfg.quantum_ns
-        ));
-    }
 
     if cfg.preempt_margin_ns > policy::PREEMPT_MARGIN_MAX_NS {
         errors.push(format!(
@@ -269,7 +299,6 @@ pub fn load_resolved(path: Option<&Path>, overrides: &Overrides) -> Result<LiveC
         None => FileConfig::default(),
     };
     let mut cfg = LiveConfig {
-        quantum_ns: file.quantum_ns,
         placement: file.placement,
         smt: file.smt,
         preempt_margin_ns: file.preempt_margin_ns,
@@ -284,7 +313,6 @@ pub fn load_resolved(path: Option<&Path>, overrides: &Overrides) -> Result<LiveC
 
 fn validate_live(cfg: &LiveConfig) -> Result<()> {
     let file = FileConfig {
-        quantum_ns: cfg.quantum_ns,
         placement: cfg.placement,
         smt: cfg.smt,
         preempt_margin_ns: cfg.preempt_margin_ns,
@@ -334,7 +362,6 @@ mod tests {
     fn defaults_match_the_schema() {
         let cfg = FileConfig::default();
 
-        assert_eq!(cfg.quantum_ns, policy::QUANTUM_DEFAULT_NS);
         assert_eq!(cfg.placement, PlacementMode::Auto);
         assert!(cfg.smt);
         assert_eq!(cfg.preempt_margin_ns, policy::PREEMPT_MARGIN_DEFAULT_NS);
@@ -349,7 +376,6 @@ mod tests {
     fn a_valid_file_is_loaded_with_every_field() {
         let file = TempFile::new(
             r#"
-quantum_ns = 2000000
 placement = "numa"
 smt = false
 preempt_margin_ns = 250000
@@ -360,7 +386,6 @@ stats_interval_ms = 500
 
         let cfg = load_resolved(Some(file.path()), &Overrides::default()).unwrap();
 
-        assert_eq!(cfg.quantum_ns, 2_000_000);
         assert_eq!(cfg.placement, PlacementMode::Numa);
         assert!(!cfg.smt);
         assert_eq!(cfg.preempt_margin_ns, 250_000);
@@ -382,14 +407,13 @@ stats_interval_ms = 500
     fn cli_values_win_over_the_file() {
         let file = TempFile::new(
             r#"
-quantum_ns = 1000000
 placement = "llc"
 smt = true
+preempt_margin_ns = 100000
 spill_threshold = 4
 "#,
         );
         let overrides = Overrides {
-            quantum_us: Some(3_000),
             placement: Some(PlacementMode::Machine),
             no_smt: true,
             spill_threshold: Some(16),
@@ -398,7 +422,6 @@ spill_threshold = 4
 
         let cfg = load_resolved(Some(file.path()), &overrides).unwrap();
 
-        assert_eq!(cfg.quantum_ns, 3_000_000);
         assert_eq!(cfg.placement, PlacementMode::Machine);
         assert!(!cfg.smt);
         assert_eq!(cfg.spill_threshold, 16);
@@ -408,7 +431,6 @@ spill_threshold = 4
     fn an_invalid_file_is_rejected() {
         let file = TempFile::new(
             r#"
-quantum_ns = 1000000
 placement = "realtime"
 "#,
         );
@@ -420,71 +442,66 @@ placement = "realtime"
 
     #[test]
     fn an_unknown_key_is_rejected() {
+        let file = TempFile::new("queue_order = \"fifo\"\n");
+
+        let error = load_resolved(Some(file.path()), &Overrides::default()).unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(message.contains("failed to parse configuration"));
+        assert!(message.contains("queue_order"));
+    }
+
+    #[test]
+    fn a_quantum_key_is_rejected_as_a_whole() {
         let file = TempFile::new(
             r#"
-quantum_ns = 1000000
-queue_order = "fifo"
+quantum_ns = 2000000
+placement = "numa"
+smt = false
 "#,
         );
 
         let error = load_resolved(Some(file.path()), &Overrides::default()).unwrap_err();
+        let message = format!("{error:#}");
 
-        assert!(error.to_string().contains("failed to parse configuration"));
+        assert!(message.contains("quantum_ns"), "{message}");
+        assert!(message.contains("revision 4"), "{message}");
+        assert!(message.contains("measured kernel tick"), "{message}");
+        assert!(message.contains("placement"), "{message}");
     }
 
     #[test]
-    fn an_out_of_range_quantum_is_rejected() {
-        for quantum_ns in [policy::QUANTUM_MIN_NS - 1, policy::QUANTUM_MAX_NS + 1] {
-            let file = TempFile::new(&format!("quantum_ns = {quantum_ns}\n"));
+    fn the_quantum_option_is_rejected_with_the_revision_change() {
+        let error = reject_removed_options(Some(2_000)).unwrap_err();
+        let message = error.to_string();
 
-            let error = load_resolved(Some(file.path()), &Overrides::default()).unwrap_err();
-
-            assert!(error.to_string().contains("quantum_ns must be between"));
-        }
-    }
-
-    #[test]
-    fn an_out_of_range_cli_quantum_is_rejected() {
-        let overrides = Overrides {
-            quantum_us: Some(policy::QUANTUM_MAX_NS / 1000 + 1),
-            ..Overrides::default()
-        };
-
-        let error = load_resolved(None, &overrides).unwrap_err();
-
-        assert!(error.to_string().contains("quantum must be between"));
+        assert!(message.contains("--quantum-us"), "{message}");
+        assert!(message.contains("revision 4"), "{message}");
+        assert!(reject_removed_options(None).is_ok());
     }
 
     #[test]
     fn numeric_boundaries_are_accepted_or_rejected_by_one_step() {
-        let minimum = TempFile::new(&format!(
-            "quantum_ns = {}\npreempt_margin_ns = 0\nspill_threshold = 1\n",
-            policy::QUANTUM_MIN_NS
-        ));
+        let minimum = TempFile::new("preempt_margin_ns = 0\nspill_threshold = 1\n");
         let cfg = load_resolved(Some(minimum.path()), &Overrides::default()).unwrap();
-        assert_eq!(cfg.quantum_ns, policy::QUANTUM_MIN_NS);
         assert_eq!(cfg.preempt_margin_ns, 0);
         assert_eq!(cfg.spill_threshold, 1);
 
         let maximum = TempFile::new(&format!(
-            "quantum_ns = {}\npreempt_margin_ns = {}\nspill_threshold = {}\n",
-            policy::QUANTUM_MAX_NS,
+            "preempt_margin_ns = {}\nspill_threshold = {}\n",
             policy::PREEMPT_MARGIN_MAX_NS,
             SPILL_THRESHOLD_MAX
         ));
         let cfg = load_resolved(Some(maximum.path()), &Overrides::default()).unwrap();
-        assert_eq!(cfg.quantum_ns, policy::QUANTUM_MAX_NS);
         assert_eq!(cfg.preempt_margin_ns, policy::PREEMPT_MARGIN_MAX_NS);
         assert_eq!(cfg.spill_threshold, SPILL_THRESHOLD_MAX);
 
         let over = TempFile::new(&format!(
-            "quantum_ns = {}\npreempt_margin_ns = {}\nspill_threshold = {}\n",
-            policy::QUANTUM_MAX_NS + 1,
+            "preempt_margin_ns = {}\nspill_threshold = {}\n",
             policy::PREEMPT_MARGIN_MAX_NS + 1,
             SPILL_THRESHOLD_MAX + 1
         ));
         let error = load_resolved(Some(over.path()), &Overrides::default()).unwrap_err();
-        assert!(error.to_string().contains("quantum_ns"));
         assert!(error.to_string().contains("preempt_margin_ns"));
         assert!(error.to_string().contains("spill_threshold"));
     }
@@ -492,15 +509,13 @@ queue_order = "fifo"
     #[test]
     fn all_errors_are_reported_together() {
         let file = TempFile::new(&format!(
-            "quantum_ns = {}\npreempt_margin_ns = {}\nspill_threshold = 0\n",
-            policy::QUANTUM_MAX_NS + 1,
+            "preempt_margin_ns = {}\nspill_threshold = 0\n",
             policy::PREEMPT_MARGIN_MAX_NS + 1
         ));
 
         let error = load_resolved(Some(file.path()), &Overrides::default()).unwrap_err();
         let message = error.to_string();
 
-        assert!(message.contains("quantum_ns"));
         assert!(message.contains("preempt_margin_ns"));
         assert!(message.contains("spill_threshold"));
     }
@@ -533,7 +548,6 @@ queue_order = "fifo"
     #[test]
     fn the_bpf_value_carries_the_generation() {
         let cfg = LiveConfig {
-            quantum_ns: 1_500_000,
             placement: PlacementMode::Llc,
             smt: false,
             preempt_margin_ns: 200_000,
@@ -543,12 +557,10 @@ queue_order = "fifo"
 
         let value = cfg.to_bpf(7);
 
-        assert_eq!(value.quantum_ns, 1_500_000);
         assert_eq!(value.preempt_margin_ns, 200_000);
         assert_eq!(value.placement_mode, bpf_intf::INF_PLACEMENT_LLC);
         assert_eq!(value.smt_enabled, 0);
         assert_eq!(value.spill_threshold, 6);
         assert_eq!(value.generation, 7);
-        assert_eq!(std::mem::size_of::<bpf_intf::inf_cfg>(), 32);
     }
 }

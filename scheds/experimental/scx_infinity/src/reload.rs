@@ -9,7 +9,9 @@
 //!
 //! A reload reads the same path, validates the whole result, and only then
 //! publishes one configuration value. A parse or validation error leaves
-//! the active configuration in place.
+//! the active configuration in place. The service slot is not part of the
+//! reload: it comes from the kernel tick, so a file that still sets a
+//! quantum is rejected as a whole.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -106,7 +108,7 @@ mod tests {
 
     #[test]
     fn invalid_toml_keeps_the_old_value() {
-        let file = TempFile::new("quantum_ns = [not a number]\n");
+        let file = TempFile::new("preempt_margin_ns = [not a number]\n");
         let mut map = FakeMap {
             value: Some(LiveConfig::default()),
             updates: 0,
@@ -125,7 +127,6 @@ mod tests {
     fn a_valid_file_writes_one_value_with_all_fields() {
         let file = TempFile::new(
             r#"
-quantum_ns = 2000000
 placement = "numa"
 smt = false
 preempt_margin_ns = 250000
@@ -144,7 +145,6 @@ stats_interval_ms = 500
         assert_eq!(
             map.value,
             Some(LiveConfig {
-                quantum_ns: 2_000_000,
                 placement: PlacementMode::Numa,
                 smt: false,
                 preempt_margin_ns: 250_000,
@@ -156,26 +156,27 @@ stats_interval_ms = 500
 
     #[test]
     fn a_cli_override_survives_a_reload() {
-        let file = TempFile::new("quantum_ns = 2000000\nplacement = \"llc\"\n");
+        let file = TempFile::new("placement = \"llc\"\nspill_threshold = 4\n");
         let overrides = Overrides {
-            quantum_us: Some(3_000),
             placement: Some(PlacementMode::Machine),
+            spill_threshold: Some(12),
             ..Overrides::default()
         };
         let mut map = FakeMap::default();
 
         reload(Some(file.path()), &overrides, |cfg| map.publish(cfg)).unwrap();
 
-        assert_eq!(map.value.unwrap().quantum_ns, 3_000_000);
-        assert_eq!(map.value.unwrap().placement, PlacementMode::Machine);
+        let value = map.value.unwrap();
+        assert_eq!(value.placement, PlacementMode::Machine);
+        assert_eq!(value.spill_threshold, 12);
         assert_eq!(map.updates, 1);
     }
 
     #[test]
     fn an_invalid_field_rejects_the_whole_file() {
         let file = TempFile::new(&format!(
-            "quantum_ns = {}\nspill_threshold = 0\n",
-            policy::QUANTUM_MAX_NS
+            "preempt_margin_ns = {}\nspill_threshold = 0\n",
+            policy::PREEMPT_MARGIN_MAX_NS + 1
         ));
         let mut map = FakeMap {
             value: Some(LiveConfig::default()),
@@ -192,8 +193,8 @@ stats_interval_ms = 500
     }
 
     #[test]
-    fn a_valid_reload_followed_by_a_bad_one_keeps_the_first_value() {
-        let file = TempFile::new("quantum_ns = 2000000\n");
+    fn a_quantum_key_is_rejected_as_a_whole() {
+        let file = TempFile::new("placement = \"llc\"\n");
         let mut map = FakeMap::default();
 
         reload(Some(file.path()), &Overrides::default(), |cfg| {
@@ -201,21 +202,47 @@ stats_interval_ms = 500
         })
         .unwrap();
         assert_eq!(map.updates, 1);
-        assert_eq!(map.value.unwrap().quantum_ns, 2_000_000);
+        let kept = map.value;
 
-        file.write("quantum_ns = 50\n");
+        file.write("quantum_ns = 2000000\nplacement = \"numa\"\n");
+        let result = reload(Some(file.path()), &Overrides::default(), |cfg| {
+            map.publish(cfg)
+        });
+
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(message.contains("quantum_ns"), "{message}");
+        assert!(message.contains("revision 4"), "{message}");
+        assert_eq!(map.updates, 1);
+        assert_eq!(map.value, kept);
+        assert_eq!(map.value.unwrap().placement, PlacementMode::Llc);
+    }
+
+    #[test]
+    fn a_valid_reload_followed_by_a_bad_one_keeps_the_first_value() {
+        let file = TempFile::new("placement = \"numa\"\n");
+        let mut map = FakeMap::default();
+
+        reload(Some(file.path()), &Overrides::default(), |cfg| {
+            map.publish(cfg)
+        })
+        .unwrap();
+        assert_eq!(map.updates, 1);
+        let kept = map.value;
+        assert_eq!(kept.unwrap().placement, PlacementMode::Numa);
+
+        file.write("spill_threshold = 0\n");
         let result = reload(Some(file.path()), &Overrides::default(), |cfg| {
             map.publish(cfg)
         });
 
         assert!(result.is_err());
         assert_eq!(map.updates, 1);
-        assert_eq!(map.value.unwrap().quantum_ns, 2_000_000);
+        assert_eq!(map.value, kept);
     }
 
     #[test]
     fn a_failing_publish_changes_nothing() {
-        let file = TempFile::new("quantum_ns = 2000000\n");
+        let file = TempFile::new("placement = \"numa\"\n");
         let mut map = FakeMap {
             value: Some(LiveConfig::default()),
             updates: 0,

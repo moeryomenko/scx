@@ -5,10 +5,10 @@ Experimental sched_ext scheduler for the Infinity fair policy.
 **Status: experimental. Not ready for general use.**
 
 The current tree implements revision 2 of
-`.agent/tasks/spec/spec.md`. Revision 3 is the frozen target. It replaces
-the per-CPU DSQ queue with a scheduler-owned queue, fixes yield-to,
-queued reweight and cpu.weight/cpu.idle, and adds peer dispatch steal.
-The code and the tests below do not implement revision 3 yet. The
+`.agent/tasks/spec/spec.md`. Revision 4 is the frozen target. It replaces
+the flat per-CPU queue and weighted quantum with a per-CPU hierarchical
+entity tree, per-level normalized service and one kernel tick per service
+slot. The code and the tests below do not implement revision 4 yet. The
 limitations at the end of this file remain current until they do.
 
 ## Scope
@@ -72,11 +72,12 @@ The core policy is a bounded last-in-first-out queue:
   same 7:1 gate as any other enqueue and can take the head or the tail
   slot. An expired slice, a requeue, a forced-progress enqueue and a
   yield enter at the tail.
-- The slice is `quantum * weight / contending_weight`, with a 100 us
-  floor for a task below one tenth of the queue weight. Revision 3
-  exempts a `cpu.idle` task from the floor, so its weight of 3 is used as
-  is. The contending weight is the sum of the effective weights on the
-  target CPU. The slice is recomputed when the task is popped.
+- A service slot ends at the next kernel tick. `ops.tick` settles the
+  running task and re-enters it through the gate, and dispatch sets the
+  slice to one nominal slot as a backstop only. The slot is never derived
+  from a configured quantum. A task under a `cpu.idle` cgroup and a
+  `SCHED_IDLE` task keep the same slot and lose their share through the
+  service order instead.
 - The effective weight folds the cgroup hierarchy in through the shared
   cgroup control library (`lib/cgroup_ctl.bpf.c`). Every nested
   `cpu.weight` level scales the task weight by `shares / load`, and any
@@ -181,7 +182,7 @@ After a clean exit it reads `disabled`. A non-root run fails at load.
 ## Command line
 
 ```
-scx_infinity [--config PATH] [--exit-dump-len N] [--quantum-us N]
+scx_infinity [--config PATH] [--exit-dump-len N]
              [--placement MODE] [--no-smt] [--spill-threshold N]
              [--preempt-margin-us N] [--no-cpu-max] [--verbose] [--version]
              [--trace] [--test-dsq-refuse N]
@@ -190,8 +191,6 @@ scx_infinity [--config PATH] [--exit-dump-len N] [--quantum-us N]
 - `--config PATH`: read this TOML file instead of the default XDG path.
 - `--exit-dump-len N`: exit debug dump buffer length, 0 selects the
   default.
-- `--quantum-us N`: base quantum in microseconds, 100 to 4000, default
-  1000 (1 ms). Overrides the file.
 - `--placement MODE`: `auto` (default) walks the full order. `llc`
   stops at the local LLC, `numa` stops at the local NUMA node, and
   `machine` skips locality and ranks every allowed CPU by capacity and
@@ -218,6 +217,11 @@ scx_infinity [--config PATH] [--exit-dump-len N] [--quantum-us N]
   local DSQ inserts without calling the kernel, so the requeue fallback
   runs deterministically.
 
+`--quantum-us` was removed in revision 4. The option is hidden, and a
+run that still passes it stops with a message that names the revision-4
+change. The service slot is one kernel tick, so there is no quantum to
+set.
+
 Run it as root. Press Ctrl-C to unregister the scheduler.
 
 ## Configuration
@@ -240,7 +244,6 @@ file. Unknown keys and out-of-range values reject the entire file.
 
 ```toml
 # scx_infinity configuration
-quantum_ns = 1000000        # 100_000 ..= 4_000_000
 placement = "auto"          # "auto" | "llc" | "numa" | "machine"
 smt = true                  # false: physical cores only
 preempt_margin_ns = 100000  # 0 ..= 1_000_000
@@ -250,6 +253,33 @@ stats_interval_ms = 1000    # 0 disables the stats line
 
 The file is checked as a whole before any value is applied. All errors
 are reported in one message, and a rejected file changes nothing.
+
+There is no quantum key. A revision-3 file that still sets `quantum_ns`
+is rejected as a whole, with the key name, the revision-4 reason and the
+allowed keys in the error. The key is never accepted and ignored.
+
+## Service slot
+
+One `ops.tick` call is one service slot. The scheduler does not take the
+slot from the configuration: it counts kernel ticks, and the tick rate is
+measured at run time. On the `CONFIG_HZ=1000` guest the measured rate is
+about 1000 ticks per second, so the nominal slot is 1 ms.
+
+The measurement, one busy task pinned to CPU 0 for 5 s:
+
+```
+task_tick_scx n=5001 span_ms=5001.048
+ gap_ms min=0.1760 median=1.0000 p99=1.0250 max=2.8260
+ gaps_gt_1.5ms=3 gaps_gt_2ms=1
+```
+
+The run had function tracing active, which adds overhead. The nominal
+1 ms is the dispatch slice and the band width, not a wall-clock promise:
+a late tick makes the slot longer, and a slice expiry before the tick
+ends it early. `ops.tick` runs only when a task of the scheduler's class
+is the donor of that runqueue, so an idle CPU does not deliver it. A
+`NOHZ_FULL` tick can arrive on another CPU, and that tick charges one
+nominal slot instead of a cross-CPU clock difference.
 
 ## Reload
 
