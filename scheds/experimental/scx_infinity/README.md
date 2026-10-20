@@ -27,6 +27,14 @@ intrusive list is a second prototype behind the `queue-list` build
 feature. It exists to measure the queue cost. EDQ wins a correctness tie
 because it provides a hold count and exact node removal.
 
+The queue choice was measured. Six ten-minute mixed-load campaigns ran
+on two restored guests, three per build, with the same configuration and
+the same workload. Both builds were correct, with no lost task, no stall
+and no lost trace record. Every measured difference was smaller than the
+run-to-run spread, so EDQ stays the default and the FIFO list stays a
+prototype. The measurement, the selection rule and the rejected
+variants are in `.agent/tasks/queue-selection/evidence.md`.
+
 Dispatch in revision 3 steals from same-LLC peer queues first, then from
 same-NUMA peers, with a rotating cursor and at most eight peers per
 tier. It does not steal across a NUMA node.
@@ -143,6 +151,10 @@ The default queue is EDQ. The FIFO measurement prototype builds with:
 ```
 cargo build -p scx_infinity --features queue-list
 ```
+
+The FIFO prototype stays a measurement prototype. The measured
+comparison found no gain over the run-to-run noise, so it is not the
+default.
 
 For a release binary:
 
