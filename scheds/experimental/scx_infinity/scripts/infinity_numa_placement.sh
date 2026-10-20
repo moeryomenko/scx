@@ -7,18 +7,31 @@
 #
 # The harness loads scx_infinity in a guest with two vNUMA nodes and checks:
 #
-#   local_llc     a task woken on an idle CPU stays inside that LLC
-#   local_node    a task woken on an idle CPU stays inside that NUMA node
-#   remote_spill  with the local node saturated, a new task is placed on the
-#                 remote node at wakeup
-#   affinity      a task that narrows its mask never runs outside the mask
-#   affinity_one  a task narrowed to one CPU never runs on another CPU
+#   local_llc        a task woken on an idle CPU stays inside that LLC
+#   local_node       a task woken on an idle CPU stays inside that NUMA node
+#   steal_llc        a peer inside the same LLC steals, and only the LLC tier
+#                    counter moves
+#   steal_node       a peer inside the same node but in another LLC steals, and
+#                    only the node tier counter moves
+#   no_remote_steal  an idle node does not take work from the other node
+#   remote_spill     with the local node saturated, a new task is placed on the
+#                    remote node at wakeup
+#   remote_spill_mask the mask forbids the remote node, so no spill happens
+#   affinity         a task that narrows its mask never runs outside the mask
+#   affinity_one     a task narrowed to one CPU never runs on another CPU
+#   migration        a task moved to the other node keeps running there
 #
 # A task's CPU is sampled from sched_getcpu() by infinity_workload. The
 # probe records the CPU it started on, broadens its affinity to the full
 # set, then wakes and samples. The scheduler therefore sees a wakeup whose
 # previous CPU is the original CPU, which is the placement input that
 # specification section 4.1 defines.
+#
+# The steal cases use the task mask to attribute a steal to one tier. A task
+# whose mask names only the two CPUs of one LLC can only be stolen inside that
+# LLC. A task whose mask names one CPU of each of the two LLCs of one node can
+# only be stolen inside that node. The counters are therefore read against a
+# condition that leaves exactly one tier reachable.
 #
 # The harness fails closed. It refuses to run without a disposable VM
 # (SCX_INFINITY_VM=1), root, two online NUMA nodes and the LLC sysfs file.
@@ -53,7 +66,20 @@ NODE0_CPUS=""
 NODE1_CPUS=""
 NODE0_CPU=""
 NODE0_LLC=""
+NODE0_LLC_PEER=""
+NODE0_LLC2=""
+NODE0_LLC2_CPU=""
+NODE0_LLC2_PEER=""
+NODE1_LLC=""
 DMESG_BASELINE=0
+
+# The lowest share of the probe samples that must stay in the local LLC or
+# the local node. The guest keeps its own tasks, so a wakeup can find the
+# local cache busy and move to another core of the same node. That is the
+# placement order of specification section 4.1, so the case measures the
+# preference over the whole sample window instead of demanding that no
+# sample ever leaves the domain.
+LOCALITY_MIN_SHARE_PCT=${LOCALITY_MIN_SHARE_PCT:-90}
 
 usage() {
     cat >&2 <<'EOF'
@@ -145,6 +171,38 @@ preflight() {
         else
             record PASS llc "cpu $NODE0_CPU LLC=$NODE0_LLC"
         fi
+        NODE0_LLC_PEER=$(llc_other_cpu "$NODE0_LLC" "$NODE0_CPU" || true)
+        if [[ -z "$NODE0_LLC_PEER" ]]; then
+            record BLOCKED llc_peer "the LLC of cpu $NODE0_CPU has no second CPU"
+            missing=1
+        else
+            record PASS llc_peer "LLC $NODE0_LLC peer cpu=$NODE0_LLC_PEER"
+        fi
+        NODE0_LLC2_CPU=$(node_cpu_outside_llc "$NODE0_CPUS" "$NODE0_LLC" || true)
+        if [[ -z "$NODE0_LLC2_CPU" ]]; then
+            record BLOCKED llc2 "node 0 has no second LLC"
+            missing=1
+        else
+            NODE0_LLC2=$(cpu_llc_list "$NODE0_LLC2_CPU")
+            NODE0_LLC2_PEER=$(llc_other_cpu "$NODE0_LLC2" "$NODE0_LLC2_CPU" || true)
+            if [[ -z "$NODE0_LLC2_PEER" ]]; then
+                record BLOCKED llc2 "the second LLC of node 0 has no second CPU"
+                missing=1
+            else
+                record PASS llc2 "node 0 second LLC=$NODE0_LLC2 cpu=$NODE0_LLC2_CPU peer=$NODE0_LLC2_PEER"
+            fi
+        fi
+    fi
+    if [[ -n "$NODE1_CPUS" ]]; then
+        local node1_cpu
+        node1_cpu=$(cpulist_first "$NODE1_CPUS" || true)
+        NODE1_LLC=$(cpu_llc_list "$node1_cpu")
+        if [[ -z "$NODE1_LLC" ]]; then
+            record BLOCKED llc_node1 "cpu $node1_cpu has no cache/index3/shared_cpu_list"
+            missing=1
+        else
+            record PASS llc_node1 "cpu $node1_cpu LLC=$NODE1_LLC"
+        fi
     fi
 
     if [[ -z "$SCHED_BIN" ]]; then
@@ -195,6 +253,103 @@ setup_cgroup() {
     cleanup_push 'stop_all_workers'
 }
 
+# Print the CPU of a task, or an empty string when the task is gone.
+worker_cpu() {
+    local -r pid="$1"
+    local stat=""
+    local rest=""
+
+    [[ -r "/proc/$pid/stat" ]] || return 1
+    stat=$(<"/proc/$pid/stat") || return 1
+    rest=${stat#*") "}
+    awk '{ if (NF >= 37) print $37; else print -1 }' <<<"$rest"
+}
+
+# Print the consumed CPU time of a task in clock ticks.
+worker_cpu_time() {
+    local -r pid="$1"
+    local stat=""
+    local rest=""
+
+    [[ -r "/proc/$pid/stat" ]] || return 1
+    stat=$(<"/proc/$pid/stat") || return 1
+    rest=${stat#*") "}
+    awk '{ print $12 + $13 }' <<<"$rest"
+}
+
+# Poll every task of the harness cgroup and print every CPU one of them ran
+# on. The children of a workload inherit the cgroup, so this covers the
+# whole load and not only the process the harness started.
+observe_cgroup_cpus() {
+    local -r seconds="$1"
+    local end
+    local pid
+    local cpu
+    local seen=""
+
+    end=$(( $(date +%s) + seconds ))
+    while (( $(date +%s) < end )); do
+        while read -r pid; do
+            [[ -n "$pid" ]] || continue
+            cpu=$(worker_cpu "$pid" 2>/dev/null || true)
+            [[ -z "$cpu" || "$cpu" == "-1" ]] && continue
+            if [[ ",$seen," != *",$cpu,"* ]]; then
+                seen="$seen,$cpu"
+            fi
+        done <"$CG_BURN/cgroup.procs" 2>/dev/null || true
+        sleep 0.05
+    done
+    printf '%s\n' "${seen#,}"
+}
+
+# Print the other CPU of one LLC.
+llc_other_cpu() {
+    local -r llc="$1"
+    local -r exclude="$2"
+    local cpu
+
+    for cpu in $(cpulist_expand "$llc"); do
+        if [[ "$cpu" != "$exclude" ]]; then
+            printf '%s\n' "$cpu"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Print a CPU of one node that is not part of the given LLC.
+node_cpu_outside_llc() {
+    local -r node="$1"
+    local -r llc="$2"
+    local cpu
+
+    for cpu in $(cpulist_expand "$node"); do
+        if ! cpu_in_list "$cpu" "$llc"; then
+            printf '%s\n' "$cpu"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Wait until the loader printed a new statistics line.
+wait_for_stat_tick() {
+    local -r seconds="$1"
+    local first=""
+    local current=""
+    local i
+
+    first=$(stats_line "$SCHED_LOG")
+    for (( i = 0; i < seconds * 20; i++ )); do
+        current=$(stats_line "$SCHED_LOG")
+        if [[ -n "$current" && "$current" != "$first" ]]; then
+            return 0
+        fi
+        sleep 0.05
+    done
+    return 1
+}
+
 # Run one probe. Args: start_cpu tag mask [broaden]
 probe_run() {
     local -r cpu="$1"
@@ -243,6 +398,49 @@ all_cpus_in() {
     done
 }
 
+# Print the share of the probe samples that fell into the given cpulist, in
+# percent with two decimals.
+probe_share() {
+    local -r log="$1"
+    local -r list="$2"
+    local counts=""
+    local total=0
+    local inside=0
+
+    counts=$(probe_field "$log" counts)
+    total=$(probe_field "$log" samples)
+    if [[ -z "$counts" || "$counts" == "none" || -z "$total" || "$total" == "0" ]]; then
+        printf '0.00\n'
+        return 1
+    fi
+    inside=$(printf '%s\n' "$counts" | awk -v list="$list" '
+        BEGIN {
+            n = split(list, part, ",")
+            for (i = 1; i <= n; i++) {
+                lo = part[i]
+                hi = lo
+                if (index(lo, "-")) {
+                    split(lo, r, "-")
+                    lo = r[1]
+                    hi = r[2]
+                }
+                for (c = lo; c <= hi; c++)
+                    want[c] = 1
+            }
+        }
+        {
+            n = split($0, parts, ",")
+            for (i = 1; i <= n; i++) {
+                split(parts[i], kv, ":")
+                if (kv[1] in want)
+                    sum += kv[2]
+            }
+        }
+        END { print sum + 0 }')
+    awk -v inside="$inside" -v total="$total" \
+        'BEGIN { printf "%.2f", 100 * inside / total }'
+}
+
 check_alive() {
     local -r tag="$1"
 
@@ -261,6 +459,7 @@ run_local_llc() {
     local out_of_mask=""
     local distinct=""
     local first=""
+    local share=""
     local extra=""
 
     if ! log=$(probe_run "$NODE0_CPU" local_llc all broaden); then
@@ -270,13 +469,18 @@ run_local_llc() {
     out_of_mask=$(probe_field "$log" out_of_mask)
     distinct=$(probe_field "$log" distinct)
     first=$(probe_field "$log" first_cpu)
-    extra=$(printf '"start_cpu":%d,"first_cpu":%s,"llc":"%s","sampled_cpus":"%s","out_of_mask":%s' \
-        "$NODE0_CPU" "${first:-0}" "$NODE0_LLC" "${distinct:-none}" "${out_of_mask:-0}")
-    if [[ "${out_of_mask:-1}" != "0" ]] || ! all_cpus_in "$distinct" "$NODE0_LLC"; then
+    share=$(probe_share "$log" "$NODE0_LLC")
+    extra=$(printf '"start_cpu":%d,"first_cpu":%s,"llc":"%s","sampled_cpus":"%s","llc_share_pct":%s,"out_of_mask":%s' \
+        "$NODE0_CPU" "${first:-0}" "$NODE0_LLC" "${distinct:-none}" "${share:-0}" "${out_of_mask:-0}")
+    if [[ "${out_of_mask:-1}" != "0" ]]; then
+        record FAIL local_llc "a sample ran outside the allowed CPU set" "$extra"
+        return
+    fi
+    if ! num_in_range "$share" "$LOCALITY_MIN_SHARE_PCT" 100; then
         record FAIL local_llc "the task left its local LLC $NODE0_LLC" "$extra"
         return
     fi
-    record PASS local_llc "samples $distinct stayed in LLC $NODE0_LLC" "$extra"
+    record PASS local_llc "$share percent of the samples stayed in LLC $NODE0_LLC" "$extra"
 }
 
 run_local_node() {
@@ -284,6 +488,7 @@ run_local_node() {
     local out_of_mask=""
     local distinct=""
     local first=""
+    local share=""
     local extra=""
 
     if ! log=$(probe_run "$NODE0_CPU" local_node all broaden); then
@@ -293,13 +498,159 @@ run_local_node() {
     out_of_mask=$(probe_field "$log" out_of_mask)
     distinct=$(probe_field "$log" distinct)
     first=$(probe_field "$log" first_cpu)
-    extra=$(printf '"start_cpu":%d,"first_cpu":%s,"node_cpus":"%s","sampled_cpus":"%s","out_of_mask":%s' \
-        "$NODE0_CPU" "${first:-0}" "$NODE0_CPUS" "${distinct:-none}" "${out_of_mask:-0}")
-    if [[ "${out_of_mask:-1}" != "0" ]] || ! all_cpus_in "$distinct" "$NODE0_CPUS"; then
+    share=$(probe_share "$log" "$NODE0_CPUS")
+    extra=$(printf '"start_cpu":%d,"first_cpu":%s,"node_cpus":"%s","sampled_cpus":"%s","node_share_pct":%s,"out_of_mask":%s' \
+        "$NODE0_CPU" "${first:-0}" "$NODE0_CPUS" "${distinct:-none}" "${share:-0}" "${out_of_mask:-0}")
+    if [[ "${out_of_mask:-1}" != "0" ]]; then
+        record FAIL local_node "a sample ran outside the allowed CPU set" "$extra"
+        return
+    fi
+    if ! num_in_range "$share" "$LOCALITY_MIN_SHARE_PCT" 100; then
         record FAIL local_node "the task left its local NUMA node" "$extra"
         return
     fi
-    record PASS local_node "samples $distinct stayed in node 0" "$extra"
+    record PASS local_node "$share percent of the samples stayed in node 0" "$extra"
+}
+
+# One steal case. The mask names the only CPUs a task may use, so exactly one
+# steal tier can reach a queued task. Args: tag source_cpu peer_cpu mask
+#
+# The idle window before the load gives the background level of both
+# counters. The guest keeps its own tasks, so a counter never sits still.
+# The case therefore compares the load induced rise against that level.
+run_steal_case() {
+    local -r tag="$1"
+    local -r source="$2"
+    local -r peer="$3"
+    local -r mask="$4"
+    local -r want="$5"
+    local -r other="$6"
+    local llc_before=0
+    local node_before=0
+    local llc_after=0
+    local node_after=0
+    local bg_llc_before=0
+    local bg_node_before=0
+    local bg_llc=0
+    local bg_node=0
+    local want_delta=0
+    local other_delta=0
+    local want_excess=0
+    local other_excess=0
+    local bg_want=0
+    local observed=""
+    local extra=""
+
+    stop_all_workers
+    sleep 1
+    wait_for_stat_tick 2 || true
+    bg_llc_before=$(stat_value "$SCHED_LOG" llc)
+    bg_node_before=$(stat_value "$SCHED_LOG" node)
+    sleep "$((DURATION + 1))"
+    wait_for_stat_tick 2 || true
+    bg_llc=$(( $(stat_value "$SCHED_LOG" llc) - bg_llc_before ))
+    bg_node=$(( $(stat_value "$SCHED_LOG" node) - bg_node_before ))
+
+    llc_before=$(stat_value "$SCHED_LOG" llc)
+    node_before=$(stat_value "$SCHED_LOG" node)
+
+    # A long task keeps the source CPU busy, so a queued task waits there.
+    start_worker "$CG_BURN" "$source" "$HARNESS_TMP/${tag}_source.log" \
+        "$WORKLOAD" burn "$((DURATION + 25))" >/dev/null || true
+    # A stream of short tasks keeps both CPUs busy and the queues churning.
+    start_worker "$CG_BURN" "$mask" "$HARNESS_TMP/${tag}_load.log" \
+        "$WORKLOAD" forkexec "$((DURATION + 10))" >/dev/null || true
+    sleep 1
+    observed=$(observe_cgroup_cpus "$((DURATION + 1))")
+    stop_all_workers
+    wait_for_stat_tick 3 || true
+    llc_after=$(stat_value "$SCHED_LOG" llc)
+    node_after=$(stat_value "$SCHED_LOG" node)
+
+    llc_before=${llc_before:-0}
+    node_before=${node_before:-0}
+    llc_after=${llc_after:-0}
+    node_after=${node_after:-0}
+    if [[ "$want" == "llc" ]]; then
+        want_delta=$(( llc_after - llc_before ))
+        other_delta=$(( node_after - node_before ))
+        want_excess=$(( want_delta - bg_llc ))
+        other_excess=$(( other_delta - bg_node ))
+        bg_want=$bg_llc
+    else
+        want_delta=$(( node_after - node_before ))
+        other_delta=$(( llc_after - llc_before ))
+        want_excess=$(( want_delta - bg_node ))
+        other_excess=$(( other_delta - bg_llc ))
+        bg_want=$bg_node
+    fi
+    (( other_excess < 0 )) && other_excess=0
+    extra=$(printf '"mask":"%s","source_cpu":%d,"peer_cpu":%d,"llc_delta":%d,"node_delta":%d,"llc_background":%d,"node_background":%d,"sampled_cpus":"%s"' \
+        "$mask" "$source" "$peer" \
+        "$(( llc_after - llc_before ))" "$(( node_after - node_before ))" \
+        "$bg_llc" "$bg_node" "${observed:-none}")
+
+    if (( want_excess < 100 )); then
+        record FAIL "$tag" "the $want steal counter did not rise above the background" "$extra"
+        return
+    fi
+    if (( other_excess * 4 > want_excess )); then
+        record FAIL "$tag" "the $other steal counter rose as well" "$extra"
+        return
+    fi
+    if ! all_cpus_in "$observed" "$mask"; then
+        record FAIL "$tag" "a worker ran outside its mask" "$extra"
+        return
+    fi
+    record PASS "$tag" "$want steals $want_delta above a background of $bg_want, $other steals $other_delta" "$extra"
+}
+
+run_steal_llc() {
+    run_steal_case steal_llc "$NODE0_CPU" "$NODE0_LLC_PEER" "$NODE0_LLC" llc node
+}
+
+run_steal_node() {
+    run_steal_case steal_node "$NODE0_CPU" "$NODE0_LLC2_PEER" \
+        "$NODE0_CPU,$NODE0_LLC2_PEER" node llc
+}
+
+# Work runs only on node 1 while node 0 stays idle. An idle CPU of node 0
+# must not take work from the other node.
+run_no_remote_steal() {
+    local observed=""
+    local llc_before=0
+    local node_before=0
+    local llc_after=0
+    local node_after=0
+    local extra=""
+
+    stop_all_workers
+    sleep 1
+    wait_for_stat_tick 2 || true
+    llc_before=$(stat_value "$SCHED_LOG" llc)
+    node_before=$(stat_value "$SCHED_LOG" node)
+
+    start_worker "$CG_BURN" "$NODE1_LLC" "$HARNESS_TMP/remote_load.log" \
+        "$WORKLOAD" forkexec "$((DURATION + 10))" >/dev/null || true
+    sleep 1
+    observed=$(observe_cgroup_cpus "$((DURATION + 1))")
+    stop_all_workers
+    wait_for_stat_tick 3 || true
+    llc_after=$(stat_value "$SCHED_LOG" llc)
+    node_after=$(stat_value "$SCHED_LOG" node)
+
+    extra=$(printf '"mask":"%s","node1_cpus":"%s","sampled_cpus":"%s","llc_delta":%d,"node_delta":%d' \
+        "$NODE1_LLC" "$NODE1_CPUS" "${observed:-none}" \
+        "$(( llc_after - llc_before ))" "$(( node_after - node_before ))")
+    if ! all_cpus_in "$observed" "$NODE1_CPUS"; then
+        record FAIL no_remote_steal "work from node 1 ran on node 0" "$extra"
+        return
+    fi
+    if [[ "${observed:-none}" == "none" ]]; then
+        record FAIL no_remote_steal "no worker was observed" "$extra"
+        return
+    fi
+    record PASS no_remote_steal "node 1 work stayed in node 1" "$extra"
 }
 
 run_remote_spill() {
@@ -348,6 +699,46 @@ run_remote_spill() {
     record PASS remote_spill "the task spilled out of node 0; samples $distinct" "$extra"
 }
 
+# The mask keeps the task inside node 0, so a crowded node 0 must not push
+# it to node 1.
+run_remote_spill_mask() {
+    local cpu
+    local log=""
+    local out_of_mask=""
+    local distinct=""
+    local extra=""
+    local i
+
+    while IFS= read -r cpu; do
+        for i in 0 1; do
+            if ! start_worker "$CG_BURN" "$cpu" "$HARNESS_TMP/maskburn_${cpu}_${i}.log" \
+                timeout --signal=TERM --kill-after=5s "$((DURATION + 20))s" \
+                "$WORKLOAD" burn "$((DURATION + 10))" >/dev/null; then
+                record FAIL remote_spill_mask "cannot start a local burner"
+                stop_all_workers
+                return
+            fi
+        done
+    done < <(cpulist_expand "$NODE0_CPUS")
+    sleep 1
+
+    if ! log=$(probe_run "$NODE0_CPU" remote_spill_mask "$NODE0_CPUS"); then
+        stop_all_workers
+        record FAIL remote_spill_mask "the probe did not complete"
+        return
+    fi
+    stop_all_workers
+    out_of_mask=$(probe_field "$log" out_of_mask)
+    distinct=$(probe_field "$log" distinct)
+    extra=$(printf '"mask":"%s","sampled_cpus":"%s","node1_cpus":"%s","out_of_mask":%s' \
+        "$NODE0_CPUS" "${distinct:-none}" "$NODE1_CPUS" "${out_of_mask:-0}")
+    if [[ "${out_of_mask:-1}" != "0" ]] || ! all_cpus_in "$distinct" "$NODE0_CPUS"; then
+        record FAIL remote_spill_mask "a task left the mask that forbids node 1" "$extra"
+        return
+    fi
+    record PASS remote_spill_mask "the mask kept the task in node 0" "$extra"
+}
+
 run_affinity() {
     local log=""
     local out_of_mask=""
@@ -392,6 +783,63 @@ run_affinity_one() {
     record PASS affinity_one "the task stayed on CPU $NODE0_CPU" "$extra"
 }
 
+# Move a busy task from node 0 to node 1 and check that it keeps running.
+run_migration() {
+    local pid=""
+    local cpu_before=""
+    local cpu_after=""
+    local time_before=0
+    local time_after=0
+    local moved=0
+    local extra=""
+    local i
+
+    stop_all_workers
+    start_worker "$CG_BURN" "$NODE0_CPU" "$HARNESS_TMP/migrate.log" \
+        "$WORKLOAD" burn "$((DURATION + 25))" >/dev/null || true
+    pid="${HARNESS_LAST_PID:-}"
+    if [[ -z "$pid" || ! -r "/proc/$pid/stat" ]]; then
+        record FAIL migration "the busy task did not start"
+        stop_all_workers
+        return
+    fi
+    sleep 1
+    cpu_before=$(worker_cpu "$pid" 2>/dev/null || true)
+    time_before=$(worker_cpu_time "$pid" 2>/dev/null || echo 0)
+
+    if ! taskset -cp "$NODE1_CPUS" "$pid" >"$HARNESS_TMP/migrate_taskset.log" 2>&1; then
+        record FAIL migration "cannot change the affinity of the task"
+        stop_all_workers
+        return
+    fi
+
+    for (( i = 0; i < 100; i++ )); do
+        cpu_after=$(worker_cpu "$pid" 2>/dev/null || true)
+        if [[ -n "$cpu_after" ]] && cpu_in_list "$cpu_after" "$NODE1_CPUS"; then
+            moved=1
+            break
+        fi
+        sleep 0.1
+    done
+    # The task needs a slice on the new CPU before it burns again.
+    sleep 1
+    time_after=$(worker_cpu_time "$pid" 2>/dev/null || echo 0)
+    extra=$(printf '"pid":%s,"cpu_before":%s,"cpu_after":%s,"node0_cpus":"%s","node1_cpus":"%s","cpu_ticks_before":%s,"cpu_ticks_after":%s' \
+        "$pid" "${cpu_before:-none}" "${cpu_after:-none}" "$NODE0_CPUS" "$NODE1_CPUS" \
+        "$time_before" "$time_after")
+    stop_all_workers
+
+    if (( moved == 0 )); then
+        record FAIL migration "the task did not move to node 1" "$extra"
+        return
+    fi
+    if (( time_after <= time_before )); then
+        record FAIL migration "the task stopped making progress after the move" "$extra"
+        return
+    fi
+    record PASS migration "the task moved to node 1 and kept running" "$extra"
+}
+
 teardown() {
     local faults=""
 
@@ -413,8 +861,10 @@ teardown() {
 
 main() {
     harness_init numa_placement
-    mkdir -p "$HARNESS_TMP/config"
+    mkdir -p "$HARNESS_TMP/config/scx_infinity"
     export XDG_CONFIG_HOME="$HARNESS_TMP/config"
+    # A short statistics period gives the steal counters a usable resolution.
+    printf 'stats_interval_ms = 250\n' >"$XDG_CONFIG_HOME/scx_infinity/config.toml"
     if [[ -n "$OUT" ]]; then
         HARNESS_JSON_OUT=$OUT
         : >"$OUT"
@@ -440,11 +890,29 @@ main() {
     record PASS scheduler "state enabled"
 
     run_local_llc
+    check_alive local_llc
     run_local_node
+    check_alive local_node
+    run_steal_llc
+    check_alive steal_llc
+    run_steal_node
+    check_alive steal_node
+    run_no_remote_steal
+    check_alive no_remote_steal
     run_remote_spill
+    check_alive remote_spill
+    run_remote_spill_mask
+    check_alive remote_spill_mask
     run_affinity
+    check_alive affinity
     run_affinity_one
+    check_alive affinity_one
+    run_migration
+    check_alive migration
     teardown
+    if [[ -n "$OUT" ]]; then
+        cp -- "$SCHED_LOG" "$OUT.scheduler.log" 2>/dev/null || true
+    fi
 }
 
 main "$@"

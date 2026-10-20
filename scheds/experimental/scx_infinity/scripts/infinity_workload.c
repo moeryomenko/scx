@@ -229,8 +229,11 @@ static int cmd_probe(double seconds, const char *mask, bool broaden)
 	cpu_set_t check;
 	cpu_set_t target;
 	bool	  seen[CPU_LIMIT] = { false };
+	long long hits[CPU_LIMIT] = { 0 };
 	char	  distinct[4096];
+	char	  counts[4096];
 	size_t	  used	      = 0;
+	size_t	  counted	      = 0;
 	long long samples     = 0;
 	long long out_of_mask = 0;
 	long long end;
@@ -271,6 +274,7 @@ static int cmd_probe(double seconds, const char *mask, bool broaden)
 					used += (size_t)written;
 				seen[cpu] = true;
 			}
+			hits[cpu]++;
 			if (min_cpu < 0 || cpu < min_cpu)
 				min_cpu = cpu;
 			if (cpu > max_cpu)
@@ -278,9 +282,21 @@ static int cmd_probe(double seconds, const char *mask, bool broaden)
 		}
 		sleep_ms(1);
 	}
-	printf("samples=%lld out_of_mask=%lld first_cpu=%d min_cpu=%d max_cpu=%d distinct=%s done=1 cpu_ms=%lld\n",
+	for (cpu = 0; cpu < CPU_LIMIT; cpu++) {
+		int written;
+
+		if (!seen[cpu])
+			continue;
+		written = snprintf(counts + counted, sizeof(counts) - counted,
+				   counted == 0 ? "%d:%lld" : ",%d:%lld", cpu,
+				   hits[cpu]);
+		if (written > 0 && (size_t)written < sizeof(counts) - counted)
+			counted += (size_t)written;
+	}
+	printf("samples=%lld out_of_mask=%lld first_cpu=%d min_cpu=%d max_cpu=%d distinct=%s counts=%s done=1 cpu_ms=%lld\n",
 	       samples, out_of_mask, first_cpu, min_cpu, max_cpu,
-	       used == 0 ? "none" : distinct, cpu_ms());
+	       used == 0 ? "none" : distinct, counted == 0 ? "none" : counts,
+	       cpu_ms());
 	return 0;
 }
 
