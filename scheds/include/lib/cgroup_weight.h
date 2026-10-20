@@ -9,6 +9,11 @@
  * (cgroup, CPU) and folds the hierarchy into one effective task weight, the
  * same single-runqueue model scx_eevdf uses.
  *
+ * A scheduler that owns the hierarchy itself, one node per (cgroup, CPU),
+ * reads the stored control state with scx_cgroup_weight_node() instead of
+ * calling the fold. That accessor is read-only: it returns what the cgroup
+ * callbacks stored and changes no load, count, epoch or fold result.
+ *
  * The bandwidth half of the API stays in lib/cgroup.h. A scheduler that
  * wants both includes lib/cgroup_ctl.h.
  */
@@ -81,6 +86,37 @@ struct scx_cgroup_weight_info {
 	u32 pad;
 };
 
+/*
+ * Read-only control state of one cgroup, for a scheduler that builds its own
+ * per-CPU hierarchy.
+ *
+ * @cgrp_id:   kernel control-group id, as stored in cgrp->kn->id
+ * @parent_id: nearest ancestor that has a control entry, 0 at the root
+ * @epoch:     the library epoch when the value was read, see
+ *             scx_cgroup_weight_epoch()
+ * @weight:    cpu.weight, 0 when the group is not present
+ * @idle:      cpu.idle, 0 when the group is not present
+ * @present:   1 when the cgroup has a live control entry at its level
+ *
+ * Identity and control values are the same on every CPU. The CPU argument of
+ * scx_cgroup_weight_node() names the coordinate the caller is building a node
+ * for, and only bounds-checks that coordinate.
+ *
+ * The process root cgroup, a cgroup without the cpu controller, and a cgroup
+ * that has exited report @present 0 with @weight, @idle and @parent_id 0.
+ * A caller that needs the root's own weight uses its task weight, because
+ * fair.c scales nothing at the root.
+ */
+struct scx_cgroup_weight_node {
+	u64 cgrp_id;
+	u64 parent_id;
+	u64 epoch;
+	u32 weight;
+	u32 idle;
+	u32 present;
+	u32 pad;
+};
+
 int  scx_cgroup_weight_lib_init(struct scx_cgroup_weight_config *config);
 
 int  scx_cgroup_weight_init(struct cgroup *cgrp		      __arg_trusted,
@@ -110,6 +146,15 @@ int scx_cgroup_weight_fold(struct cgroup *cgrp __arg_trusted, s32 cpu,
 
 /* Epoch of the last weight or idle change. */
 u64 scx_cgroup_weight_epoch(void);
+
+/*
+ * Fill @out with the control state of @cgrp for @cpu. Read-only: no load,
+ * count, epoch or fold value changes. Returns 0 on success, including when
+ * the group is not present, which @out->present reports. Returns -EINVAL on
+ * a NULL argument or a negative CPU.
+ */
+int scx_cgroup_weight_node(struct cgroup *cgrp __arg_trusted, s32 cpu,
+			   struct scx_cgroup_weight_node *out);
 
 /* Refold an already joined task after an epoch change. */
 int scx_cgroup_weight_refresh(struct task_struct *p __arg_trusted, s32 cpu,

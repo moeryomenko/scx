@@ -593,6 +593,42 @@ __hidden void scx_cgroup_weight_set_idle(struct cgroup *cgrp __arg_trusted,
 	scw_epoch_bump();
 }
 
+__hidden int scx_cgroup_weight_node(struct cgroup *cgrp __arg_trusted, s32 cpu,
+				    struct scx_cgroup_weight_node *out)
+{
+	struct scw_group *g;
+
+	if (!cgrp || !out || cpu < 0)
+		return -EINVAL;
+
+	/*
+	 * Read the epoch before the entry. A concurrent cpu.weight or
+	 * cpu.idle change stores the value first and bumps the epoch after
+	 * it, so a value read here is never paired with an older epoch than
+	 * the one the caller already holds.
+	 */
+	out->epoch     = scx_cgroup_weight_epoch();
+	out->cgrp_id   = scw_cgroup_id(cgrp);
+	out->parent_id = 0;
+	out->weight    = 0;
+	out->idle      = 0;
+	out->present   = 0;
+	out->pad       = 0;
+
+	if (!out->cgrp_id)
+		return 0;
+
+	g = scw_group_of(out->cgrp_id);
+	if (!g || !READ_ONCE(g->present))
+		return 0;
+
+	out->parent_id = READ_ONCE(g->parent_id);
+	out->weight    = READ_ONCE(g->weight);
+	out->idle      = READ_ONCE(g->idle);
+	out->present   = 1;
+	return 0;
+}
+
 __hidden int scx_cgroup_weight_task(struct task_struct *p __arg_trusted,
 				    s32 cpu, bool joining,
 				    struct scx_cgroup_weight_info *out)
