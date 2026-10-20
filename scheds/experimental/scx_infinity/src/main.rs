@@ -16,6 +16,7 @@ mod model;
 mod placement;
 mod policy;
 mod reload;
+mod service;
 mod topology;
 
 use std::mem::MaybeUninit;
