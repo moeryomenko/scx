@@ -2,18 +2,19 @@
 /*
  * Shared definitions for scx_infinity.
  *
- * The scheduler keeps one scheduler-owned queue per CPU. A scheduler-owned
- * sequence key gives the queue bounded-LIFO order: a head insert takes the
- * next key below INF_KEY_MID, a tail insert the next key above it, so the
- * queue pops the newest head insert first and a tail insert last. The 7:1
- * gate and the key ranges are fixed. The queue itself is either the EDQ
- * from lib/edq.h or the intrusive FIFO list selected by the queue-list
- * build feature. The base quantum and the placement preferences live in
- * `struct inf_cfg` and a SIGHUP reload replaces them.
+ * Revision 4 replaces the flat per-CPU ready queue with a hierarchical
+ * entity tree. Each CPU owns one tree. The tree has a root entity, one
+ * group entity per (cgroup, CPU) pair and one task entity per task. Every
+ * level of the tree is an eligible deadline queue from lib/edq.h, ordered
+ * by the normalized service value of its children.
  *
- * Placement is locality-first. The loader seeds one topology row per
- * CPU and one NUMA distance row per node, and the scheduler keeps the
- * policy in its own map. No shared helper carries it.
+ * The service value is a Q16 nanosecond count that every level advances by
+ * its own weight. A parent queue keeps a monotone frontier, and a 7:1 gate
+ * decides whether an insertion takes the head or the tail of that queue.
+ *
+ * Placement is locality-first. The loader seeds one topology row per CPU
+ * and one NUMA distance row per node, and the scheduler keeps the policy in
+ * its own map. No shared helper carries it.
  */
 #ifndef __SCX_INFINITY_INTF_H
 #define __SCX_INFINITY_INTF_H
@@ -30,17 +31,6 @@ typedef signed long    s64;
 #endif
 #include <stdbool.h>
 
-#define INF_QUANTUM_DEFAULT_NS 1000000ULL
-#define INF_QUANTUM_MIN_NS 100000ULL
-#define INF_QUANTUM_MAX_NS 4000000ULL
-
-/*
- * A task below one tenth of the queue weight gets at least this slice,
- * so a very light task cannot build a sub-microsecond slice. The floor
- * never exceeds the base quantum.
- */
-#define INF_QUANTUM_FLOOR_NS 100000ULL
-
 #define INF_PREEMPT_MARGIN_DEFAULT_NS 100000ULL
 #define INF_PREEMPT_MARGIN_MAX_NS 1000000ULL
 #define INF_STATS_INTERVAL_DEFAULT_MS 1000ULL
@@ -50,15 +40,66 @@ typedef signed long    s64;
 #define INF_SCHED_IDLE 5
 #define INF_SCHED_EXT 7
 
-/* One tail insert in every eight regular enqueues. */
+/*
+ * One service slot is one ops.tick() call. The slot is the band width and
+ * the dispatch slice. It is not a wall-clock promise.
+ */
+#define INF_SLOT_NS 1000000ULL
+
+/*
+ * The largest charge one settlement can add. A slot that runs longer is
+ * clamped to it and the clamp is counted.
+ */
+#define INF_SETTLE_MAX_NS 4000000ULL
+
+/* Q16 fixed point service units. */
+#define INF_Q16_SHIFT 16
+
+/* One nanosecond at weight 1, in Q16 service units: 100 * 2^16. */
+#define INF_SERVICE_SCALE (100ULL << INF_Q16_SHIFT)
+
+/* The band width in Q16 service units: one slot. */
+#define INF_BAND_Q16 (INF_SLOT_NS << INF_Q16_SHIFT)
+
+/* The largest charge one settlement can add, in Q16 service units. */
+#define INF_SETTLE_MAX_Q16 (INF_SETTLE_MAX_NS * INF_SERVICE_SCALE)
+
+/* A band scan inspects at most this many entities. */
+#define INF_BAND_SCAN_MAX 16
+
+/*
+ * The number of cgroup levels the entity chain keeps. A task in a deeper
+ * cgroup joins the deepest ancestor that has an entity.
+ */
+#define INF_CHAIN_MAX 4
+
+/* The counters of the per-CPU scans. */
+#define INF_MAX_COUNTERS 8
+#define INF_COUNTER_BAND 0
+#define INF_COUNTER_PEEK 1
+
+/* One tail insertion in every eight normal insertions. */
 #define INF_GATE_MASK 7U
 
 /*
- * Head keys decrease from INF_KEY_MID and tail keys increase from it.
- * Both runs stay below 2^62 keys in any realistic uptime, so a head key
- * is always before a tail key under the kernel's wrap-safe vtime order.
+ * The maximum number of tree levels, from the leaf parent to the root.
+ * The cgroup hierarchy is at most cgroup.max.depth deep, and the kernel
+ * limit is 16, so a tree of 16 levels covers every hierarchy.
  */
-#define INF_KEY_MID (1ULL << 62)
+#define INF_MAX_LEVELS 4
+
+/* Group entities per CPU and the open-addressed index slots per CPU. */
+#define INF_GROUPS_PER_CPU 128
+#define INF_INDEX_SLOTS 256
+
+/* Task entities in the pool. A full pool fails ops.init_task(). */
+#define INF_TASKS_MAX 65536
+
+/* Entity weights. A task uses its nice weight, a group its cpu.weight. */
+#define INF_WEIGHT_MIN 1U
+#define INF_WEIGHT_MAX 10000U
+#define INF_WEIGHT_IDLE 3U
+#define INF_WEIGHT_DEFAULT 100U
 
 #define INF_MAX_CPUS 1024
 #define INF_MAX_CGROUPS 2048
@@ -68,47 +109,67 @@ typedef signed long    s64;
 #define INF_STEAL_SCAN_MAX 8
 
 /*
- * Queue implementation selected at build time. EDQ is the default and the
- * supported integration. The queue-list feature trades the EDQ hold count
- * for an intrusive FIFO list and exists to measure the queue cost.
+ * The live control state of one cgroup, keyed by the cgroup id. The
+ * scheduler reads it when it latches a group weight and when it refreshes
+ * one at an epoch boundary. A cgroup without an entry has the default
+ * weight.
  */
-#define INF_QUEUE_KIND_EDQ 0
-#define INF_QUEUE_KIND_LIST 1
-#ifdef INF_QUEUE_LIST
-#define INF_QUEUE_KIND INF_QUEUE_KIND_LIST
-#else
-#define INF_QUEUE_KIND INF_QUEUE_KIND_EDQ
-#endif
-
-/* Scheduler queue membership and task lifetime states. */
-#define INF_TASK_IDLE 0
-#define INF_TASK_QUEUED 1
-#define INF_TASK_DISPATCHED 2
-#define INF_TASK_RUNNING 3
-#define INF_TASK_PARKED 4
-#define INF_TASK_EXITING 5
+struct inf_cgrp_state {
+	u64 cgrp_id;
+	u64 epoch;
+	u32 weight;
+	u32 idle;
+	u32 present;
+	u32 pad;
+};
 
 /*
- * Arena allocation size for the task context. The real struct embeds the
- * cgroup bandwidth context at offset 0 and one queue node. The loader only
- * needs the size, which a static assertion in main.bpf.c checks.
+ * The entity states, mirrored by the Rust model. A group entity is
+ * RUNNABLE while it sits in its parent queue, SELECTED while a running
+ * path holds it, and INACTIVE while it has no dispatchable descendant.
  */
-#define INF_TASK_CTX_SIZE 640
+#define INF_ENTITY_INACTIVE 0
+#define INF_ENTITY_RUNNABLE 1
+#define INF_ENTITY_SELECTED 2
+#define INF_ENTITY_RUNNING 3
+#define INF_ENTITY_PARKED 4
+#define INF_ENTITY_HANDOFF 5
+#define INF_ENTITY_EXITING 6
+
+/* The insertion class of an entity inside its parent queue. */
+#define INF_CLASS_HEAD 0
+#define INF_CLASS_TAIL 1
 
 /*
- * One queue node per task. The default node is struct scx_edq_task and
- * the queue-list prototype node is smaller, so the arena layout reserves
- * the size of the selected implementation. Static assertions in
- * main.bpf.c check each implementation against this value.
+ * The insertion modes of the frozen event table. A normal insertion takes
+ * one gate step in the parent queue and the gate decides head or tail. A
+ * tail insertion takes the tail without a gate step. A head-exempt
+ * insertion takes the head without a gate step.
  */
-#ifdef INF_QUEUE_LIST
-#define INF_QUEUE_NODE_BYTES 48
-#else
-#define INF_QUEUE_NODE_BYTES 96
-#endif
+#define INF_INS_NORMAL 0
+#define INF_INS_TAIL 1
+#define INF_INS_HEAD 2
+
+/*
+ * The events of the frozen event table. The class and the gate of each row
+ * are fixed.
+ */
+#define INF_EV_NONE 0
+#define INF_EV_ADMIT 1
+#define INF_EV_ADMIT_HEAD 2
+#define INF_EV_POST_SLOT 3
+#define INF_EV_EXPIRY 4
+#define INF_EV_YIELD 5
+#define INF_EV_PREEMPT 6
+#define INF_EV_QUOTA 7
+#define INF_EV_REWEIGHT 8
+#define INF_EV_MOVE 9
+#define INF_EV_STEAL 10
+#define INF_EV_STEAL_FAIL 11
+#define INF_EV_YIELD_TO 12
 
 /* Peer steal tiers and the per-tier scan bound. */
-#define INF_STEAL_MAX_PEERS 8
+#define INF_STEAL_MAX_PEERS 2
 /*
  * Upper bound on the CPU ids one tier walk inspects. The walk stops after
  * eight peers in the tier; this bound keeps the verifier state small on a
@@ -119,13 +180,17 @@ typedef signed long    s64;
 #define INF_STEAL_LLC 0
 #define INF_STEAL_NODE 1
 
-/* Queue node states, mirrored by the Rust model. */
-#define INF_TASK_IDLE 0
-#define INF_TASK_QUEUED 1
-#define INF_TASK_DISPATCHED 2
-#define INF_TASK_RUNNING 3
-#define INF_TASK_PARKED 4
-#define INF_TASK_EXITING 5
+/*
+ * Arena allocation size for the task context. The real struct embeds the
+ * cgroup bandwidth context at offset 0 and one queue node. The loader only
+ * needs the size, which a static assertion in main.bpf.c checks.
+ */
+#define INF_TASK_CTX_SIZE 688
+
+/*
+ * One queue node per task. The node is struct scx_edq_task.
+ */
+#define INF_QUEUE_NODE_BYTES 96
 
 /*
  * Arena allocation size for the bandwidth task context. The struct holds
@@ -160,9 +225,7 @@ typedef signed long    s64;
 
 /*
  * Weight cap. The kernel task weight is at most 10000 and the cgroup
- * share at most 10000, so an effective weight stays below 2^32. Capping
- * there keeps quantum multiplication inside 64 bits without a 128-bit
- * helper in the BPF object.
+ * share at most 10000, so a weight stays well below 2^32.
  */
 #define INF_WEIGHT_CAP (1ULL << 32)
 
@@ -170,6 +233,10 @@ typedef signed long    s64;
  * Live configuration. The loader owns the single array entry and replaces
  * it with one map update, so the BPF side never observes a partial
  * configuration. Queue order and expiry stay compile-time constants.
+ *
+ * quantum_ns is not read by revision 4: one service slot is one measured
+ * kernel tick. The field stays until the change that removes it from the
+ * userspace layout lands.
  */
 struct inf_cfg {
 	u64 quantum_ns;
@@ -180,20 +247,46 @@ struct inf_cfg {
 	u32 generation;
 };
 
+/*
+ * The reservation of one running task. One CPU runs one task at a time,
+ * so the reservation lives in the per-CPU context. It holds the timing and
+ * the two ledgers of the slot. The path the task holds lives in the task
+ * context, because a task can change CPU between the settle and the
+ * requeue.
+ */
+struct inf_reservation {
+	u64 start_now;
+	u64 actual_ns;
+	u64 policy_ns;
+	u64 slot_ns;
+	u32 pid;
+	u32 cpu;
+	u32 flags;
+	u32 pad;
+};
+
+/*
+ * The path of a selection: the group entities from the leaf parent to the
+ * root, and the service minimum of every level. It is the scratch of one
+ * selection and the record of one held path.
+ */
+struct inf_path {
+	u32 ent[INF_MAX_LEVELS];
+	u64 vmin[INF_MAX_LEVELS];
+	u32 depth;
+	u32 pad;
+};
+
 struct inf_cpu_ctx {
-	u64 head_seq;
-	u64 tail_seq;
-	u64 w_sum;
-	/* Weight of the task this CPU dispatched last, read by the next
-	 * dispatch to normalize against the still-running task. */
-	u64 run_w;
+	struct inf_reservation resv;
+	u64 root_idx;
+	/* The number of dispatchable entities in the tree, advisory. */
 	s64 depth;
 	u32 seq;
 	u32 steal_llc_cursor;
 	u32 steal_node_cursor;
-	/* Task in this CPU's local DSQ, and its stored weight. */
-	s32 run_pid;
-	u32 pad;
+	u32 online;
+	u32 pad[2];
 };
 
 /*
@@ -242,24 +335,33 @@ struct inf_hist {
 struct inf_task_ctx_layout {
 	u8  cg_bw[INF_CGROUP_BW_CTX_SIZE];
 	u8  qnode[INF_QUEUE_NODE_BYTES];
-	u64 base_weight;
-	u64 weight;
-	u64 group_scale;
+	u64 v_q16;
+	u64 rem;
+	u64 tie;
+	u64 latched_weight;
+	u64 epoch;
+	u64 parent_idx;
+	u64 cgrp_id;
 	u64 slice_ns;
 	u64 last_running_ns;
-	u64 weight_epoch;
+	u64 base_weight;
+	u32 path_ent[INF_MAX_LEVELS];
 	s32 queued_cpu;
-	s32 group_cpu;
+	s32 path_cpu;
+	u32 path_depth;
 	u32 state;
+	u32 class;
 	u32 moving;
-	u32 reweight_pending;
 	u32 dequeue_pending;
 	u32 exit_pending;
+	u32 reweight_pending;
 	u32 joined;
 	u32 yielded;
+	u32 preempted;
 	u32 wake_fork;
 	u32 idle;
 	u32 pid;
+	u32 pending_event;
 	u32 hist_idx;
 	struct inf_hist hist[8];
 };
@@ -308,6 +410,34 @@ struct inf_stats {
 	u64 disp_renew;
 	u64 disp_total;
 	u64 disp_q;
+	/* Revision-4 counters. */
+	u64 entity_overflow;
+	u64 entity_reclaims;
+	u64 entity_alloc_fail;
+	u64 band_scan_truncated;
+	u64 half_range_faults;
+	u64 settle_clamps;
+	u64 remote_slots;
+	u64 state_repairs;
+	u64 steal_failures;
+	u64 steal_refusals;
+	u64 ctl_map_overflow;
+	u64 path_depth_max;
+	u64 disp_tree;
+	u64 disp_steal;
+	u64 tick_slots;
+	u64 requeue_tail;
+	u64 requeue_normal;
+	u64 disp_remove_fail;
+	u64 disp_remove_einval;
+	u64 disp_stale_state;
+	u64 disp_stale_inactive;
+	u64 disp_stale_selected;
+	u64 disp_stale_running;
+	u64 disp_dsq_fail;
+	u64 disp_affinity_fail;
+	u64 enq_admit_fail;
+	u64 pid_sample;
 };
 
 /*
@@ -358,7 +488,7 @@ struct inf_trace_rec {
 	s64 result;
 	s32 pid;
 	s32 src_cpu; /* source queue, -1 when the task had none */
-	s32 dst_cpu; /* target queue, -1 when none */
+	s32 dst_cpu; /* target queue, -1 when there was none */
 	u32 op; /* INF_TR_* */
 	u32 state; /* enum inf_task_state at the record */
 	u32 hold; /* queue node hold count */
@@ -374,7 +504,11 @@ struct inf_trace_ctl {
 	u32 enabled;
 };
 
-/* Exit-time queue snapshot, one entry per possible CPU. */
+/*
+ * Exit-time queue snapshot, one entry per possible CPU. w_sum is the flat
+ * weight sum of revision 3. Revision 4 has no flat sum, so the field
+ * stays zero and the loader prints it for the dump layout.
+ */
 struct inf_queue_snap {
 	u64 w_sum;
 	u64 head_slice;

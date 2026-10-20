@@ -9,8 +9,6 @@ license = "GPL-2.0-only"
 
 [features]
 default = []
-# Prototype: replace the EDQ ready queue with an intrusive FIFO list.
-queue-list = []
 
 [dependencies]
 anyhow = "1"
