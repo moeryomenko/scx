@@ -677,6 +677,12 @@ __hidden void scx_cgroup_weight_join(struct task_struct *p __arg_trusted,
 	scw_nr_add(cgrp, cpu, 1);
 	scw_load_add(cgid, cpu, (s64)base_weight);
 	SCW_STAT_INC(joins);
+	/*
+	 * The join changed a level's load, so every fold that read it is
+	 * stale. Without this a task that folded before a sibling group
+	 * joined kept the pre-join scale for its whole runnable period.
+	 */
+	scw_epoch_bump();
 }
 
 __hidden void scx_cgroup_weight_leave(struct task_struct *p __arg_trusted,
@@ -697,6 +703,7 @@ __hidden void scx_cgroup_weight_leave(struct task_struct *p __arg_trusted,
 	scw_nr_add(cgrp, cpu, -1);
 	scw_load_add(cgid, cpu, -(s64)base_weight);
 	SCW_STAT_INC(leaves);
+	scw_epoch_bump();
 }
 
 __hidden void scx_cgroup_weight_reweight(struct task_struct *p __arg_trusted,
@@ -719,6 +726,7 @@ __hidden void scx_cgroup_weight_reweight(struct task_struct *p __arg_trusted,
 
 	scw_load_add(cgid, cpu, (s64)new_weight - (s64)old_weight);
 	SCW_STAT_INC(reweights);
+	scw_epoch_bump();
 }
 
 __hidden void scx_cgroup_weight_move(struct cgroup *from __arg_trusted,
@@ -747,4 +755,5 @@ __hidden void scx_cgroup_weight_move(struct cgroup *from __arg_trusted,
 	}
 
 	SCW_STAT_INC(moves);
+	scw_epoch_bump();
 }

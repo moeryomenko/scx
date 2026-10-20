@@ -556,6 +556,10 @@ impl<'a> Scheduler<'a> {
         let mut enq_no_cctx = 0u64;
         let mut stale_requeues = 0u64;
         let mut stale_skips = 0u64;
+        let mut disp_pop = 0u64;
+        let mut disp_renew = 0u64;
+        let mut disp_total = 0u64;
+        let mut disp_q = 0u64;
 
         let key = 0u32.to_ne_bytes();
         if let Ok(Some(rows)) = self
@@ -615,6 +619,10 @@ impl<'a> Scheduler<'a> {
                 enq_no_cctx += stats.enq_no_cctx;
                 stale_requeues += stats.stale_requeues;
                 stale_skips += stats.stale_skips;
+                disp_pop += stats.disp_pop;
+                disp_renew += stats.disp_renew;
+                disp_total += stats.disp_total;
+                disp_q += stats.disp_q;
             }
         }
 
@@ -699,7 +707,9 @@ impl<'a> Scheduler<'a> {
              weight_changes={weight_changes} queued={reweight_queued} \
              queued_cpu={weight_queued_cpu} exit_passes={exit_passes} \
              no_ctx={enq_no_ctx} no_cctx={enq_no_cctx} \
-             stale_requeues={stale_requeues} stale_skips={stale_skips}"
+             stale_requeues={stale_requeues} stale_skips={stale_skips} \
+             disp: pop={disp_pop} renew={disp_renew} \
+             total={disp_total} q={disp_q}"
         );
 
         if self.trace

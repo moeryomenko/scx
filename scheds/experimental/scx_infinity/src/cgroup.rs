@@ -152,6 +152,8 @@ impl Tree {
             }
             self.contrib_sync(*leaf);
         }
+        /* The load changed, so every fold that read it is stale. */
+        self.epoch += 1;
     }
 
     /// The runnable period ended: reverse the join, count first, then load.
@@ -168,6 +170,7 @@ impl Tree {
             }
             self.contrib_sync(*leaf);
         }
+        self.epoch += 1;
     }
 
     /// A nice-weight change moves only the task's own contribution.
@@ -182,6 +185,7 @@ impl Tree {
             }
             self.contrib_sync(*leaf);
         }
+        self.epoch += 1;
     }
 
     /// Bring each group's contribution in line with its count, then move the
@@ -379,8 +383,37 @@ mod tests {
         assert_eq!(tree.group(2).unwrap().contrib, 2048);
         assert_eq!(tree.group(1).unwrap().load, 2048);
 
+        /* The child keeps one task but twice the shares, so its leaf
+         * scale doubles; the parent level is balanced and does not scale. */
         task.dispatch(&tree);
         assert_eq!(task.weight, 2048);
+    }
+
+    #[test]
+    fn a_sibling_join_refreshes_a_stale_fold() {
+        /* Harness shape: one parent group with two children, shares 1024
+         * and 2048, the values a cpu.weight of 100 and 200 maps to. */
+        let mut tree = Tree::new();
+        tree.add_group(9, None, 1024);
+        tree.add_group(1, Some(9), 1024);
+        tree.add_group(2, Some(9), 2048);
+
+        let mut a = Task::new(vec![1, 9], 1024);
+        a.enqueue(&mut tree);
+        /* The first task joins an empty parent, so it folds alone. */
+        assert_eq!(a.weight, 1024);
+
+        /* The sibling joins later, so the parent load doubles. The first
+         * task must refold at its next dispatch instead of keeping the
+         * pre-join scale for its whole runnable period. */
+        let mut b = Task::new(vec![2, 9], 1024);
+        b.enqueue(&mut tree);
+
+        a.dispatch(&tree);
+        b.dispatch(&tree);
+        assert_eq!(a.weight, 341);
+        assert_eq!(b.weight, 682);
+        assert_eq!(b.weight, 2 * a.weight, "extra weight is the 1:2 share");
     }
 
     #[test]

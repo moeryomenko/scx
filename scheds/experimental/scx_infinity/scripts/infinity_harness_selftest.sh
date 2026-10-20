@@ -114,6 +114,15 @@ is_equal "fp_scale divides" "0.5000" "$(fp_scale 50000 100000)"
 is_equal "median_of an odd count" "2.0000" "$(median_of 1 2 3)"
 is_equal "median_of an even count" "2.5000" "$(median_of 1 2 3 4)"
 
+# read_pair ------------------------------------------------------------
+# The harness IFS is newline and tab, so a plain read would keep both
+# numbers of the measured pair in its first variable.
+pair_a=""
+pair_b=""
+read_pair "2461745 2458399" pair_a pair_b
+is_equal "read_pair splits the first value" "2461745" "$pair_a"
+is_equal "read_pair splits the second value" "2458399" "$pair_b"
+
 # stat_value ----------------------------------------------------------
 cat >"$WORK/scheduler.log" <<'EOF'
 2026-10-20 10:00:00 INFO inserts: head=100 tail=20 exempt=3 expiries=5 preemptions=2 yields=1 depth=0 cgrp: throttled=0 reenqueued=0 eff_weight=0 eff_min=0 eff_max=0 eff_samples=0 scale_q10=0 refolds=0 deq: sleep=0 sched_change=0 core_exec=0 keep=0 qui: sleep=0 sched_change=0 keep=0 cpu_moves=0 weight: joins=0 leaves=0 reweights=0 moves=0 refolds=0 underflow=0 nr_underflow=0 epoch=0 init_idle=0 idle_on=0 idle_off=0 queue: steals=4 llc=3 node=1 yield_to=2 reweight=5 stale=0 lost=0 requeues=0 weight_changes=6 queued=1 queued_cpu=0

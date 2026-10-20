@@ -77,6 +77,40 @@ pub fn quantum_ns(base: u64, weight: u64, total: u64) -> u64 {
     q.max(1)
 }
 
+/// Quantum for a task under a `cpu.idle` cgroup.
+///
+/// The proportional slice is unchanged, but the light-task floor does not
+/// apply. The floor exists to stop a light normal task from rescheduling at
+/// a high rate; applying it to an idle task gives that task about nine
+/// percent of a CPU and fails the five percent rule of specification 5.2.
+pub fn quantum_ns_idle(base: u64, weight: u64, total: u64) -> u64 {
+    let weight = weight.clamp(1, WEIGHT_CAP);
+    let total = total.max(weight);
+
+    if base == 0 {
+        return 1;
+    }
+    let q = (u128::from(base) * u128::from(weight) / u128::from(total)).min(u128::from(u64::MAX))
+        as u64;
+    q.max(1)
+}
+
+/// Weight normalizer for a dispatch on one CPU.
+///
+/// The kernel's `root_cfs->inf_w_sum` sums every entity on the CPU's root
+/// list, including the one that is running. The scheduler queue only holds
+/// the tasks that wait, so the dispatch adds the weight of the task that is
+/// still in a runnable period on this CPU. Without it a CPU with one queued
+/// competitor gives each task the base quantum and the weights disappear.
+pub fn dispatch_total(queued: u64, running: u64, weight: u64) -> u64 {
+    let weight = weight.clamp(1, WEIGHT_CAP);
+
+    queued
+        .saturating_add(running)
+        .saturating_add(weight)
+        .max(weight)
+}
+
 /// True when a regular enqueue takes the tail slot instead of the head.
 ///
 /// The kernel sequence wraps at `u32::MAX`, so that value is a tail slot
@@ -306,6 +340,36 @@ mod tests {
         assert_eq!(quantum_ns(QUANTUM_DEFAULT_NS, 100, 1_000), QUANTUM_FLOOR_NS);
         assert_eq!(quantum_ns(QUANTUM_DEFAULT_NS, 99, 1_000), QUANTUM_FLOOR_NS);
         assert_eq!(quantum_ns(QUANTUM_DEFAULT_NS, 101, 1_000), 101_000);
+    }
+
+    #[test]
+    fn a_running_peer_joins_the_dispatch_normalizer() {
+        /* One queued competitor and one task running on this CPU: the
+         * normalizer is the CPU's runnable weight, so the heavy task takes
+         * twice the runtime and not the base quantum. */
+        assert_eq!(dispatch_total(0, 100, 200), 300);
+        assert_eq!(dispatch_total(0, 200, 100), 300);
+        assert_eq!(
+            quantum_ns(QUANTUM_DEFAULT_NS, 200, dispatch_total(0, 100, 200)),
+            QUANTUM_DEFAULT_NS * 2 / 3
+        );
+        assert_eq!(
+            quantum_ns(QUANTUM_DEFAULT_NS, 100, dispatch_total(0, 200, 100)),
+            QUANTUM_DEFAULT_NS / 3
+        );
+        assert_eq!(dispatch_total(50, 100, 200), 350);
+    }
+
+    #[test]
+    fn an_idle_task_bypasses_the_light_task_floor() {
+        /* Weight 3 against a normal 100 is below one tenth, so the floored
+         * slice is 100 us and the idle share would be nine percent. The
+         * idle slice must stay proportional: 3/103 of the base. */
+        assert_eq!(quantum_ns(QUANTUM_DEFAULT_NS, 3, 103), QUANTUM_FLOOR_NS);
+        assert_eq!(
+            quantum_ns_idle(QUANTUM_DEFAULT_NS, 3, 103),
+            QUANTUM_DEFAULT_NS * 3 / 103
+        );
     }
 
     #[test]

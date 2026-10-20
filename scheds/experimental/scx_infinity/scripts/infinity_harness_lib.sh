@@ -763,6 +763,17 @@ fp_scale() {
     }'
 }
 
+# Split the "a b" pair that measure_pair prints into two integers. This
+# file sets IFS to newline and tab, so a plain read keeps the whole pair in
+# its first variable.
+read_pair() {
+    local -r text="$1"
+    local -n pair_first="$2"
+    local -n pair_second="$3"
+
+    IFS=' ' read -r pair_first pair_second <<<"$text"
+}
+
 median_of() {
     if (($# == 0)); then
         printf '0\n'

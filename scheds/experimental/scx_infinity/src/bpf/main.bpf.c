@@ -362,7 +362,7 @@ static __noinline void inf_trace(u32 op, task_ctx *tctx, u64 where, s64 result)
 	pid = (s32)tctx->pid;
 
 	{
-		u32 slot = tctx->hist_idx & 7;
+		u32 slot		= tctx->hist_idx & 7;
 
 		tctx->hist[slot].op	= op;
 		tctx->hist[slot].src	= src;
@@ -420,29 +420,30 @@ static __noinline void inf_trace(u32 op, task_ctx *tctx, u64 where, s64 result)
 	{
 		u32 i;
 
-		bpf_for(i, 0, 8) {
+		bpf_for(i, 0, 8)
+		{
 			u32 slot = (tctx->hist_idx - snap->hist_count + i) & 7;
 
 			snap->hist[i] = tctx->hist[slot];
 		}
 	}
 
-	snap->ts		      = bpf_ktime_get_ns();
-	snap->slice	      = tctx->slice_ns;
-	snap->weight	      = tctx->weight;
-	snap->pid	      = pid;
-	snap->queued_cpu	      = tctx->queued_cpu;
-	snap->group_cpu	      = tctx->group_cpu;
-	snap->state	      = tctx->state;
-	snap->hold	      = inf_queue_node_hold(&tctx->qnode);
-	snap->joined	      = tctx->joined;
-	snap->moving	      = tctx->moving;
+	snap->ts	       = bpf_ktime_get_ns();
+	snap->slice	       = tctx->slice_ns;
+	snap->weight	       = tctx->weight;
+	snap->pid	       = pid;
+	snap->queued_cpu       = tctx->queued_cpu;
+	snap->group_cpu	       = tctx->group_cpu;
+	snap->state	       = tctx->state;
+	snap->hold	       = inf_queue_node_hold(&tctx->qnode);
+	snap->joined	       = tctx->joined;
+	snap->moving	       = tctx->moving;
 	snap->reweight_pending = tctx->reweight_pending;
 	snap->dequeue_pending  = tctx->dequeue_pending;
 	snap->exit_pending     = tctx->exit_pending;
-	snap->last_op	      = op;
-	snap->last_src	      = src;
-	snap->last_dst	      = dst;
+	snap->last_op	       = op;
+	snap->last_src	       = src;
+	snap->last_dst	       = dst;
 	snap->last_result      = result;
 
 	if (bpf_map_update_elem(&tsnap_stor, &pid, snap, BPF_ANY))
@@ -606,7 +607,7 @@ static __always_inline u64 inf_cfg_quantum_ns(void)
  * zero normalizer falls back to one task. Weights cap at INF_WEIGHT_CAP,
  * so the product stays inside 64 bits on the BPF target.
  */
-static __always_inline u64 inf_quantum(u64 w, u64 total)
+static __always_inline u64 inf_quantum(u64 w, u64 total, bool idle)
 {
 	u64 base = inf_cfg_quantum_ns();
 	u64 floor;
@@ -624,10 +625,12 @@ static __always_inline u64 inf_quantum(u64 w, u64 total)
 	/*
 	 * A task below one tenth of the queue weight takes at least the
 	 * 100 us floor, which is itself capped by the base quantum. The
-	 * condition mirrors src/policy.rs `quantum_ns()`.
+	 * condition mirrors src/policy.rs `quantum_ns()`. A task under a
+	 * cpu.idle cgroup bypasses the floor: applying it took the idle
+	 * share to about nine percent and failed the five percent rule.
 	 */
 	floor = base < INF_QUANTUM_FLOOR_NS ? base : INF_QUANTUM_FLOOR_NS;
-	if (w * 10 < total && q < floor)
+	if (!idle && w * 10 < total && q < floor)
 		q = floor;
 	return q ? q : 1;
 }
@@ -692,6 +695,29 @@ static __always_inline u64 inf_refresh_fold(struct task_struct *p, s32 cpu,
 static __always_inline bool inf_weight_stale(task_ctx *tctx)
 {
 	return tctx->weight_epoch != scx_cgroup_ctl_epoch();
+}
+
+/*
+ * Track the one task this CPU has in its local DSQ. The dispatch that puts
+ * a task there stores its weight; the next dispatch adds that weight to the
+ * queue sum, because a running task is runnable but not queued. The record
+ * is cleared when the task is queued, ends its runnable period, or the CPU
+ * goes idle, so it never counts a task the queue already carries.
+ */
+static __always_inline void inf_running_set(struct inf_cpu_ctx *cctx,
+					    task_ctx *tctx, u64 w)
+{
+	WRITE_ONCE(cctx->run_w, w);
+	WRITE_ONCE(cctx->run_pid, tctx->pid);
+}
+
+static __always_inline void inf_running_clear(struct inf_cpu_ctx *cctx,
+					      task_ctx *tctx)
+{
+	if (READ_ONCE(cctx->run_pid) != tctx->pid)
+		return;
+	WRITE_ONCE(cctx->run_w, 0);
+	WRITE_ONCE(cctx->run_pid, 0);
 }
 
 /* Reweight a task from its new base weight and stored group scale. */
@@ -1159,6 +1185,9 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 		return 0;
 	}
 
+	/* A queued task is charged in w_sum, so it is not the running one. */
+	inf_running_clear(cctx, tctx);
+
 	stats = inf_stats();
 	base  = tctx->base_weight ? tctx->base_weight :
 				    (p->scx.weight ? p->scx.weight : 1);
@@ -1254,8 +1283,8 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 		 * the bookkeeping forgot makes the insert below fail with
 		 * -EALREADY, which used to drop the task.
 		 */
-		s32		    owner     = inf_queue_owner_cpu(&tctx->qnode);
-		s32		    old_cpu   = owner >= 0 ? owner : tctx->queued_cpu;
+		s32 owner   = inf_queue_owner_cpu(&tctx->qnode);
+		s32 old_cpu = owner >= 0 ? owner : tctx->queued_cpu;
 		struct inf_cpu_ctx *old_cctx  = inf_cpu_ctx(old_cpu);
 		inf_queue_t	   *old_queue = inf_queue(old_cpu);
 		u64		    old_w = tctx->weight ? tctx->weight : base;
@@ -1329,7 +1358,7 @@ no_stale:
 		}
 	}
 
-	q   = inf_quantum(w, READ_ONCE(cctx->w_sum) + w);
+	q   = inf_quantum(w, READ_ONCE(cctx->w_sum) + w, tctx->idle);
 	key = head ? inf_head_key(cctx) : inf_tail_key(cctx);
 
 	/* Charge the queue before the insert so the pop sees this weight. */
@@ -1460,7 +1489,7 @@ static __noinline int inf_requeue_task(struct task_struct *p, task_ctx *tctx,
 		w = inf_task_weight(p);
 	if (!w)
 		w = 1;
-	q   = inf_quantum(w, READ_ONCE(cctx->w_sum) + w);
+	q   = inf_quantum(w, READ_ONCE(cctx->w_sum) + w, tctx->idle);
 	key = inf_tail_key(cctx);
 
 	inf_queue_charge(cctx, w);
@@ -1501,7 +1530,8 @@ static __noinline int inf_requeue_task(struct task_struct *p, task_ctx *tctx,
  * task is gone, exiting or pending a dequeue is dropped, never run. A
  * task that cannot run on this CPU is requeued on a CPU its mask allows.
  */
-static __noinline bool inf_dispatch_local(s32 cpu, struct inf_cpu_ctx *cctx)
+static __noinline bool inf_dispatch_local(s32 cpu, struct inf_cpu_ctx *cctx,
+					  struct task_struct *prev)
 {
 	inf_queue_t	   *queue = inf_queue(cpu);
 	inf_queue_node_t   *node;
@@ -1518,9 +1548,9 @@ static __noinline bool inf_dispatch_local(s32 cpu, struct inf_cpu_ctx *cctx)
 	if (!nodep)
 		return false;
 
-	node = (inf_queue_node_t *)nodep;
-	tctx = inf_task_from_qnode(node);
-	w    = tctx->weight ? tctx->weight : 1;
+	node	= (inf_queue_node_t *)nodep;
+	tctx	= inf_task_from_qnode(node);
+	w	= tctx->weight ? tctx->weight : 1;
 
 	/*
 	 * Publish the cleared membership before the charge drops, so a
@@ -1578,8 +1608,11 @@ static __noinline bool inf_dispatch_local(s32 cpu, struct inf_cpu_ctx *cctx)
 			return false;
 		}
 
-		q	       = inf_quantum(w, READ_ONCE(cctx->w_sum) + w);
+		q = inf_quantum(w, READ_ONCE(cctx->w_sum) + w +
+					READ_ONCE(cctx->run_w),
+				tctx->idle);
 		tctx->slice_ns = q;
+		inf_running_set(cctx, tctx, w);
 		scx_bpf_task_set_slice(p, q);
 		handed = scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, q, 0);
 		inf_trace(INF_TR_EXIT_PASS, tctx, INF_TR_WHERE(cpu, cpu),
@@ -1633,13 +1666,31 @@ static __noinline bool inf_dispatch_local(s32 cpu, struct inf_cpu_ctx *cctx)
 		tctx->weight = w;
 	}
 
-	/* The task is out of the queue, so the remaining weight normalizes. */
-	q		       = inf_quantum(w, READ_ONCE(cctx->w_sum) + w);
+	/*
+	 * The task is out of the queue, so the remaining weight normalizes.
+	 * The task that is still running on this CPU stays runnable and is
+	 * not charged in w_sum, so its weight joins the normalizer here;
+	 * without it one queued competitor gave every task the base quantum.
+	 */
+	q = inf_quantum(w, READ_ONCE(cctx->w_sum) + w +
+				    READ_ONCE(cctx->run_w),
+				    tctx->idle);
 	tctx->queued_cpu       = -1;
 	tctx->state	       = INF_TASK_DISPATCHED;
 	tctx->slice_ns	       = q;
 	tctx->reweight_pending = 0;
 
+	{
+		struct inf_stats *st = inf_stats();
+		u64 total = READ_ONCE(cctx->w_sum) + w;
+
+		if (st) {
+			__sync_fetch_and_add(&st->disp_pop, 1);
+			__sync_fetch_and_add(&st->disp_total, total);
+			__sync_fetch_and_add(&st->disp_q, q);
+		}
+	}
+	inf_running_set(cctx, tctx, w);
 	scx_bpf_task_set_slice(p, q);
 	if (inject_dsq_refusal) {
 		struct inf_test_ctl *tc;
@@ -1751,8 +1802,9 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 			return false;
 		}
 
-		q	       = inf_quantum(w, READ_ONCE(dcctx->w_sum) + w);
+		q = inf_quantum(w, READ_ONCE(dcctx->w_sum) + w, tctx->idle);
 		tctx->slice_ns = q;
+		inf_running_set(dcctx, tctx, w);
 		scx_bpf_task_set_slice(p, q);
 		handed = scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, q, 0);
 		inf_trace(INF_TR_EXIT_PASS, tctx, INF_TR_WHERE(peer, dst),
@@ -1807,10 +1859,11 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 		tctx->weight = w;
 	}
 
-	tctx->state    = INF_TASK_DISPATCHED;
-	q	       = inf_quantum(w, READ_ONCE(dcctx->w_sum) + w);
+	tctx->state = INF_TASK_DISPATCHED;
+	q	    = inf_quantum(w, READ_ONCE(dcctx->w_sum) + w, tctx->idle);
 	tctx->slice_ns = q;
 
+	inf_running_set(dcctx, tctx, w);
 	scx_bpf_task_set_slice(p, q);
 	if (!scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, q, 0)) {
 		/*
@@ -1918,7 +1971,7 @@ void BPF_STRUCT_OPS(infinity_dispatch, s32 cpu, struct task_struct *prev)
 	if (inf_cpu_bw_enabled())
 		scx_cgroup_ctl_reenqueue();
 
-	if (inf_dispatch_local(cpu, cctx))
+	if (inf_dispatch_local(cpu, cctx, prev))
 		return;
 
 	lt = inf_cpu_topo(cpu);
@@ -1939,8 +1992,14 @@ void BPF_STRUCT_OPS(infinity_dispatch, s32 cpu, struct task_struct *prev)
 	if (prev && !READ_ONCE(prev->scx.slice)) {
 		tctx = inf_task_ctx(prev);
 		w = tctx && tctx->weight ? tctx->weight : inf_task_weight(prev);
-		q = inf_quantum(w, READ_ONCE(cctx->w_sum) + w);
+		q = inf_quantum(w, READ_ONCE(cctx->w_sum) + w,
+				tctx ? tctx->idle : false);
+		inf_running_set(cctx, tctx, w);
+		INF_STAT_INC(disp_renew);
 		scx_bpf_task_set_slice(prev, q);
+	} else {
+		WRITE_ONCE(cctx->run_w, 0);
+		WRITE_ONCE(cctx->run_pid, 0);
 	}
 
 	inf_trace(INF_TR_DISPATCH_EMPTY, tctx, INF_TR_WHERE(cpu, -1),
@@ -2077,10 +2136,16 @@ void BPF_STRUCT_OPS(infinity_dequeue, struct task_struct *p, u64 deq_flags)
 	 * property change ends the runnable period. A custody-only dequeue
 	 * keeps the state the dispatch or running hook set.
 	 */
-	if (core_exec)
+	if (core_exec) {
 		tctx->state = INF_TASK_RUNNING;
-	else if (ended && tctx->state != INF_TASK_EXITING)
-		tctx->state = INF_TASK_IDLE;
+	} else if (ended) {
+		struct inf_cpu_ctx *cc = inf_cpu_ctx(scx_bpf_task_cpu(p));
+
+		if (cc)
+			inf_running_clear(cc, tctx);
+		if (tctx->state != INF_TASK_EXITING)
+			tctx->state = INF_TASK_IDLE;
+	}
 }
 
 /*
@@ -2124,6 +2189,12 @@ void BPF_STRUCT_OPS(infinity_quiescent, struct task_struct *p, u64 deq_flags)
 	scx_cgroup_ctl_leave(p, tctx->group_cpu, tctx->base_weight);
 	tctx->joined	= 0;
 	tctx->group_cpu = -1;
+	{
+		struct inf_cpu_ctx *cc = inf_cpu_ctx(scx_bpf_task_cpu(p));
+
+		if (cc)
+			inf_running_clear(cc, tctx);
+	}
 	if (tctx->state != INF_TASK_EXITING && tctx->state != INF_TASK_QUEUED)
 		tctx->state = INF_TASK_IDLE;
 }
@@ -2172,7 +2243,17 @@ void BPF_STRUCT_OPS(infinity_set_weight, struct task_struct *p, u32 weight)
 		new = inf_reweight(new_base, tctx->group_scale, tctx->idle);
 	}
 	tctx->weight   = new;
-	tctx->slice_ns = inf_quantum(new, new);
+	tctx->slice_ns = inf_quantum(new, new, tctx->idle);
+	{
+		/*
+		 * A running task is not in w_sum, so its normalizer entry
+		 * has to follow a nice-weight change here.
+		 */
+		struct inf_cpu_ctx *cc = inf_cpu_ctx(scx_bpf_task_cpu(p));
+
+		if (cc && READ_ONCE(cc->run_pid) == tctx->pid)
+			WRITE_ONCE(cc->run_w, new);
+	}
 
 	if (tctx->joined)
 		scx_cgroup_ctl_reweight(p, tctx->group_cpu, old_base, new_base);
@@ -2235,7 +2316,8 @@ void BPF_STRUCT_OPS(infinity_set_weight, struct task_struct *p, u32 weight)
 	seq  = __sync_fetch_and_add(&cctx->seq, 1);
 	head = !(seq == (u32)-1 || (seq & INF_GATE_MASK) == INF_GATE_MASK);
 	key  = head ? inf_head_key(cctx) : inf_tail_key(cctx);
-	tctx->slice_ns = inf_quantum(new, READ_ONCE(cctx->w_sum) + new);
+	tctx->slice_ns =
+		inf_quantum(new, READ_ONCE(cctx->w_sum) + new, tctx->idle);
 
 	inf_queue_charge(cctx, new);
 	ret = inf_queue_insert(queue, node, key, tctx->slice_ns);

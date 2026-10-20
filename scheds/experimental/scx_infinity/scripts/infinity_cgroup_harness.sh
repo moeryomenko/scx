@@ -209,6 +209,12 @@ setup_cgroups() {
 }
 
 reset_groups() {
+    # Clear cpu.idle first: this kernel rejects a cpu.weight write with
+    # EINVAL while the group is idle, because the idle weight overrides
+    # cpu.weight. Writing the weight first would leave group b at the
+    # weight the previous case left behind.
+    cgroup_write "$CG_A" cpu.idle 0 || return 1
+    cgroup_write "$CG_B" cpu.idle 0 || return 1
     cgroup_write "$CG_A" cpu.weight 100 || {
         record FAIL cgroup "cannot set cpu.weight of group a"
         return 1
@@ -227,8 +233,6 @@ reset_groups() {
     }
     cgroup_write "$CG_A" cpu.max.burst 0 || return 1
     cgroup_write "$CG_B" cpu.max.burst 0 || return 1
-    cgroup_write "$CG_A" cpu.idle 0 || return 1
-    cgroup_write "$CG_B" cpu.idle 0 || return 1
 }
 
 start_burn() {
@@ -320,7 +324,7 @@ run_weight_trial() {
         return
     fi
     stop_pair
-    read -r ua ub <<<"$pair"
+    read_pair "$pair" ua ub
     ratio=$(fp_ratio "$ua" "$ub")
     if num_in_range "$ratio" 1.8 2.2; then
         status=PASS
@@ -355,7 +359,7 @@ run_live_trial() {
         record FAIL live_weight "trial $trial cannot read cpu.stat usage_usec"
         return
     fi
-    read -r a1 b1 <<<"$pair1"
+    read_pair "$pair1" a1 b1
     cgroup_write "$CG_B" cpu.weight 200 || {
         stop_pair
         record FAIL live_weight "trial $trial cannot change the live weight"
@@ -372,7 +376,7 @@ run_live_trial() {
         return
     fi
     stop_pair
-    read -r a2 b2 <<<"$pair2"
+    read_pair "$pair2" a2 b2
     ratio1=$(fp_ratio "$a1" "$b1")
     ratio2=$(fp_ratio "$a2" "$b2")
     if num_in_range "$ratio1" 0.85 1.15 && num_in_range "$ratio2" 1.8 2.2; then
@@ -415,7 +419,7 @@ run_idle_trial() {
         record FAIL cpu_idle "trial $trial cannot read cpu.stat"
         return
     fi
-    read -r a b <<<"$pair"
+    read_pair "$pair" a b
     on1=$(fp_scale "$b" "$((a + b))")
 
     cgroup_write "$CG_B" cpu.idle 0 || {
@@ -429,7 +433,7 @@ run_idle_trial() {
         record FAIL cpu_idle "trial $trial cannot read the non-idle window"
         return
     fi
-    read -r a b <<<"$pair"
+    read_pair "$pair" a b
     off=$(fp_scale "$b" "$((a + b))")
 
     cgroup_write "$CG_B" cpu.idle 1 || {
@@ -443,7 +447,7 @@ run_idle_trial() {
         record FAIL cpu_idle "trial $trial cannot read the second idle window"
         return
     fi
-    read -r a b <<<"$pair"
+    read_pair "$pair" a b
     on2=$(fp_scale "$b" "$((a + b))")
 
     # The normal worker stops, so the idle worker must make progress.

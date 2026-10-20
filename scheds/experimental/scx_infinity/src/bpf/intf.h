@@ -184,10 +184,15 @@ struct inf_cpu_ctx {
 	u64 head_seq;
 	u64 tail_seq;
 	u64 w_sum;
+	/* Weight of the task this CPU dispatched last, read by the next
+	 * dispatch to normalize against the still-running task. */
+	u64 run_w;
 	s64 depth;
 	u32 seq;
 	u32 steal_llc_cursor;
 	u32 steal_node_cursor;
+	/* Task in this CPU's local DSQ, and its stored weight. */
+	s32 run_pid;
 	u32 pad;
 };
 
@@ -298,6 +303,11 @@ struct inf_stats {
 	u64 enq_no_cctx;
 	u64 stale_requeues;
 	u64 stale_skips;
+	/* Dispatch outcome and normalizer, for the share diagnosis. */
+	u64 disp_pop;
+	u64 disp_renew;
+	u64 disp_total;
+	u64 disp_q;
 };
 
 /*
