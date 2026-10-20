@@ -214,6 +214,8 @@ pub struct Stats {
     pub reweight_moves: u64,
     pub stale_pops: u64,
     pub lost_state_errors: u64,
+    pub dsq_refusals: u64,
+    pub requeues: u64,
 }
 
 /// A small scheduler: one queue per CPU, the gate and key runs, the
@@ -383,6 +385,60 @@ impl<Q: IntrusiveQueue + Default> Model<Q> {
             }
         }
         Some(item)
+    }
+
+    /// Put a task that a dispatch just popped back at the tail. The BPF
+    /// fallback uses this when the core refuses a local DSQ insert.
+    pub fn requeue_tail(&mut self, cpu: usize, id: u64) {
+        let (weight, slice) = self
+            .tasks
+            .get(&id)
+            .map(|task| (task.weight, task.slice))
+            .unwrap_or((100, 1));
+
+        let key = self.tail_key(cpu);
+        let item = Item {
+            id,
+            key,
+            weight,
+            slice,
+        };
+        if !self.queues[cpu].insert(item, Position::Tail) {
+            self.stats.lost_state_errors += 1;
+            return;
+        }
+        self.w_sum[cpu] += weight as i64;
+        self.depth[cpu] += 1;
+        if let Some(task) = self.tasks.get_mut(&id) {
+            task.state = TaskState::Queued;
+            task.queued_cpu = Some(cpu);
+        }
+        self.stats.requeues += 1;
+    }
+
+    /// Model one dispatch decision. A refused local DSQ insert requeues the
+    /// task at the tail and leaves it runnable; it is never dropped.
+    pub fn dispatch(&mut self, cpu: usize, refuse_local_insert: bool) -> Option<u64> {
+        let item = self.queues[cpu].pop()?;
+        self.w_sum[cpu] -= item.weight as i64;
+        self.depth[cpu] -= 1;
+
+        if !self.tasks.contains_key(&item.id) {
+            self.stats.stale_pops += 1;
+            return None;
+        }
+
+        if refuse_local_insert {
+            self.stats.dsq_refusals += 1;
+            self.requeue_tail(cpu, item.id);
+            return None;
+        }
+
+        if let Some(task) = self.tasks.get_mut(&item.id) {
+            task.state = TaskState::Running;
+            task.queued_cpu = None;
+        }
+        Some(item.id)
     }
 
     pub fn rank(&self, cpu: usize, id: u64) -> Option<usize> {
@@ -767,6 +823,38 @@ mod tests {
         assert!(!model.tasks.contains_key(&1));
     }
 
+    fn refused_local_dsq_insert<Q: IntrusiveQueue + Default>() {
+        let mut model = one_cpu::<Q>();
+        for id in 1..=3 {
+            model.add_task(id, 100, vec![0]);
+            model.enqueue(id, 0, true, false, false, false, false);
+        }
+        assert_eq!(model.w_sum[0], 300);
+        assert_eq!(model.depth[0], 3);
+
+        /* The first dispatch pops 3 and the core refuses the local insert. */
+        assert_eq!(model.dispatch(0, true), None);
+        assert_eq!(model.stats.dsq_refusals, 1);
+        assert_eq!(model.stats.requeues, 1);
+        assert_eq!(model.stats.lost_state_errors, 0);
+        assert_eq!(model.w_sum[0], 300);
+        assert_eq!(model.depth[0], 3);
+        assert_eq!(model.tasks[&3].state, TaskState::Queued);
+        assert_eq!(model.tasks[&3].queued_cpu, Some(0));
+        /* 3 went to the tail; the remaining heads run first. */
+        assert_eq!(model.rank(0, 3), Some(2));
+
+        /* The task is not lost: every task still runs exactly once. */
+        let mut ran = Vec::new();
+        while let Some(id) = model.dispatch(0, false) {
+            ran.push(id);
+        }
+        assert_eq!(ran, vec![2, 1, 3]);
+        assert_eq!(model.stats.lost_state_errors, 0);
+        assert_eq!(model.w_sum[0], 0);
+        assert_eq!(model.depth[0], 0);
+    }
+
     macro_rules! both_queues {
         ($name:ident, $body:ident) => {
             #[test]
@@ -785,4 +873,8 @@ mod tests {
     both_queues!(both_queues_steal_from_peers, peer_steal);
     both_queues!(both_queues_drop_a_stale_pop, stale_pop);
     both_queues!(both_queues_hold_a_task_across_exit, task_lifetime);
+    both_queues!(
+        both_queues_requeue_a_refused_local_insert,
+        refused_local_dsq_insert
+    );
 }

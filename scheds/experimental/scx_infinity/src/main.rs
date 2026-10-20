@@ -109,6 +109,16 @@ struct Opts {
     /// Print scheduler version and exit.
     #[clap(short = 'V', long, action = clap::ArgAction::SetTrue)]
     version: bool,
+
+    /// Diagnostic: record queue transitions and dump the queue and task
+    /// snapshots when the scheduler exits. The trace is off by default.
+    #[clap(long, action = clap::ArgAction::SetTrue)]
+    trace: bool,
+
+    /// Diagnostic: refuse this many local DSQ inserts to exercise the
+    /// requeue fallback. Requires --trace for the transition records.
+    #[clap(long, value_name = "N", hide = true)]
+    test_dsq_refuse: Option<u64>,
 }
 
 impl Opts {
@@ -158,6 +168,49 @@ fn write_config(skel: &mut BpfSkel<'_>, config: &LiveConfig, generation: u32) ->
         .context("failed to publish the live configuration")
 }
 
+/// Read one fixed-size map value into a plain C-layout struct.
+fn read_map_value<T: Copy, M: MapCore>(map: &M, key: &[u8]) -> Option<T> {
+    let bytes = map.lookup(key, libbpf_rs::MapFlags::ANY).ok().flatten()?;
+    if bytes.len() < std::mem::size_of::<T>() {
+        return None;
+    }
+    /* SAFETY: the length is checked and T is a plain C-layout struct. */
+    Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const T) })
+}
+
+/// Name of one trace operation, from `intf.h`.
+fn trace_op_name(op: u32) -> &'static str {
+    match op {
+        bpf_intf::INF_TR_ENQ_PARK => "enq_park",
+        bpf_intf::INF_TR_ENQ_STALE => "enq_stale",
+        bpf_intf::INF_TR_ENQ_INSERT_FAIL => "enq_insert_fail",
+        bpf_intf::INF_TR_INSERT => "insert",
+        bpf_intf::INF_TR_DEQ_QUEUED => "deq_queued",
+        bpf_intf::INF_TR_DEQ_PENDING => "deq_pending",
+        bpf_intf::INF_TR_DEQ_REMOVE_FAIL => "deq_remove_fail",
+        bpf_intf::INF_TR_DEQ_END => "deq_end",
+        bpf_intf::INF_TR_POP => "pop",
+        bpf_intf::INF_TR_POP_STALE => "pop_stale",
+        bpf_intf::INF_TR_POP_AFFINITY => "pop_affinity",
+        bpf_intf::INF_TR_POP_PENDING => "pop_pending",
+        bpf_intf::INF_TR_DSQ_OK => "dsq_ok",
+        bpf_intf::INF_TR_DSQ_REFUSED => "dsq_refused",
+        bpf_intf::INF_TR_REQUEUE => "requeue",
+        bpf_intf::INF_TR_REQUEUE_FAIL => "requeue_fail",
+        bpf_intf::INF_TR_STEAL => "steal",
+        bpf_intf::INF_TR_STEAL_SKIP => "steal_skip",
+        bpf_intf::INF_TR_REMOVE => "remove",
+        bpf_intf::INF_TR_REMOVE_FAIL => "remove_fail",
+        bpf_intf::INF_TR_YIELD_TO => "yield_to",
+        bpf_intf::INF_TR_REWEIGHT => "reweight",
+        bpf_intf::INF_TR_EXIT => "exit",
+        bpf_intf::INF_TR_SET_WEIGHT => "set_weight",
+        bpf_intf::INF_TR_DISPATCH_EMPTY => "dispatch_empty",
+        bpf_intf::INF_TR_EXIT_PASS => "exit_pass",
+        _ => "unknown",
+    }
+}
+
 struct Scheduler<'a> {
     skel: BpfSkel<'a>,
     struct_ops: Option<libbpf_rs::Link>,
@@ -165,6 +218,7 @@ struct Scheduler<'a> {
     overrides: Overrides,
     live: LiveConfig,
     generation: u32,
+    trace: bool,
     /* Kept alive for as long as the scheduler uses the arena. */
     _arenalib: ArenaLib,
 }
@@ -229,6 +283,11 @@ impl<'a> Scheduler<'a> {
             .try_into()
             .context("CPU count does not fit in u32")?;
         rodata.enable_cpu_bw = cpu_bw;
+        rodata.enable_trace = opts.trace;
+        rodata.inject_dsq_refusal = opts.test_dsq_refuse.is_some();
+        if opts.trace {
+            info!("Diagnostic trace enabled");
+        }
         if cpu_bw {
             /*
              * Match the map sizes set above and keep the built-in idle
@@ -254,6 +313,26 @@ impl<'a> Scheduler<'a> {
         write_config(&mut skel, &live, 1)?;
         let struct_ops = Some(scx_ops_attach!(skel, infinity_ops)?);
 
+        /*
+         * Arm the controlled-refusal counter after attach. The flag is a
+         * rodata boolean, so a run without the option never reads the map.
+         */
+        if let Some(count) = opts.test_dsq_refuse {
+            let value = bpf_intf::inf_test_ctl { dsq_refuse: count };
+            /* SAFETY: the value is a plain C-layout struct and its length is exact. */
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::addr_of!(value) as *const u8,
+                    std::mem::size_of::<bpf_intf::inf_test_ctl>(),
+                )
+            };
+            skel.maps
+                .test_stor
+                .update(&0u32.to_ne_bytes(), bytes, libbpf_rs::MapFlags::ANY)
+                .context("failed to arm the DSQ refusal injection")?;
+            info!("Controlled DSQ refusal armed for {count} inserts");
+        }
+
         info!("Infinity configuration: {}", describe(&live));
 
         Ok(Self {
@@ -263,8 +342,146 @@ impl<'a> Scheduler<'a> {
             overrides: opts.overrides(),
             live,
             generation: 1,
+            trace: opts.trace,
             _arenalib: arenalib,
         })
+    }
+
+    /// Print the diagnostic trace, the per-CPU queue snapshot and the task
+    /// snapshot written by the BPF exit hook. A run without `--trace` prints
+    /// nothing.
+    fn dump_diagnostics(&self) {
+        if !self.trace {
+            return;
+        }
+
+        const TRACE_PRINT_MAX: u64 = 16384;
+        let key = 0u32.to_ne_bytes();
+        let Some(ctl) =
+            read_map_value::<bpf_intf::inf_trace_ctl, _>(&self.skel.maps.trace_ctl_stor, &key)
+        else {
+            error!("diagnostics: the trace control entry is missing");
+            return;
+        };
+
+        let cap = u64::from(ctl.cap);
+        let kept = ctl.next.min(cap);
+        let start = ctl.next.saturating_sub(TRACE_PRINT_MAX);
+        info!(
+            "diagnostics: enabled={} cap={} transitions={} ringed={} kept={} overwritten={} task_overflow={} printed={}",
+            ctl.enabled,
+            cap,
+            ctl.total,
+            ctl.next,
+            kept,
+            ctl.overwritten,
+            ctl.task_overflow,
+            ctl.next.saturating_sub(start)
+        );
+
+        for cpu in 0..*NR_CPU_IDS {
+            let key = (cpu as u32).to_ne_bytes();
+            let Some(qs) =
+                read_map_value::<bpf_intf::inf_queue_snap, _>(&self.skel.maps.qsnap_stor, &key)
+            else {
+                continue;
+            };
+            info!(
+                "infq: cpu={} depth={} w_sum={} head_pid={} head_state={} head_cpu={} head_gcpu={} head_hold={} head_slice={} head_weight={} head_key={} head_kflags=0x{:x} head_ops_state={} head_runnable_cpu={}",
+                qs.cpu,
+                qs.depth,
+                qs.w_sum,
+                qs.head_pid,
+                qs.head_state,
+                qs.head_cpu,
+                qs.head_group_cpu,
+                qs.head_hold,
+                qs.head_slice,
+                qs.head_weight,
+                qs.head_key,
+                qs.head_kflags,
+                qs.head_ops_state,
+                qs.head_runnable_cpu
+            );
+        }
+
+        let mut tasks = 0u32;
+        for k in self.skel.maps.tsnap_stor.keys() {
+            let Some(ts) =
+                read_map_value::<bpf_intf::inf_task_snap, _>(&self.skel.maps.tsnap_stor, &k)
+            else {
+                continue;
+            };
+            tasks += 1;
+            info!(
+                "inftask: pid={} state={} queued_cpu={} group_cpu={} hold={} slice={} weight={} joined={} moving={} reweight_pending={} dequeue_pending={} exit_pending={} last_op={} src={} dst={} result={} ts={} prev_op={} prev_state={} prev_src={} prev_dst={} prev_result={} prev_ts={}",
+                ts.pid,
+                ts.state,
+                ts.queued_cpu,
+                ts.group_cpu,
+                ts.hold,
+                ts.slice,
+                ts.weight,
+                ts.joined,
+                ts.moving,
+                ts.reweight_pending,
+                ts.dequeue_pending,
+                ts.exit_pending,
+                trace_op_name(ts.last_op),
+                ts.last_src,
+                ts.last_dst,
+                ts.last_result,
+                ts.ts,
+                trace_op_name(ts.prev_op),
+                ts.prev_state,
+                ts.prev_src,
+                ts.prev_dst,
+                ts.prev_result,
+                ts.prev_ts
+            );
+
+            let count = usize::min(ts.hist_count as usize, ts.hist.len());
+            let mut hist = String::new();
+            for slot in &ts.hist[..count] {
+                if !hist.is_empty() {
+                    hist.push(';');
+                }
+                hist.push_str(&format!(
+                    "{},{},{},{},{}",
+                    trace_op_name(slot.op),
+                    slot.src,
+                    slot.dst,
+                    slot.result,
+                    slot.state
+                ));
+            }
+            info!("infhist: pid={} count={} {}", ts.pid, count, hist);
+        }
+        info!("diagnostics: task snapshots printed={tasks}");
+
+        for seq in start..ctl.next {
+            let slot = (seq % cap.max(1)) as u32;
+            let Some(rec) = read_map_value::<bpf_intf::inf_trace_rec, _>(
+                &self.skel.maps.trace_stor,
+                &slot.to_ne_bytes(),
+            ) else {
+                continue;
+            };
+            info!(
+                "inftr: seq={} op={} pid={} src={} dst={} state={} hold={} group_cpu={} slice={} result={} ts={}",
+                rec.seq,
+                trace_op_name(rec.op),
+                rec.pid,
+                rec.src_cpu,
+                rec.dst_cpu,
+                rec.state,
+                rec.hold,
+                rec.group_cpu,
+                rec.slice,
+                rec.result,
+                rec.ts
+            );
+        }
     }
 
     fn exited(&self) -> bool {
@@ -334,6 +551,11 @@ impl<'a> Scheduler<'a> {
         let mut weight_changes = 0u64;
         let mut reweight_queued = 0u64;
         let mut weight_queued_cpu = 0u64;
+        let mut exit_passes = 0u64;
+        let mut enq_no_ctx = 0u64;
+        let mut enq_no_cctx = 0u64;
+        let mut stale_requeues = 0u64;
+        let mut stale_skips = 0u64;
 
         let key = 0u32.to_ne_bytes();
         if let Ok(Some(rows)) = self
@@ -388,6 +610,11 @@ impl<'a> Scheduler<'a> {
                 weight_changes += stats.weight_changes;
                 reweight_queued += stats.reweight_queued;
                 weight_queued_cpu += stats.weight_queued_cpu;
+                exit_passes += stats.exit_passes;
+                enq_no_ctx += stats.enq_no_ctx;
+                enq_no_cctx += stats.enq_no_cctx;
+                stale_requeues += stats.stale_requeues;
+                stale_skips += stats.stale_skips;
             }
         }
 
@@ -470,8 +697,20 @@ impl<'a> Scheduler<'a> {
              reweight={reweight_moves} stale={stale_pops} \
              lost={lost_state_errors} requeues={requeues} \
              weight_changes={weight_changes} queued={reweight_queued} \
-             queued_cpu={weight_queued_cpu}"
+             queued_cpu={weight_queued_cpu} exit_passes={exit_passes} \
+             no_ctx={enq_no_ctx} no_cctx={enq_no_cctx} \
+             stale_requeues={stale_requeues} stale_skips={stale_skips}"
         );
+
+        if self.trace
+            && let Some(ctl) =
+                read_map_value::<bpf_intf::inf_trace_ctl, _>(&self.skel.maps.trace_ctl_stor, &key)
+        {
+            info!(
+                "trace: transitions={} ringed={} cap={} overwritten={} task_overflow={}",
+                ctl.total, ctl.next, ctl.cap, ctl.overwritten, ctl.task_overflow
+            );
+        }
     }
 
     fn run(
@@ -496,6 +735,7 @@ impl<'a> Scheduler<'a> {
         }
 
         let _ = self.struct_ops.take();
+        self.dump_diagnostics();
         uei_report!(&self.skel, uei)
     }
 }
@@ -614,6 +854,19 @@ mod tests {
         assert!(overrides.no_smt);
         assert_eq!(overrides.spill_threshold, Some(8));
         assert_eq!(overrides.preempt_margin_us, Some(250));
+    }
+
+    #[test]
+    fn cli_parses_the_diagnostic_flags() {
+        let opts =
+            Opts::try_parse_from(["scx_infinity", "--trace", "--test-dsq-refuse", "4"]).unwrap();
+
+        assert!(opts.trace);
+        assert_eq!(opts.test_dsq_refuse, Some(4));
+
+        let default = Opts::try_parse_from(["scx_infinity"]).unwrap();
+        assert!(!default.trace);
+        assert_eq!(default.test_dsq_refuse, None);
     }
 
     #[test]

@@ -49,6 +49,21 @@ static long long now_ms(void)
 	return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
 }
 
+/* CPU time this process consumed, for the progress record. */
+static long long cpu_ms(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) != 0)
+		return 0;
+	return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
+static void print_done(const char *mode, unsigned long long work)
+{
+	printf("mode=%s done=1 cpu_ms=%lld work=%llu\n", mode, cpu_ms(), work);
+}
+
 static void sleep_ms(long milliseconds)
 {
 	struct timespec ts = {
@@ -125,6 +140,7 @@ static int cmd_burn(double seconds)
 	/* Keep the compiler from removing the loop. */
 	if (count == 0)
 		return 1;
+	print_done("burn", count);
 	return 0;
 }
 
@@ -134,6 +150,7 @@ static int cmd_sleeper(double seconds)
 
 	while (now_ms() < end)
 		sleep_ms(1);
+	print_done("sleeper", 0);
 	return 0;
 }
 
@@ -155,6 +172,7 @@ static int cmd_forkexec(double seconds)
 				;
 		}
 	}
+	print_done("forkexec", 0);
 	return 0;
 }
 
@@ -167,7 +185,7 @@ static int cmd_yield(double seconds)
 		sched_yield();
 		calls++;
 	}
-	printf("yields=%llu\n", calls);
+	printf("yields=%llu done=1 cpu_ms=%lld\n", calls, cpu_ms());
 	return 0;
 }
 
@@ -202,7 +220,7 @@ static int cmd_migrate(double seconds)
 			migrations++;
 		sleep_ms(1);
 	}
-	printf("migrations=%llu\n", migrations);
+	printf("migrations=%llu done=1 cpu_ms=%lld\n", migrations, cpu_ms());
 	return 0;
 }
 
@@ -260,9 +278,9 @@ static int cmd_probe(double seconds, const char *mask, bool broaden)
 		}
 		sleep_ms(1);
 	}
-	printf("samples=%lld out_of_mask=%lld first_cpu=%d min_cpu=%d max_cpu=%d distinct=%s\n",
+	printf("samples=%lld out_of_mask=%lld first_cpu=%d min_cpu=%d max_cpu=%d distinct=%s done=1 cpu_ms=%lld\n",
 	       samples, out_of_mask, first_cpu, min_cpu, max_cpu,
-	       used == 0 ? "none" : distinct);
+	       used == 0 ? "none" : distinct, cpu_ms());
 	return 0;
 }
 

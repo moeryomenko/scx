@@ -53,18 +53,31 @@ WORKLOAD=""
 CGROUP_PARENT=""
 CG_STRESS=""
 DMESG_BASELINE=0
+TRACE=0
+DSQ_REFUSE=""
+MIXED=0
+DUMP_DIR=""
+SCHED_EXTRA=()
 
 usage() {
     cat >&2 <<'EOF'
 usage: infinity_queue_stress.sh [--duration SEC] [--workers N]
        [--scheduler PATH] [--out FILE] [--yield-to-cmd CMD] [--check]
+       [--mixed] [--trace] [--test-dsq-refuse N] [--dump-dir DIR]
 
-  --duration SEC     seconds per phase, default 8
+  --duration SEC     seconds per phase, or the whole mixed campaign with --mixed
   --workers N        worker count, default one per online CPU
   --scheduler PATH   scx_infinity binary, default SCX_INFINITY_BIN or target/
   --out FILE         also append the JSON Lines records to FILE
   --yield-to-cmd CMD run CMD as the directed-yield source, for example a KVM
                      workload; without it the yield-to check is BLOCKED
+  --mixed            run every workload class at once for --duration instead
+                     of the serial phases: the ten-minute stall campaign
+  --trace            load the scheduler with its diagnostic transition trace
+  --test-dsq-refuse N
+                     arm N controlled local DSQ insert refusals, so the
+                     requeue fallback runs without a kernel refusal
+  --dump-dir DIR     copy the scheduler log, dmesg and every worker log to DIR
   --check            verify preconditions only, start nothing
 EOF
 }
@@ -89,6 +102,20 @@ while (($#)); do
             ;;
         --yield-to-cmd)
             YIELD_TO_CMD=${2:?}
+            shift
+            ;;
+        --mixed)
+            MIXED=1
+            ;;
+        --trace)
+            TRACE=1
+            ;;
+        --test-dsq-refuse)
+            DSQ_REFUSE=${2:?}
+            shift
+            ;;
+        --dump-dir)
+            DUMP_DIR=${2:?}
             shift
             ;;
         --check)
@@ -520,6 +547,180 @@ phase_yieldto() {
     record PASS yieldto "the scheduler moved $((after - before)) yield-to targets" "$extra"
 }
 
+#
+# The ten-minute stall campaign. Every workload class runs at once, a nice
+# change and two live cpu.weight writes land under load, and every worker
+# must report that it ran. This is the mixed load that produced the host
+# stall; the serial phases are kept for the narrower checks.
+
+phase_mixed() {
+    local -a tags=()
+    local online=""
+    local i count
+    local head0 head1 tail0 tail1 exp0 exp1 yields0 yields1
+    local changes0 changes1 refolds0 refolds1
+    local requeues0 requeues1 lost0 stale0
+    local bad=0 progress=0 value=""
+
+    online=$(cat /sys/devices/system/cpu/online 2>/dev/null || true)
+    if [[ -z "$online" ]]; then
+        record FAIL "mixed:mask" "the online CPU list is missing"
+        return
+    fi
+
+    head0=$(stat_value "$SCHED_LOG" head)
+    tail0=$(stat_value "$SCHED_LOG" tail)
+    exp0=$(stat_value "$SCHED_LOG" expiries)
+    yields0=$(stat_value "$SCHED_LOG" yields)
+    changes0=$(stat_value "$SCHED_LOG" weight_changes)
+    refolds0=$(stat_value "$SCHED_LOG" refolds)
+    requeues0=$(stat_value "$SCHED_LOG" requeues)
+    lost0=$(stat_value "$SCHED_LOG" lost)
+    stale0=$(stat_value "$SCHED_LOG" stale)
+
+    for (( i=0; i < WORKERS; i++ )); do
+        tags+=("mix_burn_${i}")
+        if ! start_worker "$CG_STRESS" "$(( i % $(nproc) ))" \
+            "$HARNESS_TMP/mix_burn_${i}.log" \
+            timeout --signal=TERM --kill-after=5s "$((DURATION + 30))s" \
+            "$WORKLOAD" burn "$DURATION" >/dev/null; then
+            record FAIL "mixed:burn" "cannot start burn worker $i"
+            stop_all_workers
+            return
+        fi
+        tags+=("mix_sleeper_${i}")
+        if ! start_worker "$CG_STRESS" "$(( i % $(nproc) ))" \
+            "$HARNESS_TMP/mix_sleeper_${i}.log" \
+            timeout --signal=TERM --kill-after=5s "$((DURATION + 30))s" \
+            "$WORKLOAD" sleeper "$DURATION" >/dev/null; then
+            record FAIL "mixed:sleeper" "cannot start sleeper $i"
+            stop_all_workers
+            return
+        fi
+        tags+=("mix_migrate_${i}")
+        if ! start_worker "$CG_STRESS" any "$HARNESS_TMP/mix_migrate_${i}.log" \
+            timeout --signal=TERM --kill-after=5s "$((DURATION + 30))s" \
+            "$WORKLOAD" migrate "$DURATION" >/dev/null; then
+            record FAIL "mixed:migrate" "cannot start migrate worker $i"
+            stop_all_workers
+            return
+        fi
+        tags+=("mix_probe_${i}")
+        if ! start_worker "$CG_STRESS" "$(( i % $(nproc) ))" \
+            "$HARNESS_TMP/mix_probe_${i}.log" \
+            timeout --signal=TERM --kill-after=5s "$((DURATION + 30))s" \
+            "$WORKLOAD" probe "$DURATION" "$online" >/dev/null; then
+            record FAIL "mixed:affinity" "cannot start affinity worker $i"
+            stop_all_workers
+            return
+        fi
+    done
+
+    count=$(( WORKERS / 2 ))
+    if (( count < 2 )); then
+        count=2
+    fi
+    for (( i=0; i < count; i++ )); do
+        tags+=("mix_forkexec_${i}")
+        if ! start_worker "$CG_STRESS" "$(( i % $(nproc) ))" \
+            "$HARNESS_TMP/mix_forkexec_${i}.log" \
+            timeout --signal=TERM --kill-after=5s "$((DURATION + 30))s" \
+            "$WORKLOAD" forkexec "$DURATION" >/dev/null; then
+            record FAIL "mixed:forkexec" "cannot start fork workload $i"
+            stop_all_workers
+            return
+        fi
+        tags+=("mix_yield_${i}")
+        if ! start_worker "$CG_STRESS" "$(( i % $(nproc) ))" \
+            "$HARNESS_TMP/mix_yield_${i}.log" \
+            timeout --signal=TERM --kill-after=5s "$((DURATION + 30))s" \
+            "$WORKLOAD" yield "$DURATION" >/dev/null; then
+            record FAIL "mixed:yield" "cannot start yield worker $i"
+            stop_all_workers
+            return
+        fi
+    done
+
+    #
+     # Live reweight under load: a nice change on a running worker, then
+     # two cpu.weight writes. Both reach the scheduler while the queues
+     # hold work.
+
+    sleep 2
+    if [[ -n "$HARNESS_LAST_PID" ]]; then
+        renice 5 -p "$HARNESS_LAST_PID" >/dev/null 2>&1 || true
+        sleep 1
+        renice 0 -p "$HARNESS_LAST_PID" >/dev/null 2>&1 || true
+    fi
+    cgroup_write "$CG_STRESS" cpu.weight 200 || true
+    sleep 1
+    cgroup_write "$CG_STRESS" cpu.weight 100 || true
+
+    if ! join_workers; then
+        record FAIL mixed "a mixed-load worker exited non-zero"
+        return
+    fi
+    check_alive mixed || return
+
+    for i in "${tags[@]}"; do
+        value=$(grep -oE 'cpu_ms=[0-9]+' "$HARNESS_TMP/${i}.log" 2>/dev/null |
+            tail -n 1 | cut -d= -f2 || true)
+        if grep -q 'done=1' "$HARNESS_TMP/${i}.log" 2>/dev/null; then
+            progress=$((progress + 1))
+        else
+            bad=$((bad + 1))
+        fi
+        if [[ -n "$value" ]] && (( value <= 0 )); then
+            bad=$((bad + 1))
+        fi
+    done
+
+    head1=$(stat_value "$SCHED_LOG" head)
+    tail1=$(stat_value "$SCHED_LOG" tail)
+    exp1=$(stat_value "$SCHED_LOG" expiries)
+    yields1=$(stat_value "$SCHED_LOG" yields)
+    changes1=$(stat_value "$SCHED_LOG" weight_changes)
+    refolds1=$(stat_value "$SCHED_LOG" refolds)
+    requeues1=$(stat_value "$SCHED_LOG" requeues)
+    lost0=$(( $(stat_value "$SCHED_LOG" lost) - lost0 ))
+    stale0=$(( $(stat_value "$SCHED_LOG" stale) - stale0 ))
+
+    value=$(printf '"workers":%d,"progress":%d,"bad_workers":%d,"head_before":%s,"head_after":%s,"tail_before":%s,"tail_after":%s,"expiries_before":%s,"expiries_after":%s,"yields_before":%s,"yields_after":%s,"weight_changes_before":%s,"weight_changes_after":%s,"refolds_before":%s,"refolds_after":%s,"requeues_before":%s,"requeues_after":%s,"lost_delta":%s,"stale_delta":%s' \
+        "${#tags[@]}" "$progress" "$bad" "$head0" "$head1" "$tail0" "$tail1" \
+        "$exp0" "$exp1" "$yields0" "$yields1" "$changes0" "$changes1" \
+        "$refolds0" "$refolds1" "$requeues0" "$requeues1" "$lost0" "$stale0")
+
+    if (( bad > 0 || progress != ${#tags[@]} )); then
+        record FAIL mixed "a mixed-load worker did not report progress" "$value"
+        return
+    fi
+    if (( head1 <= head0 )); then
+        record FAIL mixed "head_inserts did not advance" "$value"
+        return
+    fi
+    if (( exp1 <= exp0 )); then
+        record FAIL mixed "the expiry path did not run" "$value"
+        return
+    fi
+    if (( yields1 <= yields0 )); then
+        record FAIL mixed "the yield path did not run" "$value"
+        return
+    fi
+    if (( changes1 <= changes0 )); then
+        record FAIL mixed "the weight change path did not run" "$value"
+        return
+    fi
+    if (( lost0 != 0 || stale0 != 0 )); then
+        record FAIL mixed "lost=$lost0 stale=$stale0 during the campaign" "$value"
+        return
+    fi
+    if [[ -n "$DSQ_REFUSE" ]] && (( requeues1 < DSQ_REFUSE )); then
+        record FAIL mixed "the refused local insert path did not requeue" "$value"
+        return
+    fi
+    record PASS mixed "$progress of ${#tags[@]} mixed workers made progress, lost=0 stale=0" "$value"
+}
+
 phase_exit() {
     local lost=0
     local stale=0
@@ -551,6 +752,59 @@ phase_exit() {
     fi
 }
 
+#
+# Report whether the diagnostic ring lost records. A non-zero overwrite
+# count is a FAIL: the transition evidence for that run is incomplete.
+
+trace_check() {
+    local line=""
+    local overwritten=""
+    local extra=""
+
+    if (( TRACE == 0 )); then
+        record PASS trace "the diagnostic trace is off"
+        return
+    fi
+    line=$(grep -F 'diagnostics: enabled=' "$SCHED_LOG" 2>/dev/null | tail -n 1 || true)
+    if [[ -z "$line" ]]; then
+        record FAIL trace "no diagnostic summary in the scheduler log"
+        return
+    fi
+    overwritten=$(printf '%s\n' "$line" | grep -oE 'overwritten=[0-9]+' |
+        cut -d= -f2 || true)
+    extra=$(printf '%s\n' "$line" | grep -oE 'transitions=[0-9]+|ringed=[0-9]+|overwritten=[0-9]+|task_overflow=[0-9]+' |
+        paste -sd, - || true)
+    if [[ -z "$overwritten" ]]; then
+        record FAIL trace "the diagnostic summary has no overwrite count"
+        return
+    fi
+    if (( overwritten > 0 )); then
+        record FAIL trace_overflow "the trace ring overwrote $overwritten records" \
+            "\"overwritten\":$overwritten"
+        return
+    fi
+    record PASS trace "the trace ring did not overflow" "\"overwritten\":0,\"summary\":\"$(json_escape "$extra")\""
+}
+
+#
+# Copy the run artifacts out of the temporary directory before cleanup.
+
+capture_artifacts() {
+    local -r dest="$1"
+
+    if [[ -z "$dest" ]]; then
+        return 0
+    fi
+    if ! mkdir -p -- "$dest"; then
+        record FAIL artifacts "cannot create $dest"
+        return
+    fi
+    cp -f -- "$SCHED_LOG" "$dest/scheduler.log" 2>/dev/null || true
+    dmesg >"$dest/dmesg.txt" 2>/dev/null || true
+    cp -f -- "$HARNESS_TMP"/*.log "$dest/" 2>/dev/null || true
+    record PASS artifacts "$dest"
+}
+
 teardown() {
     local faults=""
 
@@ -573,6 +827,10 @@ teardown() {
 
 main() {
     harness_init queue_stress
+    # The trap runs these after stop_scheduler (pushed later) and before
+    # the temporary directory is removed (pushed first).
+    cleanup_push 'trace_check'
+    cleanup_push "capture_artifacts $(printf '%q' "$DUMP_DIR")"
     mkdir -p "$HARNESS_TMP/config"
     export XDG_CONFIG_HOME="$HARNESS_TMP/config"
     if [[ -n "$OUT" ]]; then
@@ -591,7 +849,13 @@ main() {
 
     setup_cgroup
     DMESG_BASELINE=$(dmesg_lines)
-    start_scheduler "$SCHED_BIN" "$SCHED_LOG"
+    if (( TRACE )); then
+        SCHED_EXTRA+=(--trace)
+    fi
+    if [[ -n "$DSQ_REFUSE" ]]; then
+        SCHED_EXTRA+=(--test-dsq-refuse "$DSQ_REFUSE")
+    fi
+    start_scheduler "$SCHED_BIN" "$SCHED_LOG" "${SCHED_EXTRA[@]}"
     if ! wait_for_sched_state enabled 10; then
         record FAIL scheduler "state did not become enabled"
         tail -n 5 "$SCHED_LOG" >&2 || true
@@ -599,6 +863,16 @@ main() {
     fi
     record PASS scheduler "state enabled"
     sleep 1.2
+
+    if (( MIXED )); then
+        phase_mixed
+        if [[ -n "$YIELD_TO_CMD" ]]; then
+            phase_yieldto
+        fi
+        phase_exit
+        teardown
+        return
+    fi
 
     phase_burn
     phase_sleep

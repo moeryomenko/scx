@@ -172,6 +172,7 @@ After a clean exit it reads `disabled`. A non-root run fails at load.
 scx_infinity [--config PATH] [--exit-dump-len N] [--quantum-us N]
              [--placement MODE] [--no-smt] [--spill-threshold N]
              [--preempt-margin-us N] [--no-cpu-max] [--verbose] [--version]
+             [--trace] [--test-dsq-refuse N]
 ```
 
 - `--config PATH`: read this TOML file instead of the default XDG path.
@@ -195,6 +196,15 @@ scx_infinity [--config PATH] [--exit-dump-len N] [--quantum-us N]
   same path automatically.
 - `--verbose`: enable libbpf and loader diagnostics.
 - `--version`: print the scheduler version and exit.
+- `--trace`: diagnostic only. Record queue transitions and the last eight
+  transitions of every task, and print the trace ring, the per-CPU queue
+  snapshot and the task snapshot when the scheduler exits. The trace is
+  off by default. A trace record carries the operation, the task id, the
+  source and destination CPU, the queue state, the node hold count, the
+  group CPU, the slice and the result.
+- `--test-dsq-refuse N`: diagnostic only, hidden. Refuse the first N
+  local DSQ inserts without calling the kernel, so the requeue fallback
+  runs deterministically.
 
 Run it as root. Press Ctrl-C to unregister the scheduler.
 
@@ -337,7 +347,8 @@ The median of each case follows as a `note` record.
 ```
 SCX_INFINITY_VM=1 sudo \
   scheds/experimental/scx_infinity/scripts/infinity_queue_stress.sh \
-  [--duration 8] [--workers N] [--yield-to-cmd CMD] [--out FILE]
+  [--duration 8] [--workers N] [--yield-to-cmd CMD] [--out FILE] \
+  [--mixed] [--trace] [--test-dsq-refuse N] [--dump-dir DIR]
 ```
 
 The harness loads the scheduler and runs CPU-bound workers, sleepers next
@@ -350,6 +361,24 @@ and the counters `lost` and `stale`.
 Directed yield is reachable from user space only through KVM. Without
 `--yield-to-cmd` the `yieldto` item is BLOCKED. A caller with a guest KVM
 workload passes the command that triggers the directed yield.
+
+`--mixed` runs every workload class at once for `--duration` and is the
+stall campaign: a ten-minute run (`--duration 600`) exercises CPU burn,
+sleepers, fork and exec, affinity changes, migrations, `sched_yield`, a
+nice change and two live `cpu.weight` writes together. Every worker must
+report `done=1` with non-zero CPU time, and the run fails on a stall, a
+watchdog line, a lost or stale task or a worker that did not progress.
+
+`--trace` loads the scheduler with its diagnostic transition trace. The
+trace records the anomalous queue transitions in a 65536-entry ring and
+keeps the last eight transitions of every task. The ring counts every
+overwrite in `overwritten`, and a non-zero count is a FAIL: the campaign
+cannot claim complete transition evidence. `--dump-dir DIR` copies the
+scheduler log, dmesg and every worker log out of the temporary directory,
+which is needed when a run aborts. `--test-dsq-refuse N` arms N
+controlled local-DSQ insert refusals, so the requeue fallback runs
+without a kernel refusal; the mixed phase then requires the `requeues`
+counter to reach N with `lost=0`.
 
 ### Two-node placement
 

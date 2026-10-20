@@ -93,7 +93,7 @@ typedef signed long    s64;
  * cgroup bandwidth context at offset 0 and one queue node. The loader only
  * needs the size, which a static assertion in main.bpf.c checks.
  */
-#define INF_TASK_CTX_SIZE 512
+#define INF_TASK_CTX_SIZE 640
 
 /*
  * One queue node per task. The default node is struct scx_edq_task and
@@ -205,12 +205,25 @@ struct inf_cpu_topo {
 	u32 capacity;
 	u32 core_primary;
 	u32 online;
+	u32 head_kflags;
+	s64 head_ops_state;
+	s32 head_runnable_cpu;
 	u32 pad;
 };
 
 /* NUMA distance row for one node. The key of the map entry is the node. */
 struct inf_node_topo {
 	u32 distance[INF_MAX_NODES];
+};
+
+/* One slot of the per-task transition history kept in the task context. */
+struct inf_hist {
+	u32 op;
+	s32 src;
+	s32 dst;
+	s32 result;
+	u32 state;
+	u32 pad;
 };
 
 /*
@@ -242,7 +255,8 @@ struct inf_task_ctx_layout {
 	u32 wake_fork;
 	u32 idle;
 	u32 pid;
-	u32 pad;
+	u32 hist_idx;
+	struct inf_hist hist[8];
 };
 
 struct inf_stats {
@@ -279,6 +293,130 @@ struct inf_stats {
 	u64 weight_changes;
 	u64 reweight_queued;
 	u64 weight_queued_cpu;
+	u64 exit_passes;
+	u64 enq_no_ctx;
+	u64 enq_no_cctx;
+	u64 stale_requeues;
+	u64 stale_skips;
+};
+
+/*
+ * Diagnostic trace. The trace is compiled in but disabled unless the
+ * loader sets `enable_trace` before load. It records every queue
+ * transition that can lose a runnable task, plus one task snapshot that
+ * keeps the last transition of each live task. The trace is a ring: once
+ * INF_TRACE_CAP records are written the oldest slot is overwritten and
+ * `overwritten` counts every replacement. A stall campaign reads the ring
+ * and the snapshots from the exit dump.
+ */
+#define INF_TRACE_CAP 65536
+#define INF_TASK_SNAP_MAX 65536
+
+/* One trace operation. The order is stable; the loader names each one. */
+#define INF_TR_ENQ_PARK 1
+#define INF_TR_ENQ_STALE 2
+#define INF_TR_ENQ_INSERT_FAIL 3
+#define INF_TR_INSERT 4
+#define INF_TR_DEQ_QUEUED 5
+#define INF_TR_DEQ_PENDING 6
+#define INF_TR_DEQ_REMOVE_FAIL 7
+#define INF_TR_DEQ_END 8
+#define INF_TR_POP 9
+#define INF_TR_POP_STALE 10
+#define INF_TR_POP_AFFINITY 11
+#define INF_TR_POP_PENDING 12
+#define INF_TR_DSQ_OK 13
+#define INF_TR_DSQ_REFUSED 14
+#define INF_TR_REQUEUE 15
+#define INF_TR_REQUEUE_FAIL 16
+#define INF_TR_STEAL 17
+#define INF_TR_STEAL_SKIP 18
+#define INF_TR_REMOVE 19
+#define INF_TR_REMOVE_FAIL 20
+#define INF_TR_YIELD_TO 21
+#define INF_TR_REWEIGHT 22
+#define INF_TR_EXIT 23
+#define INF_TR_SET_WEIGHT 24
+#define INF_TR_DISPATCH_EMPTY 25
+#define INF_TR_EXIT_PASS 26
+
+/* The causal fields of one queue transition. */
+struct inf_trace_rec {
+	u64 ts;
+	u64 seq; /* ring sequence number, monotone */
+	u64 slice;
+	s64 result;
+	s32 pid;
+	s32 src_cpu; /* source queue, -1 when the task had none */
+	s32 dst_cpu; /* target queue, -1 when none */
+	u32 op; /* INF_TR_* */
+	u32 state; /* enum inf_task_state at the record */
+	u32 hold; /* queue node hold count */
+	s32 group_cpu;
+};
+
+struct inf_trace_ctl {
+	u64 next; /* ring records written, including overwritten ones */
+	u64 overwritten; /* records replaced in the ring */
+	u64 task_overflow; /* task snapshots dropped when the table is full */
+	u64 total; /* all transitions seen, ringed or not */
+	u32 cap;
+	u32 enabled;
+};
+
+/* Exit-time queue snapshot, one entry per possible CPU. */
+struct inf_queue_snap {
+	u64 w_sum;
+	u64 head_slice;
+	u64 head_weight;
+	u64 head_key;
+	s64 depth;
+	s32 cpu;
+	s32 head_pid;
+	s32 head_cpu;
+	s32 head_group_cpu;
+	u32 head_state;
+	u32 head_hold;
+	u32 online;
+	u32 head_kflags;
+	s64 head_ops_state;
+	s32 head_runnable_cpu;
+	u32 pad;
+};
+
+/* Exit-time task snapshot, keyed by pid. The last transition is kept. */
+struct inf_task_snap {
+	u64 ts;
+	u64 slice;
+	u64 weight;
+	s32 pid;
+	s32 queued_cpu;
+	s32 group_cpu;
+	u32 state;
+	u32 hold;
+	u32 joined;
+	u32 moving;
+	u32 reweight_pending;
+	u32 dequeue_pending;
+	u32 exit_pending;
+	u32 last_op;
+	s32 last_src;
+	s32 last_dst;
+	s64 last_result;
+	u64 prev_ts;
+	u32 prev_op;
+	u32 prev_state;
+	s32 prev_src;
+	s32 prev_dst;
+	s64 prev_result;
+	struct inf_hist hist[8];
+	u32 hist_count;
+	u32 pad;
+};
+
+/* Controlled-refusal counter for the local DSQ insert regression test. */
+struct inf_test_ctl {
+	u64 dsq_refuse;
 };
 
 /*

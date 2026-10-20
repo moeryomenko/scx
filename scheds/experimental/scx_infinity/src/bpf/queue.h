@@ -160,3 +160,38 @@ static __always_inline u64 inf_queue_nr(inf_queue_t *queue)
 	return scx_edq_nr_queued(queue);
 #endif
 }
+
+/*
+ * Lockless head for the exit snapshot. The pointer is advisory: it may be
+ * stale if the queue changes while the dump runs, which is acceptable for a
+ * diagnostic record.
+ */
+static __always_inline inf_queue_node_t __arg_arena *
+inf_queue_first(inf_queue_t *queue)
+{
+#ifdef INF_QUEUE_LIST
+	return queue->head;
+#else
+	return (inf_queue_node_t *)queue->first;
+#endif
+}
+
+/* Current hold count, for the trace record. */
+static __always_inline u32
+inf_queue_node_hold(inf_queue_node_t __arg_arena *node)
+{
+	if (!node)
+		return 0;
+	return (u32)node->holdcnt;
+}
+
+/* The queue that owns the node, or NULL when it is unlinked. */
+static __always_inline inf_queue_t __arg_arena *
+inf_queue_node_owner(inf_queue_node_t __arg_arena *node)
+{
+#ifdef INF_QUEUE_LIST
+	return node->owner;
+#else
+	return node->edq;
+#endif
+}
