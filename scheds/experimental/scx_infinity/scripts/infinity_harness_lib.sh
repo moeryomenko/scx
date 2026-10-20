@@ -789,3 +789,626 @@ median_of() {
             }
         }'
 }
+
+# ---------------------------------------------------------------------
+# Revision-4 harness contracts.
+#
+# Everything below is additive. The cgroup harness and the serial
+# revision-3 callers keep using the helpers above unchanged.
+#
+# The stall and placement oracles read these counters from the newest
+# scheduler statistics line:
+#
+#   ticks              one ops.tick call, one service slot
+#   handoffs           completed internal handoffs
+#   handoff_max_ns     longest handoff resolution, nanoseconds
+#   handoff_overdue    handoffs that spanned more than one tick
+#   handoff_orphans    tasks left in a handoff state
+#   handoff_duplicates tasks owned by two queues at once
+#   faults_injected    injected handoff failures
+#   cgrp: throttled / cgrp: reenqueued   the quota park and refill path
+#
+# A missing key is FAIL for the oracle that needs it. It is never PASS.
+# ---------------------------------------------------------------------
+
+SCX_INFINITY_OPS_NAME_DEFAULT=scx_infinity
+SCX_HANDOFF_FAULT_KINDS=(dsq dest-insert source-remove steal hold)
+HARNESS_TRACE_ROOT=""
+HARNESS_TRACE_BUFFER_SAVED=""
+
+# The active scheduler name. The kernel exposes the struct_ops name in
+# /sys/kernel/sched_ext/root/ops while a root scheduler is loaded.
+scheduler_ops_path() {
+    printf '%s\n' /sys/kernel/sched_ext/root/ops
+}
+
+scheduler_identity() {
+    local path=""
+    local name=""
+
+    path=$(scheduler_ops_path)
+    if [[ ! -r "$path" ]]; then
+        return 1
+    fi
+    name=$(tr -d ' \n' <"$path" 2>/dev/null || true)
+    if [[ -z "$name" ]]; then
+        return 1
+    fi
+    printf '%s\n' "$name"
+}
+
+scheduler_identity_expected() {
+    printf '%s\n' "${SCX_INFINITY_OPS_NAME:-$SCX_INFINITY_OPS_NAME_DEFAULT}"
+}
+
+# Compare an active scheduler name against the expected one. Pure, so the
+# harness self-test can cover the mismatch without a loaded scheduler.
+identity_matches() {
+    local -r name="${1-}"
+    local -r expected="${2-$(scheduler_identity_expected)}"
+
+    if [[ -z "$expected" || -z "$name" ]]; then
+        return 1
+    fi
+    # The loader appends the crate version, the architecture and the
+    # profile to ops.name, so the active name is "<name>_<suffix>".
+    [[ "$name" == "$expected" || "$name" == "$expected"_* ]]
+}
+
+# Record BLOCKED when the run cannot be attributed to scx_infinity. The
+# check is BLOCKED, not FAIL: the harness refuses to judge a scheduler it
+# did not load.
+require_scheduler_identity() {
+    local want=""
+    local name=""
+    local path=""
+
+    want=$(scheduler_identity_expected)
+    path=$(scheduler_ops_path)
+    if [[ ! -r "$path" ]]; then
+        record BLOCKED scheduler_identity \
+            "$path is missing; the active scheduler cannot be identified"
+        return 1
+    fi
+    name=$(scheduler_identity || true)
+    if [[ -z "$name" ]]; then
+        record BLOCKED scheduler_identity "$path is empty"
+        return 1
+    fi
+    if ! identity_matches "$name" "$want"; then
+        record BLOCKED scheduler_identity \
+            "active scheduler is '$name', expected '$want'"
+        return 1
+    fi
+    record PASS scheduler_identity "$name"
+}
+
+wait_for_scheduler_identity() {
+    local -r want="$1"
+    local -r seconds="$2"
+    local name=""
+    local i
+
+    for (( i = 0; i < seconds * 20; i++ )); do
+        name=$(scheduler_identity || true)
+        if identity_matches "$name" "$want"; then
+            return 0
+        fi
+        sleep 0.05
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------
+# Statistics contract.
+# ---------------------------------------------------------------------
+
+# True when the newest statistics line carries the key. stat_value cannot
+# tell a missing key from a zero value, so the contract checks use this.
+stat_key_present() {
+    local -r log="$1"
+    local -r key="$2"
+    local line=""
+
+    line=$(stats_line "$log")
+    if [[ -z "$line" ]]; then
+        return 1
+    fi
+    printf '%s\n' "$line" | grep -qE "(^|[[:space:]])${key}="
+}
+
+# Record FAIL when any required revision-4 counter is absent. The caller
+# continues, so independent oracles still run.
+require_stat_keys() {
+    local -r log="$1"
+    local -r tag="$2"
+    local missing=""
+    local key
+
+    shift 2
+    for key in "$@"; do
+        if ! stat_key_present "$log" "$key"; then
+            missing="$missing $key"
+        fi
+    done
+    if [[ -n "$missing" ]]; then
+        record FAIL "$tag:counters" \
+            "the scheduler statistics line lacks revision-4 counters:$missing"
+        return 1
+    fi
+    record PASS "$tag:counters" "revision-4 counters present"
+}
+
+# Read one key=value from a one-line summary. Print the value without
+# surrounding quotes. Empty output means the key is absent.
+summary_field() {
+    local -r text="$1"
+    local -r key="$2"
+
+    printf '%s\n' "$text" |
+        grep -oE "(^|[[:space:]])${key}=[^[:space:]]+" 2>/dev/null |
+        tail -n 1 |
+        cut -d= -f2 |
+        tr -d '"' || true
+}
+
+# ---------------------------------------------------------------------
+# Fault injection specifications: KIND[:COUNT].
+# ---------------------------------------------------------------------
+
+fault_spec_kind() {
+    printf '%s\n' "${1%%:*}"
+}
+
+fault_spec_count() {
+    local count=1
+
+    if [[ "${1-}" == *:* ]]; then
+        count="${1#*:}"
+    fi
+    printf '%s\n' "$count"
+}
+
+fault_spec_valid() {
+    local -r spec="${1-}"
+    local kind=""
+    local count=1
+    local found=0
+    local item=""
+
+    kind=$(fault_spec_kind "$spec")
+    if [[ "$spec" == *:* ]]; then
+        count="${spec#*:}"
+    fi
+    for item in "${SCX_HANDOFF_FAULT_KINDS[@]}"; do
+        if [[ "$item" == "$kind" ]]; then
+            found=1
+            break
+        fi
+    done
+    if (( found == 0 )); then
+        return 1
+    fi
+    [[ "$count" =~ ^[1-9][0-9]*$ ]]
+}
+
+# ---------------------------------------------------------------------
+# Task progress. /proc/<pid>/stat is read for the task and every
+# descendant, because the harness starts a workload under taskset and
+# timeout and those wrapper processes do no work themselves.
+# ---------------------------------------------------------------------
+
+proc_cpu_ticks() {
+    local -r pid="$1"
+    local stat=""
+    local rest=""
+
+    [[ -r "/proc/$pid/stat" ]] || return 1
+    if ! stat=$(<"/proc/$pid/stat"); then
+        return 1
+    fi
+    rest=${stat#*") "}
+    awk '{ print $12 + $13 }' <<<"$rest"
+}
+
+# The process state letter from /proc/<pid>/stat. A zombie is skipped by
+# the progress monitor because its CPU time can no longer advance.
+proc_state() {
+    local -r pid="$1"
+    local stat=""
+    local rest=""
+
+    [[ -r "/proc/$pid/stat" ]] || return 1
+    if ! stat=$(<"/proc/$pid/stat"); then
+        return 1
+    fi
+    rest=${stat#*") "}
+    awk '{ print $1 }' <<<"$rest"
+}
+
+proc_comm() {
+    local -r pid="$1"
+
+    [[ -r "/proc/$pid/comm" ]] || return 1
+    cat "/proc/$pid/comm" 2>/dev/null
+}
+
+# Print every process below PID, one per line.
+proc_tree_pids() {
+    local -r root="$1"
+    local -A kids=()
+    local stat=""
+    local pid=""
+    local line=""
+    local rest=""
+    local ppid=""
+    local current=""
+    local list=""
+    local -a queue=("$root")
+    local -a out=("$root")
+    local -a children=()
+    local idx=0
+
+    for stat in /proc/[0-9]*/stat; do
+        pid=${stat#/proc/}
+        pid=${pid%/stat}
+        if [[ ! -r "$stat" ]]; then
+            continue
+        fi
+        if ! IFS= read -r line 2>/dev/null <"$stat"; then
+            continue
+        fi
+        rest=${line#*") "}
+        ppid=$(awk '{ print $2 }' <<<"$rest")
+        kids[$ppid]+=" $pid"
+    done
+    while (( idx < ${#queue[@]} )); do
+        current=${queue[idx]}
+        idx=$((idx + 1))
+        list=${kids[$current]:-}
+        if [[ -z "$list" ]]; then
+            continue
+        fi
+        children=()
+        IFS=' ' read -ra children <<<"$list"
+        for pid in "${children[@]}"; do
+            if [[ -z "$pid" ]]; then
+                continue
+            fi
+            out+=("$pid")
+            queue+=("$pid")
+        done
+    done
+    printf '%s\n' "${out[@]}"
+}
+
+proc_tree_cpu_ticks() {
+    local -r root="$1"
+    local total=0
+    local pid=""
+    local ticks=""
+
+    for pid in $(proc_tree_pids "$root"); do
+        ticks=$(proc_cpu_ticks "$pid" 2>/dev/null || true)
+        if [[ -n "$ticks" ]]; then
+            total=$((total + ticks))
+        fi
+    done
+    printf '%s\n' "$total"
+}
+
+# ---------------------------------------------------------------------
+# CPU idle share from /proc/stat. A placement case uses it to decide
+# whether a local CPU was really available at the wakeup or steal point.
+# ---------------------------------------------------------------------
+
+cpu_stat_idle_total() {
+    local -r cpu="$1"
+
+    awk -v key="cpu$cpu" '$1 == key {
+        idle = $5 + $6
+        total = $2 + $3 + $4 + $5 + $6 + $7 + $8 + $9
+        print idle, total
+        exit
+    }' /proc/stat
+}
+
+cpu_idle_percent() {
+    local -r cpu="$1"
+    local -r window_ms="${2:-500}"
+    local a_idle=0
+    local a_total=0
+    local b_idle=0
+    local b_total=0
+    local line=""
+
+    line=$(cpu_stat_idle_total "$cpu")
+    if [[ -z "$line" ]]; then
+        printf '0.00\n'
+        return 1
+    fi
+    IFS=' ' read -r a_idle a_total <<<"$line"
+    sleep "$(awk -v ms="$window_ms" 'BEGIN { printf "%.3f", ms / 1000 }')"
+    line=$(cpu_stat_idle_total "$cpu")
+    if [[ -z "$line" ]]; then
+        printf '0.00\n'
+        return 1
+    fi
+    IFS=' ' read -r b_idle b_total <<<"$line"
+    awk -v a_idle="$a_idle" -v a_total="$a_total" \
+        -v b_idle="$b_idle" -v b_total="$b_total" 'BEGIN {
+        delta = b_total - a_total
+        if (delta <= 0) {
+            print "0.00"
+        } else {
+            printf "%.2f", 100 * (b_idle - a_idle) / delta
+        }
+    }'
+}
+
+# The largest idle share among the CPUs in a cpulist.
+max_idle_percent() {
+    local -r list="$1"
+    local -r window_ms="${2:-500}"
+    local best=0
+    local value=""
+    local cpu=""
+
+    for cpu in $(cpulist_expand "$list"); do
+        value=$(cpu_idle_percent "$cpu" "$window_ms")
+        if awk -v a="$value" -v b="$best" 'BEGIN { exit !(a > b) }'; then
+            best=$value
+        fi
+    done
+    printf '%s\n' "$best"
+}
+
+# ---------------------------------------------------------------------
+# Tick measurement. One ops.tick call is one service slot. The scheduler
+# exports the count; the harness divides it by the wall window.
+# ---------------------------------------------------------------------
+
+tick_ns_from_seconds() {
+    local -r seconds="$1"
+    local -r ticks="$2"
+
+    awk -v seconds="$seconds" -v ticks="$ticks" 'BEGIN {
+        if (ticks <= 0) {
+            print "0"
+        } else {
+            printf "%.0f", seconds * 1000000000 / ticks
+        }
+    }'
+}
+
+# ---------------------------------------------------------------------
+# ftrace wakeup latency. sched_wakeup and sched_switch are the only
+# events enabled, so the overhead stays bounded.
+# ---------------------------------------------------------------------
+
+tracefs_root() {
+    local candidate=""
+
+    for candidate in /sys/kernel/tracing /sys/kernel/debug/tracing; do
+        if [[ -r "$candidate/trace" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+require_tracefs() {
+    local root=""
+
+    if ! root=$(tracefs_root); then
+        record BLOCKED tracefs \
+            "no tracefs mount with a trace file; the wake latency cannot be measured"
+        return 1
+    fi
+    record PASS tracefs "$root"
+}
+
+wake_trace_start() {
+    local root=""
+
+    if ! root=$(tracefs_root); then
+        return 1
+    fi
+    HARNESS_TRACE_ROOT=$root
+    HARNESS_TRACE_BUFFER_SAVED=$(cat "$root/buffer_size_kb" 2>/dev/null || true)
+    cleanup_push 'wake_trace_abort'
+    printf '0\n' >"$root/tracing_on" 2>/dev/null || return 1
+    printf 'nop\n' >"$root/current_tracer" 2>/dev/null || true
+    if [[ -n "$HARNESS_TRACE_BUFFER_SAVED" ]]; then
+        printf '16384\n' >"$root/buffer_size_kb" 2>/dev/null || true
+    fi
+    : >"$root/trace" 2>/dev/null || return 1
+    printf '1\n' >"$root/events/sched/sched_wakeup/enable" 2>/dev/null || return 1
+    printf '1\n' >"$root/events/sched/sched_switch/enable" 2>/dev/null || return 1
+    : >"$root/trace" 2>/dev/null || true
+    printf '1\n' >"$root/tracing_on" 2>/dev/null || return 1
+}
+
+wake_trace_stop() {
+    local -r dest="$1"
+    local root="${HARNESS_TRACE_ROOT:-}"
+
+    if [[ -z "$root" ]]; then
+        return 1
+    fi
+    printf '0\n' >"$root/tracing_on" 2>/dev/null || true
+    printf '0\n' >"$root/events/sched/sched_wakeup/enable" 2>/dev/null || true
+    printf '0\n' >"$root/events/sched/sched_switch/enable" 2>/dev/null || true
+    cp -- "$root/trace" "$dest" 2>/dev/null || return 1
+    if [[ -n "${HARNESS_TRACE_BUFFER_SAVED:-}" ]]; then
+        printf '%s\n' "$HARNESS_TRACE_BUFFER_SAVED" >"$root/buffer_size_kb" 2>/dev/null || true
+    fi
+    HARNESS_TRACE_ROOT=""
+    HARNESS_TRACE_BUFFER_SAVED=""
+}
+
+wake_trace_abort() {
+    local root="${HARNESS_TRACE_ROOT:-}"
+
+    if [[ -z "$root" ]]; then
+        return 0
+    fi
+    printf '0\n' >"$root/tracing_on" 2>/dev/null || true
+    printf '0\n' >"$root/events/sched/sched_wakeup/enable" 2>/dev/null || true
+    printf '0\n' >"$root/events/sched/sched_switch/enable" 2>/dev/null || true
+    if [[ -n "${HARNESS_TRACE_BUFFER_SAVED:-}" ]]; then
+        printf '%s\n' "$HARNESS_TRACE_BUFFER_SAVED" >"$root/buffer_size_kb" 2>/dev/null || true
+    fi
+    HARNESS_TRACE_ROOT=""
+    HARNESS_TRACE_BUFFER_SAVED=""
+}
+
+# Print one "delta PID US" line per wakeup that is followed by a switch to
+# that PID, then "unmatched N" and "matched N".
+wake_latency_analyze() {
+    local -r file="$1"
+
+    shift
+    awk -v pidlist="$*" '
+        function parse_event(line,   n, f, i, stamp) {
+            n = split(line, f, " ")
+            for (i = 1; i <= n; i++) {
+                if (f[i] ~ /^[0-9]+\.[0-9]+:$/) {
+                    stamp = f[i]
+                    sub(/:$/, "", stamp)
+                    TS = stamp
+                    EV = f[i + 1]
+                    sub(/:$/, "", EV)
+                    return 1
+                }
+            }
+            return 0
+        }
+        function field(line, key,   n, f, i, value) {
+            n = split(line, f, " ")
+            for (i = 1; i <= n; i++) {
+                if (index(f[i], key "=") == 1) {
+                    value = f[i]
+                    sub("^" key "=", "", value)
+                    return value
+                }
+            }
+            return ""
+        }
+        function micros(stamp,   p, s, frac) {
+            split(stamp, p, ".")
+            s = p[1] + 0
+            frac = "0"
+            if (length(stamp) > length(p[1]) + 1) {
+                frac = p[2]
+            }
+            while (length(frac) < 6) {
+                frac = frac "0"
+            }
+            frac = substr(frac, 1, 6)
+            return s * 1000000 + (frac + 0)
+        }
+        BEGIN {
+            n = split(pidlist, list, /[[:space:]]+/)
+            for (i = 1; i <= n; i++) {
+                if (list[i] != "") {
+                    want[list[i]] = 1
+                }
+            }
+            matched = 0
+            unmatched = 0
+        }
+        {
+            if (!parse_event($0)) {
+                next
+            }
+            if (EV == "sched_wakeup") {
+                pid = field($0, "pid")
+                if (pid == "" || !(pid in want)) {
+                    next
+                }
+                wake[pid] = micros(TS)
+                pending[pid] = 1
+                next
+            }
+            if (EV == "sched_switch") {
+                pid = field($0, "next_pid")
+                if (pid == "" || !(pid in want)) {
+                    next
+                }
+                if (!(pid in pending)) {
+                    next
+                }
+                delta = micros(TS) - wake[pid]
+                delete pending[pid]
+                if (delta >= 0) {
+                    print "delta", pid, delta
+                    matched++
+                }
+                next
+            }
+        }
+        END {
+            for (pid in pending) {
+                unmatched++
+            }
+            print "unmatched", unmatched
+            print "matched", matched
+        }
+    ' "$file"
+}
+
+# Print one line: matched= unmatched= max_us= p99_us= per_worker="pid:us,..."
+wake_latency_summary() {
+    local -r file="$1"
+    local raw=""
+    local matched=0
+    local unmatched=0
+    local max_us=0
+    local p99_us=0
+    local per_worker=""
+
+    shift
+    raw=$(wake_latency_analyze "$file" "$@")
+    matched=$(printf '%s\n' "$raw" | awk '$1 == "matched" { print $2; exit }')
+    unmatched=$(printf '%s\n' "$raw" | awk '$1 == "unmatched" { print $2; exit }')
+    max_us=$(printf '%s\n' "$raw" | awk '$1 == "delta" {
+        if ($3 > max) max = $3
+    } END { printf "%.0f", max + 0 }')
+    p99_us=$(printf '%s\n' "$raw" | awk '$1 == "delta" { print $3 }' |
+        sort -n |
+        awk '{ value[NR] = $1 } END {
+            if (NR == 0) {
+                print "0"
+                exit
+            }
+            idx = int(NR * 0.99)
+            if (idx < NR * 0.99) {
+                idx++
+            }
+            if (idx < 1) {
+                idx = 1
+            }
+            printf "%.0f", value[idx]
+        }')
+    per_worker=$(printf '%s\n' "$raw" | awk '$1 == "delta" {
+        if ($3 > max[$2]) max[$2] = $3
+    } END {
+        for (pid in max) {
+            printf "%s:%d,", pid, max[pid]
+        }
+    }')
+    printf 'matched=%s unmatched=%s max_us=%s p99_us=%s per_worker="%s"\n' \
+        "${matched:-0}" "${unmatched:-0}" "${max_us:-0}" "${p99_us:-0}" \
+        "${per_worker%,}"
+}
+
+# The number of ring-buffer losses recorded in a trace file. A non-zero
+# value means the latency evidence is incomplete.
+trace_lost_events() {
+    local -r file="$1"
+
+    grep -oE 'LOST [0-9]+ EVENTS' "$file" 2>/dev/null |
+        awk '{ total += $2 } END { print total + 0 }' || true
+}

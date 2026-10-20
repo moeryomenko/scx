@@ -7,19 +7,38 @@
 #
 # The harness loads scx_infinity in a guest with two vNUMA nodes and checks:
 #
+#   previous_cpu     a task woken on an idle CPU runs on that CPU again
 #   local_llc        a task woken on an idle CPU stays inside that LLC
 #   local_node       a task woken on an idle CPU stays inside that NUMA node
+#   llc_before_node  the local LLC share is at least the local node share
 #   steal_llc        a peer inside the same LLC steals, and only the LLC tier
 #                    counter moves
 #   steal_node       a peer inside the same node but in another LLC steals, and
 #                    only the node tier counter moves
 #   no_remote_steal  an idle node does not take work from the other node
-#   remote_spill     with the local node saturated, a new task is placed on the
+#   no_remote_steal_local
+#                    the same, with eligible local runnable work present
+#   no_remote_steal_parked
+#                    the same, with the local work quota-parked
+#   remote_spill     with every local CPU busy, a new task is placed on the
 #                    remote node at wakeup
 #   remote_spill_mask the mask forbids the remote node, so no spill happens
+#   remote_spill_parked
+#                    quota-parked local work does not push a new task to the
+#                    remote node while a local CPU is idle
+#   remote_spill_affinity
+#                    a local CPU that is idle runs the new task, so affinity-
+#                    ineligible local work does not cause a remote spill
 #   affinity         a task that narrows its mask never runs outside the mask
 #   affinity_one     a task narrowed to one CPU never runs on another CPU
 #   migration        a task moved to the other node keeps running there
+#
+# Every remote-spill case reads the per-CPU idle share from /proc/stat
+# before the probe. A remote sample is a failure when a local CPU was
+# idle, and a local sample is a failure when every local CPU was busy.
+# That is the placement oracle: work moves to another node only when no
+# affinity-allowed, unthrottled local CPU can run it. Quota-parked local
+# work is tested separately from eligible local work.
 #
 # A task's CPU is sampled from sched_getcpu() by infinity_workload. The
 # probe records the CPU it started on, broadens its affinity to the full
@@ -36,12 +55,13 @@
 # The harness fails closed. It refuses to run without a disposable VM
 # (SCX_INFINITY_VM=1), root, two online NUMA nodes and the LLC sysfs file.
 # A missing precondition is BLOCKED, never PASS. Any affinity violation is
-# a failure.
+# a failure. The active scheduler must be scx_infinity; a mismatch blocks
+# the run.
 #
 # Usage:
 #   SCX_INFINITY_VM=1 sudo \
 #     scheds/experimental/scx_infinity/scripts/infinity_numa_placement.sh \
-#     [--duration SEC] [--scheduler PATH] [--out FILE] [--check]
+#     [--duration SEC] [--scheduler PATH] [--out FILE] [--case NAME] [--check]
 #
 # Output: one JSON object per line on stdout. The last line is the summary.
 # Exit codes: 0 PASS, 1 FAIL, 2 BLOCKED.
@@ -58,10 +78,13 @@ DURATION=2
 SCHED_BIN=""
 CHECK_ONLY=0
 OUT=""
+CASE=""
 SCHED_LOG=""
 WORKLOAD=""
 CGROUP_PARENT=""
 CG_BURN=""
+CG_NODE1=""
+CG_PARKED=""
 NODE0_CPUS=""
 NODE1_CPUS=""
 NODE0_CPU=""
@@ -72,14 +95,28 @@ NODE0_LLC2_CPU=""
 NODE0_LLC2_PEER=""
 NODE1_LLC=""
 DMESG_BASELINE=0
+LOCAL_LLC_SHARE=0
+LOCAL_NODE_SHARE=0
 
-# The lowest share of the probe samples that must stay in the local LLC or
-# the local node. The guest keeps its own tasks, so a wakeup can find the
-# local cache busy and move to another core of the same node. That is the
-# placement order of specification section 4.1, so the case measures the
-# preference over the whole sample window instead of demanding that no
-# sample ever leaves the domain.
+# The lowest share of the probe samples that must stay on the previous CPU,
+# in the local LLC or in the local node. The guest keeps its own tasks, so
+# a wakeup can find the preferred CPU busy and move to another CPU of the
+# same domain. That is the placement order of specification section 4.1, so
+# the case measures the preference over the whole sample window instead of
+# demanding that no sample ever leaves the domain.
 LOCALITY_MIN_SHARE_PCT=${LOCALITY_MIN_SHARE_PCT:-90}
+
+# A local CPU with at least this idle share before a probe means a local
+# CPU was available. A remote sample is then a placement failure.
+LOCAL_IDLE_PCT=${LOCAL_IDLE_PCT:-50}
+
+# The previous-CPU probe. A 1 ms sleeper can still be running when its
+# wakeup is handled, so prev_cpu is not idle yet. The probe sleeps long
+# enough for the CPU to go idle, then records the CPU it wakes on.
+PREV_ROUNDS=${PREV_ROUNDS:-20}
+PREV_SLEEP_MS=${PREV_SLEEP_MS:-50}
+PREV_MIN_SHARE_PCT=${PREV_MIN_SHARE_PCT:-90}
+PREV_PROBE=""
 
 # The number of probe windows a locality case runs. A task of the guest on
 # the second CPU of the local LLC can hold a whole window. The case then
@@ -89,11 +126,12 @@ LOCALITY_ATTEMPTS=${LOCALITY_ATTEMPTS:-3}
 usage() {
     cat >&2 <<'EOF'
 usage: infinity_numa_placement.sh [--duration SEC] [--scheduler PATH]
-       [--out FILE] [--check]
+       [--out FILE] [--case NAME] [--check]
 
   --duration SEC     sampling time per probe, default 2
   --scheduler PATH   scx_infinity binary, default SCX_INFINITY_BIN or target/
   --out FILE         also append the JSON Lines records to FILE
+  --case NAME        run one named case after load, then exit
   --check            verify preconditions only, load nothing
 EOF
 }
@@ -110,6 +148,10 @@ while (($#)); do
             ;;
         --out)
             OUT=${2:?}
+            shift
+            ;;
+        --case)
+            CASE=${2:?}
             shift
             ;;
         --check)
@@ -144,6 +186,90 @@ prepare_workload() {
         return 1
     fi
     record PASS workload_build "compiled $source"
+}
+
+# Compile the previous-CPU probe into the harness temporary directory.
+prepare_prev_probe() {
+    local source="$HARNESS_TMP/infinity_prev_cpu.c"
+    local cc_log="$HARNESS_TMP/prev-cc.log"
+
+    PREV_PROBE="$HARNESS_TMP/infinity_prev_cpu"
+    cat >"$source" <<'CPROBE_EOF'
+#define _GNU_SOURCE
+#include <errno.h>
+#include <sched.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
+
+#define CPU_LIMIT 1024
+
+static void sleep_ms(long milliseconds)
+{
+	struct timespec ts = {
+		.tv_sec	 = milliseconds / 1000,
+		.tv_nsec = (milliseconds % 1000) * 1000000LL,
+	};
+
+	while (nanosleep(&ts, &ts) != 0 && errno == EINTR)
+		;
+}
+
+static void set_all(cpu_set_t *set)
+{
+	int cpu;
+
+	CPU_ZERO(set);
+	for (cpu = 0; cpu < CPU_LIMIT; cpu++)
+		CPU_SET(cpu, set);
+}
+
+int main(int argc, char **argv)
+{
+	cpu_set_t one;
+	cpu_set_t all;
+	long sleep_ms_value;
+	int start_cpu;
+	int rounds;
+	int hits = 0;
+	int i;
+
+	if (argc < 4) {
+		fprintf(stderr, "usage: %s START_CPU SLEEP_MS ROUNDS\n", argv[0]);
+		return 2;
+	}
+	start_cpu = atoi(argv[1]);
+	sleep_ms_value = atol(argv[2]);
+	rounds = atoi(argv[3]);
+	if (start_cpu < 0 || start_cpu >= CPU_LIMIT || sleep_ms_value <= 0 ||
+	    rounds <= 0)
+		return 2;
+	set_all(&all);
+	for (i = 0; i < rounds; i++) {
+		int cpu;
+
+		CPU_ZERO(&one);
+		CPU_SET(start_cpu, &one);
+		if (sched_setaffinity(0, sizeof(one), &one) != 0)
+			return 1;
+		if (sched_setaffinity(0, sizeof(all), &all) != 0)
+			return 1;
+		sleep_ms(sleep_ms_value);
+		cpu = sched_getcpu();
+		if (cpu == start_cpu)
+			hits++;
+		printf("%d\n", cpu);
+	}
+	printf("hits=%d rounds=%d\n", hits, rounds);
+	return 0;
+}
+CPROBE_EOF
+    if ! cc -O2 -Wall -Wextra -o "$PREV_PROBE" "$source" 2>"$cc_log"; then
+        record FAIL prev_cpu_build "cc failed: $(tail -n 3 "$cc_log" 2>/dev/null || true)"
+        return 1
+    fi
+    record PASS prev_cpu_build "compiled $source"
 }
 
 preflight() {
@@ -247,6 +373,9 @@ preflight() {
     if (( missing == 0 )); then
         prepare_workload || missing=1
     fi
+    if (( missing == 0 )); then
+        prepare_prev_probe || missing=1
+    fi
     return "$missing"
 }
 
@@ -269,6 +398,14 @@ setup_cgroup() {
     fi
     if ! CG_BURN=$(cgroup_create "$CGROUP_PARENT" burn); then
         record FAIL cgroup "cannot create the burn cgroup"
+        exit 1
+    fi
+    if ! CG_NODE1=$(cgroup_create "$CGROUP_PARENT" node1); then
+        record FAIL cgroup "cannot create the node 1 cgroup"
+        exit 1
+    fi
+    if ! CG_PARKED=$(cgroup_create "$CGROUP_PARENT" parked); then
+        record FAIL cgroup "cannot create the parked cgroup"
         exit 1
     fi
     cleanup_push 'stop_all_workers'
@@ -298,11 +435,12 @@ worker_cpu_time() {
     awk '{ print $12 + $13 }' <<<"$rest"
 }
 
-# Poll every task of the harness cgroup and print every CPU one of them ran
-# on. The children of a workload inherit the cgroup, so this covers the
-# whole load and not only the process the harness started.
-observe_cgroup_cpus() {
-    local -r seconds="$1"
+# Poll every task of one cgroup and print every CPU one of them ran on. The
+# children of a workload inherit the cgroup, so this covers the whole load
+# and not only the process the harness started.
+observe_cgroup_cpus_in() {
+    local -r cg="$1"
+    local -r seconds="$2"
     local end
     local pid
     local cpu
@@ -317,10 +455,14 @@ observe_cgroup_cpus() {
             if [[ ",$seen," != *",$cpu,"* ]]; then
                 seen="$seen,$cpu"
             fi
-        done <"$CG_BURN/cgroup.procs" 2>/dev/null || true
+        done <"$cg/cgroup.procs" 2>/dev/null || true
         sleep 0.05
     done
     printf '%s\n' "${seen#,}"
+}
+
+observe_cgroup_cpus() {
+    observe_cgroup_cpus_in "$CG_BURN" "$1"
 }
 
 # Print the other CPU of one LLC.
@@ -526,6 +668,7 @@ run_local_llc() {
         record FAIL local_llc "the task left its local LLC $NODE0_LLC in every attempt" "$extra"
         return
     fi
+    LOCAL_LLC_SHARE=$share
     record PASS local_llc "$share percent of the samples stayed in LLC $NODE0_LLC" "$extra"
 }
 
@@ -543,7 +686,81 @@ run_local_node() {
         record FAIL local_node "the task left its local NUMA node in every attempt" "$extra"
         return
     fi
+    LOCAL_NODE_SHARE=$share
     record PASS local_node "$share percent of the samples stayed in node 0" "$extra"
+}
+
+# The previous CPU is the first placement input of specification section
+# 4.1. Each round pins the probe to CPU 0, broadens the mask, sleeps long
+# enough for CPU 0 to go idle, and records the CPU it wakes on. The case
+# only judges a round when CPU 0 was idle before the probe.
+run_previous_cpu() {
+    local idle=0
+    local out=""
+    local hits=""
+    local rounds=""
+    local share=""
+    local extra=""
+
+    if [[ -z "$PREV_PROBE" || ! -x "$PREV_PROBE" ]]; then
+        record BLOCKED previous_cpu "the previous-CPU probe was not built"
+        return
+    fi
+    stop_all_workers
+    sleep 1
+    idle=$(cpu_idle_percent "$NODE0_CPU" 1000)
+    if ! num_in_range "$idle" "$PREV_MIN_SHARE_PCT" 100; then
+        record BLOCKED previous_cpu \
+            "CPU $NODE0_CPU was only $idle percent idle, so the previous-CPU preference cannot be judged" \
+            "$(printf '"start_cpu":%d,"idle_pct":%s' "$NODE0_CPU" "${idle:-0}")"
+        return
+    fi
+    if ! out=$(taskset -c "$NODE0_CPU" "$PREV_PROBE" "$NODE0_CPU" \
+        "$PREV_SLEEP_MS" "$PREV_ROUNDS" 2>"$HARNESS_TMP/prev_cpu.err"); then
+        record FAIL previous_cpu "the previous-CPU probe failed"
+        return
+    fi
+    hits=$(printf '%s\n' "$out" | grep -oE 'hits=[0-9]+' |
+        tail -n 1 | cut -d= -f2 || true)
+    rounds=$(printf '%s\n' "$out" | grep -oE 'rounds=[0-9]+' |
+        tail -n 1 | cut -d= -f2 || true)
+    if [[ -z "$hits" || -z "$rounds" || "$rounds" == "0" ]]; then
+        record FAIL previous_cpu "the previous-CPU probe printed no result"
+        return
+    fi
+    share=$(awk -v hits="$hits" -v rounds="$rounds" \
+        'BEGIN { printf "%.2f", 100 * hits / rounds }')
+    extra=$(printf '"start_cpu":%d,"hits":%s,"rounds":%s,"prev_cpu_share_pct":%s,"idle_pct":%s' \
+        "$NODE0_CPU" "$hits" "$rounds" "$share" "${idle:-0}")
+    if ! num_in_range "$share" "$PREV_MIN_SHARE_PCT" 100; then
+        record FAIL previous_cpu \
+            "the woken task returned to CPU $NODE0_CPU in only $hits of $rounds rounds" "$extra"
+        return
+    fi
+    record PASS previous_cpu \
+        "the woken task returned to CPU $NODE0_CPU in $hits of $rounds rounds" "$extra"
+}
+
+# Section 4.1 orders the local LLC before the local node. The LLC share
+# must therefore be at least the node share, and both must reach the gate.
+run_llc_before_node() {
+    local extra=""
+
+    extra=$(printf '"llc":"%s","llc_share_pct":%s,"node_cpus":"%s","node_share_pct":%s' \
+        "$NODE0_LLC" "${LOCAL_LLC_SHARE:-0}" "$NODE0_CPUS" "${LOCAL_NODE_SHARE:-0}")
+    if ! num_in_range "$LOCAL_LLC_SHARE" "$LOCALITY_MIN_SHARE_PCT" 100; then
+        record FAIL llc_before_node \
+            "the local LLC share is below the gate" "$extra"
+        return
+    fi
+    if ! awk -v a="$LOCAL_LLC_SHARE" -v b="$LOCAL_NODE_SHARE" \
+        'BEGIN { exit !(a >= b) }'; then
+        record FAIL llc_before_node \
+            "the local node share is higher than the local LLC share" "$extra"
+        return
+    fi
+    record PASS llc_before_node \
+        "the LLC share $LOCAL_LLC_SHARE is at least the node share $LOCAL_NODE_SHARE" "$extra"
 }
 
 # One steal case. The mask names the only CPUs a task may use, so exactly one
@@ -689,6 +906,98 @@ run_no_remote_steal() {
     record PASS no_remote_steal "node 1 work stayed in node 1" "$extra"
 }
 
+# The same boundary with eligible local runnable work present: node 0 has
+# unthrottled work of its own, so an idle node 0 CPU has no reason to pull
+# node 1 work. The node 1 cgroup must stay on node 1.
+run_no_remote_steal_local() {
+    local observed=""
+    local extra=""
+
+    stop_all_workers
+    sleep 1
+    if ! start_worker "$CG_BURN" "$NODE0_CPUS" \
+        "$HARNESS_TMP/localwork.log" \
+        "$WORKLOAD" forkexec "$((DURATION + 12))" >/dev/null; then
+        record FAIL no_remote_steal_local "cannot start the local work"
+        return
+    fi
+    if ! start_worker "$CG_NODE1" "$NODE1_CPUS" \
+        "$HARNESS_TMP/node1work.log" \
+        "$WORKLOAD" forkexec "$((DURATION + 12))" >/dev/null; then
+        stop_all_workers
+        record FAIL no_remote_steal_local "cannot start the node 1 work"
+        return
+    fi
+    sleep 1
+    observed=$(observe_cgroup_cpus_in "$CG_NODE1" "$((DURATION + 1))")
+    stop_all_workers
+    extra=$(printf '"node0_cpus":"%s","node1_cpus":"%s","node1_sampled_cpus":"%s"' \
+        "$NODE0_CPUS" "$NODE1_CPUS" "${observed:-none}")
+    if [[ "${observed:-none}" == "none" ]]; then
+        record FAIL no_remote_steal_local "no node 1 worker was observed" "$extra"
+        return
+    fi
+    if ! all_cpus_in "$observed" "$NODE1_CPUS"; then
+        record FAIL no_remote_steal_local \
+            "node 1 work ran on node 0 while eligible local work existed" "$extra"
+        return
+    fi
+    record PASS no_remote_steal_local \
+        "node 1 work stayed in node 1 with eligible local work present" "$extra"
+}
+
+# The boundary with the local work quota-parked. A parked task is on no
+# CPU tree, so it is not local runnable work. Node 1 work must still stay
+# in node 1, and the scheduler throttle counter must rise.
+run_no_remote_steal_parked() {
+    local observed=""
+    local th0=0
+    local th1=0
+    local extra=""
+
+    stop_all_workers
+    if ! cgroup_write "$CG_PARKED" cpu.max "1000 100000"; then
+        record FAIL no_remote_steal_parked "cannot set cpu.max on the parked cgroup"
+        return
+    fi
+    cgroup_write "$CG_PARKED" cpu.max.burst 0 || true
+    sleep 1
+    th0=$(stat_value "$SCHED_LOG" throttled)
+    if ! start_worker "$CG_PARKED" "$NODE0_CPUS" \
+        "$HARNESS_TMP/parkedlocal.log" \
+        "$WORKLOAD" burn "$((DURATION + 12))" >/dev/null; then
+        record FAIL no_remote_steal_parked "cannot start the parked local work"
+        return
+    fi
+    if ! start_worker "$CG_NODE1" "$NODE1_CPUS" \
+        "$HARNESS_TMP/node1parked.log" \
+        "$WORKLOAD" forkexec "$((DURATION + 12))" >/dev/null; then
+        stop_all_workers
+        record FAIL no_remote_steal_parked "cannot start the node 1 work"
+        return
+    fi
+    sleep 1
+    observed=$(observe_cgroup_cpus_in "$CG_NODE1" "$((DURATION + 1))")
+    th1=$(stat_value "$SCHED_LOG" throttled)
+    stop_all_workers
+    cgroup_write "$CG_PARKED" cpu.max "max 100000" || true
+    extra=$(printf '"node1_cpus":"%s","node1_sampled_cpus":"%s","throttled_before":%s,"throttled_after":%s' \
+        "$NODE1_CPUS" "${observed:-none}" "$th0" "$th1")
+    if (( th1 <= th0 )); then
+        record FAIL no_remote_steal_parked \
+            "the local work was not parked: the throttle counter did not rise" "$extra"
+        return
+    fi
+    if [[ "${observed:-none}" == "none" ]] ||
+        ! all_cpus_in "$observed" "$NODE1_CPUS"; then
+        record FAIL no_remote_steal_parked \
+            "node 1 work did not stay in node 1 around parked local work" "$extra"
+        return
+    fi
+    record PASS no_remote_steal_parked \
+        "node 1 work stayed in node 1 while local work was parked" "$extra"
+}
+
 run_remote_spill() {
     local cpu
     local log=""
@@ -696,6 +1005,7 @@ run_remote_spill() {
     local distinct=""
     local first=""
     local extra=""
+    local local_idle=0
     local i
 
     # Two CPU-bound workers per local CPU make the local node crowded, so
@@ -712,6 +1022,7 @@ run_remote_spill() {
         done
     done < <(cpulist_expand "$NODE0_CPUS")
     sleep 1
+    local_idle=$(max_idle_percent "$NODE0_CPUS" 300)
 
     if ! log=$(probe_run "$NODE0_CPU" remote_spill all broaden); then
         stop_all_workers
@@ -722,10 +1033,16 @@ run_remote_spill() {
     out_of_mask=$(probe_field "$log" out_of_mask)
     distinct=$(probe_field "$log" distinct)
     first=$(probe_field "$log" first_cpu)
-    extra=$(printf '"start_cpu":%d,"first_cpu":%s,"sampled_cpus":"%s","node1_cpus":"%s","out_of_mask":%s' \
-        "$NODE0_CPU" "${first:-0}" "${distinct:-none}" "$NODE1_CPUS" "${out_of_mask:-0}")
+    extra=$(printf '"start_cpu":%d,"first_cpu":%s,"sampled_cpus":"%s","node0_cpus":"%s","node1_cpus":"%s","out_of_mask":%s,"local_idle_pct":%s' \
+        "$NODE0_CPU" "${first:-0}" "${distinct:-none}" "$NODE0_CPUS" \
+        "$NODE1_CPUS" "${out_of_mask:-0}" "${local_idle:-0}")
     if [[ "${out_of_mask:-1}" != "0" ]]; then
         record FAIL remote_spill "a sample left the full CPU set" "$extra"
+        return
+    fi
+    if num_in_range "$local_idle" "$LOCAL_IDLE_PCT" 100; then
+        record FAIL remote_spill \
+            "a local CPU was $local_idle percent idle before the probe, so no remote spill was allowed" "$extra"
         return
     fi
     if all_cpus_in "$distinct" "$NODE0_CPUS"; then
@@ -773,6 +1090,124 @@ run_remote_spill_mask() {
         return
     fi
     record PASS remote_spill_mask "the mask kept the task in node 0" "$extra"
+}
+
+# Quota-parked local work is not runnable. The local CPUs are therefore
+# idle even though the cgroup has busy workers. A new task must run on a
+# local CPU, not spill to node 1. The throttle counter proves the work was
+# parked rather than merely light.
+run_remote_spill_parked() {
+    local cpu=""
+    local log=""
+    local out_of_mask=""
+    local distinct=""
+    local extra=""
+    local th0=0
+    local th1=0
+    local local_idle=0
+
+    stop_all_workers
+    if ! cgroup_write "$CG_PARKED" cpu.max "1000 100000"; then
+        record FAIL remote_spill_parked "cannot set cpu.max on the parked cgroup"
+        return
+    fi
+    cgroup_write "$CG_PARKED" cpu.max.burst 0 || true
+    sleep 1
+    th0=$(stat_value "$SCHED_LOG" throttled)
+    while IFS= read -r cpu; do
+        if ! start_worker "$CG_PARKED" "$cpu" "$HARNESS_TMP/parked_${cpu}.log" \
+            timeout --signal=TERM --kill-after=5s "$((DURATION + 20))s" \
+            "$WORKLOAD" burn "$((DURATION + 10))" >/dev/null; then
+            record FAIL remote_spill_parked "cannot start a parked burner"
+            stop_all_workers
+            return
+        fi
+    done < <(cpulist_expand "$NODE0_CPUS")
+    sleep 1
+    local_idle=$(max_idle_percent "$NODE0_CPUS" 300)
+    if ! log=$(probe_run "$NODE0_CPU" remote_spill_parked all broaden); then
+        stop_all_workers
+        record FAIL remote_spill_parked "the probe did not complete"
+        return
+    fi
+    th1=$(stat_value "$SCHED_LOG" throttled)
+    stop_all_workers
+    cgroup_write "$CG_PARKED" cpu.max "max 100000" || true
+    out_of_mask=$(probe_field "$log" out_of_mask)
+    distinct=$(probe_field "$log" distinct)
+    extra=$(printf '"start_cpu":%d,"sampled_cpus":"%s","node0_cpus":"%s","out_of_mask":%s,"local_idle_pct":%s,"throttled_before":%s,"throttled_after":%s' \
+        "$NODE0_CPU" "${distinct:-none}" "$NODE0_CPUS" "${out_of_mask:-0}" \
+        "${local_idle:-0}" "$th0" "$th1")
+    if (( th1 <= th0 )); then
+        record FAIL remote_spill_parked \
+            "the local work was not parked: the throttle counter did not rise" "$extra"
+        return
+    fi
+    if [[ "${out_of_mask:-1}" != "0" ]]; then
+        record FAIL remote_spill_parked "a sample left the full CPU set" "$extra"
+        return
+    fi
+    if ! num_in_range "$local_idle" "$LOCAL_IDLE_PCT" 100; then
+        record FAIL remote_spill_parked \
+            "the parked work kept the local CPUs busy, so the case did not test an idle local CPU" "$extra"
+        return
+    fi
+    if ! all_cpus_in "$distinct" "$NODE0_CPUS"; then
+        record FAIL remote_spill_parked \
+            "a task spilled to node 1 while a local CPU was idle and the local work was parked" "$extra"
+        return
+    fi
+    record PASS remote_spill_parked \
+        "the task stayed in node 0 while parked work held no local CPU" "$extra"
+}
+
+# Affinity-ineligible local work. One local CPU is pinned busy and the
+# other local CPU is idle. The probe can run on the idle local CPU, so a
+# remote sample is a placement failure.
+run_remote_spill_affinity() {
+    local log=""
+    local out_of_mask=""
+    local distinct=""
+    local extra=""
+    local local_idle=0
+
+    stop_all_workers
+    sleep 1
+    if ! start_worker "$CG_BURN" "$NODE0_CPU" "$HARNESS_TMP/pinned_local.log" \
+        timeout --signal=TERM --kill-after=5s "$((DURATION + 20))s" \
+        "$WORKLOAD" burn "$((DURATION + 10))" >/dev/null; then
+        record FAIL remote_spill_affinity "cannot start the pinned local burner"
+        return
+    fi
+    sleep 1
+    local_idle=$(max_idle_percent "$NODE0_CPUS" 300)
+    if ! log=$(probe_run "$NODE0_CPU" remote_spill_affinity all broaden); then
+        stop_all_workers
+        record FAIL remote_spill_affinity "the probe did not complete"
+        return
+    fi
+    stop_all_workers
+    out_of_mask=$(probe_field "$log" out_of_mask)
+    distinct=$(probe_field "$log" distinct)
+    extra=$(printf '"start_cpu":%d,"sampled_cpus":"%s","node0_cpus":"%s","out_of_mask":%s,"local_idle_pct":%s' \
+        "$NODE0_CPU" "${distinct:-none}" "$NODE0_CPUS" "${out_of_mask:-0}" \
+        "${local_idle:-0}")
+    if [[ "${out_of_mask:-1}" != "0" ]]; then
+        record FAIL remote_spill_affinity "a sample left the full CPU set" "$extra"
+        return
+    fi
+    if ! num_in_range "$local_idle" "$LOCAL_IDLE_PCT" 100; then
+        record FAIL remote_spill_affinity \
+            "no local CPU was idle, so the case did not test an ineligible local task" "$extra"
+        return
+    fi
+    if ! all_cpus_in "$distinct" "$NODE0_CPUS"; then
+        record FAIL remote_spill_affinity \
+            "a task spilled to node 1 while an affinity-allowed local CPU was idle" "$extra"
+        return
+    fi
+    record PASS remote_spill_affinity \
+        "the task used the idle local CPU, not node 1" "$extra"
 }
 
 run_affinity() {
@@ -876,6 +1311,32 @@ run_migration() {
     record PASS migration "the task moved to node 1 and kept running" "$extra"
 }
 
+# One named case, for a focused rerun. The full gate runs every case.
+run_named_case() {
+    case "$1" in
+        previous_cpu) run_previous_cpu ;;
+        local_llc) run_local_llc ;;
+        local_node) run_local_node ;;
+        llc_before_node) run_llc_before_node ;;
+        steal_llc) run_steal_llc ;;
+        steal_node) run_steal_node ;;
+        no_remote_steal) run_no_remote_steal ;;
+        no_remote_steal_local) run_no_remote_steal_local ;;
+        no_remote_steal_parked) run_no_remote_steal_parked ;;
+        remote_spill) run_remote_spill ;;
+        remote_spill_mask) run_remote_spill_mask ;;
+        remote_spill_parked) run_remote_spill_parked ;;
+        remote_spill_affinity) run_remote_spill_affinity ;;
+        affinity) run_affinity ;;
+        affinity_one) run_affinity_one ;;
+        migration) run_migration ;;
+        *)
+            record BLOCKED "case:$1" "unknown --case name"
+            return 1
+            ;;
+    esac
+}
+
 teardown() {
     local faults=""
 
@@ -887,11 +1348,12 @@ teardown() {
     else
         record FAIL dmesg "kernel fault: $(printf '%s' "$faults" | head -n 1)"
     fi
-    rmdir -- "$CG_BURN" "$CGROUP_PARENT" 2>/dev/null || true
-    if [[ ! -e "$CG_BURN" && ! -e "$CGROUP_PARENT" ]]; then
-        record PASS cgroup_cleanup "the burn cgroup was removed"
+    rmdir -- "$CG_BURN" "$CG_NODE1" "$CG_PARKED" "$CGROUP_PARENT" 2>/dev/null || true
+    if [[ ! -e "$CG_BURN" && ! -e "$CG_NODE1" && ! -e "$CG_PARKED" &&
+        ! -e "$CGROUP_PARENT" ]]; then
+        record PASS cgroup_cleanup "the burn cgroups were removed"
     else
-        record FAIL cgroup_cleanup "the burn cgroup remains"
+        record FAIL cgroup_cleanup "a burn cgroup remains"
     fi
 }
 
@@ -924,27 +1386,51 @@ main() {
         exit 1
     fi
     record PASS scheduler "state enabled"
+    if ! require_scheduler_identity; then
+        exit 2
+    fi
 
+    if [[ -n "$CASE" ]]; then
+        run_named_case "$CASE"
+        check_alive "$CASE" || exit 1
+        teardown
+        if [[ -n "$OUT" ]]; then
+            cp -- "$SCHED_LOG" "$OUT.scheduler.log" 2>/dev/null || true
+        fi
+        return
+    fi
+
+    run_previous_cpu
+    check_alive previous_cpu || exit 1
     run_local_llc
-    check_alive local_llc
+    check_alive local_llc || exit 1
     run_local_node
-    check_alive local_node
+    check_alive local_node || exit 1
+    run_llc_before_node
     run_steal_llc
-    check_alive steal_llc
+    check_alive steal_llc || exit 1
     run_steal_node
-    check_alive steal_node
+    check_alive steal_node || exit 1
     run_no_remote_steal
-    check_alive no_remote_steal
+    check_alive no_remote_steal || exit 1
+    run_no_remote_steal_local
+    check_alive no_remote_steal_local || exit 1
+    run_no_remote_steal_parked
+    check_alive no_remote_steal_parked || exit 1
     run_remote_spill
-    check_alive remote_spill
+    check_alive remote_spill || exit 1
     run_remote_spill_mask
-    check_alive remote_spill_mask
+    check_alive remote_spill_mask || exit 1
+    run_remote_spill_parked
+    check_alive remote_spill_parked || exit 1
+    run_remote_spill_affinity
+    check_alive remote_spill_affinity || exit 1
     run_affinity
-    check_alive affinity
+    check_alive affinity || exit 1
     run_affinity_one
-    check_alive affinity_one
+    check_alive affinity_one || exit 1
     run_migration
-    check_alive migration
+    check_alive migration || exit 1
     teardown
     if [[ -n "$OUT" ]]; then
         cp -- "$SCHED_LOG" "$OUT.scheduler.log" 2>/dev/null || true
