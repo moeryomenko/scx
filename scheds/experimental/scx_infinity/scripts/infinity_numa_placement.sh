@@ -584,7 +584,9 @@ run_steal_case() {
         other_excess=$(( other_delta - bg_llc ))
         bg_want=$bg_node
     fi
-    (( other_excess < 0 )) && other_excess=0
+    if (( other_excess < 0 )); then
+        other_excess=0
+    fi
     extra=$(printf '"mask":"%s","source_cpu":%d,"peer_cpu":%d,"llc_delta":%d,"node_delta":%d,"llc_background":%d,"node_background":%d,"sampled_cpus":"%s"' \
         "$mask" "$source" "$peer" \
         "$(( llc_after - llc_before ))" "$(( node_after - node_before ))" \
