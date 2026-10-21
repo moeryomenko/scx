@@ -803,6 +803,8 @@ struct inf_stats {
 	u64 disp_q;
 	/* Revision-4 counters. */
 	u64 entity_overflow;
+	u64 entity_own; /* the resolved leaf is the task's own cgroup */
+	u64 entity_ancestor; /* the resolved leaf is an ancestor entity */
 	u64 entity_reclaims;
 	u64 entity_alloc_fail;
 	u64 band_scan_truncated;

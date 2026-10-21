@@ -873,6 +873,8 @@ impl<'a> Scheduler<'a> {
         let mut core_rescues = 0u64;
         let mut core_missing_seen = 0u64;
         let mut dsq_refusals = 0u64;
+        let mut entity_own = 0u64;
+        let mut entity_ancestor = 0u64;
         let mut handoff_inflight = 0u64;
 
         let key = 0u32.to_ne_bytes();
@@ -958,6 +960,8 @@ impl<'a> Scheduler<'a> {
                 core_rescues += stats.core_rescues;
                 core_missing_seen += stats.core_missing_seen;
                 dsq_refusals += stats.dsq_refusals;
+                entity_own += stats.entity_own;
+                entity_ancestor += stats.entity_ancestor;
             }
         }
 
@@ -1056,7 +1060,8 @@ impl<'a> Scheduler<'a> {
              handoff_duplicates={handoff_duplicates} \
              faults_injected={faults_injected} core_rescues={core_rescues} \
              core_missing_seen={core_missing_seen} \
-             handoff_inflight={handoff_inflight} dsq_refusals={dsq_refusals}"
+             handoff_inflight={handoff_inflight} dsq_refusals={dsq_refusals} \
+             entity: own={entity_own} ancestor={entity_ancestor}"
         );
 
         if self.trace

@@ -2403,36 +2403,46 @@ static __noinline u32 inf_lookup_entity(inf_cpu_block_t *blk, u64 cgrp_id)
 }
 
 /*
- * Find or create the entity of every cgroup between the task's cgroup and
- * the root, and return the entity that holds the task. The walk starts at
- * the top of the chain, so a parent entity exists before its child.
+ * Find or create the entity of the task's own cgroup and of its admitted
+ * ancestors, and return the entity that holds the task.
  *
- * A full group pool falls back to the nearest ancestor that has an
- * entity, or to the root entity. The task stays runnable and the overflow
- * is counted.
+ * cgrp->ancestors[] is indexed from the root: ancestors[0] is the root and
+ * ancestors[cgrp->level] is the cgroup itself (include/linux/cgroup.h,
+ * cgroup_ancestor()). The walk therefore ends at the task's own cgroup, so
+ * the own group gets its own entity and its own share instead of the task
+ * joining only an ancestor. The walk starts at the top of the chain, so a
+ * parent entity exists before its child.
+ *
+ * The chain keeps the four-level bound of D1. A cgroup deeper than the
+ * bound joins the deepest admitted ancestor entity. A full group pool
+ * falls back to the nearest ancestor that has an entity, or to the root
+ * entity. The task stays runnable and the overflow is counted.
  */
 static __noinline u32 inf_resolve_leaf(inf_cpu_block_t *blk,
 				       struct cgroup *cgrp, u64 *cgrp_id_out)
 {
 	u32 parent = 0;
-	int level;
+	int level, depth;
 	int i;
+	bool own_leaf = false;
 
 	*cgrp_id_out = 0;
 	if (!cgrp)
 		return 0;
 
 	level = BPF_CORE_READ(cgrp, level);
-	if (level > INF_MAX_LEVELS)
-		level = INF_MAX_LEVELS;
+	if (level < 0)
+		return 0;
 
-	for (i = 1; i <= INF_CHAIN_MAX && can_loop; i++) {
+	depth = level;
+	if (depth > INF_MAX_LEVELS)
+		depth = INF_MAX_LEVELS;
+
+	for (i = 1; i <= depth && can_loop; i++) {
 		struct cgroup *anc;
 		u64	       id;
 		u32	       idx;
 
-		if (i > level)
-			break;
 		anc = inf_cgroup_ancestor(cgrp, i);
 		if (!anc)
 			break;
@@ -2454,9 +2464,18 @@ static __noinline u32 inf_resolve_leaf(inf_cpu_block_t *blk,
 			}
 		}
 		parent = idx;
+		own_leaf = i == level;
 	}
 
 	*cgrp_id_out = inf_cgroup_id(cgrp);
+	if (level == 0) {
+		/* No cgroup level to charge: the task joins the root. */
+		return parent;
+	}
+	if (own_leaf)
+		INF_STAT_INC(entity_own);
+	else
+		INF_STAT_INC(entity_ancestor);
 	return parent;
 }
 
