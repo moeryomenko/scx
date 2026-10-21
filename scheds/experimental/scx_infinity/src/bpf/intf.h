@@ -91,16 +91,35 @@ typedef signed long    s64;
 #define INF_MAX_COUNTERS 8
 #define INF_COUNTER_BAND 0
 #define INF_COUNTER_PEEK 1
+/* The number of parent queues the current selection has inspected. */
+#define INF_COUNTER_DEPTH 2
+/* The attempt of the current selection, counted in the arena. */
+#define INF_COUNTER_RETRY 3
 
 /* One tail insertion in every eight normal insertions. */
 #define INF_GATE_MASK 7U
 
 /*
- * The maximum number of tree levels, from the leaf parent to the root.
- * The cgroup hierarchy is at most cgroup.max.depth deep, and the kernel
- * limit is 16, so a tree of 16 levels covers every hierarchy.
+ * The maximum number of group levels of one entity chain, from the leaf
+ * parent to the child of the root. A task whose cgroup is deeper joins the
+ * deepest ancestor that has an entity, so this is also the bound of the
+ * chain that a selection walks.
  */
 #define INF_MAX_LEVELS 4
+
+/*
+ * The number of parent queues one selection inspects. A chain of
+ * INF_MAX_LEVELS group levels puts a task in the queue below the deepest
+ * group, so the descent needs four group steps plus the terminal queue that
+ * holds the task. The bound was INF_MAX_LEVELS, which refused the terminal
+ * queue of a four-level chain: the fourth winner was a group, the loop ran
+ * out, and the selection returned no leaf while the group still held
+ * runnable tasks. That is the stall this bound fixes.
+ */
+#define INF_SEL_DEPTH_MAX (INF_MAX_LEVELS + 1)
+
+/* The number of times a selection restarts after it repairs a stale level. */
+#define INF_SELECT_RETRY_MAX 4
 
 /* Group entities per CPU and the open-addressed index slots per CPU. */
 #define INF_GROUPS_PER_CPU 128
@@ -299,14 +318,105 @@ struct inf_reservation {
 
 /*
  * The path of a selection: the group entities from the leaf parent to the
- * root, and the service minimum of every level. It is the scratch of one
- * selection and the record of one held path.
+ * root, and the service minimum of every queue the selection inspected. It
+ * is the scratch of one selection and the record of one held path.
+ *
+ * ent[] holds one group per descent, so it is INF_MAX_LEVELS long. vmin[]
+ * holds the minimum of every inspected queue, the terminal queue included,
+ * so it is INF_SEL_DEPTH_MAX long. The selected task is the terminal
+ * inspection: it is found in the queue at depth path->depth, whose owner is
+ * ent[path->depth - 1], or the root entity when path->depth is zero.
  */
 struct inf_path {
 	u32 ent[INF_MAX_LEVELS];
-	u64 vmin[INF_MAX_LEVELS];
+	u64 vmin[INF_SEL_DEPTH_MAX];
 	u32 depth;
 	u32 pad;
+};
+
+/*
+ * The reason a local selection returned no leaf. Each one is a distinct
+ * defect or a normal empty tree, so a stall report names the one that
+ * happened instead of saying that nothing was found.
+ */
+#define INF_SEL_EMPTY 1 /* a visited queue had no child */
+#define INF_SEL_SCAN 2 /* the band scan could not take a queue lock */
+#define INF_SEL_ZERO_COUNT 3 /* the winning group had no dispatchable child */
+#define INF_SEL_RETRY 4 /* the restart bound ran out */
+#define INF_SEL_DEPTH 5 /* a group entity below INF_MAX_LEVELS */
+#define INF_SEL_NO_ENTITY 6 /* a visited parent index has no entity */
+#define INF_SEL_REASONS 8 /* power of two, indexes 0..INF_SEL_REASONS-1 */
+
+/* The flags of one inspected queue. */
+#define INF_SEL_F_FIRST_GROUP 1U /* the queue head is a group entity */
+#define INF_SEL_F_ROOT_GROUP 2U /* the tree root is a group entity */
+#define INF_SEL_F_EMPTY 4U /* the queue had no child */
+#define INF_SEL_F_WIN_GROUP 8U /* the winner is a group entity */
+
+/*
+ * One parent queue that a selection inspected.
+ *
+ * A raw arena address cannot be stored in a map value, so the queue root
+ * and its head are named by identity: the entity index for a group entity
+ * and the pid for a task. count, state, refs and generation are the fields
+ * of the winning group entity that decide whether its children are
+ * reachable and dispatchable. scan is the return value of the band scan of
+ * that queue.
+ */
+struct inf_sel_level {
+	u64 v; /* service value of the winner */
+	u64 vmin; /* service minimum of the queue */
+	u64 count; /* dispatchable children of the winner */
+	u64 nr; /* children in the queue */
+	u64 generation; /* cgroup generation of the winner */
+	u64 frontier; /* frontier of the queue */
+	u32 parent; /* entity index of the queue owner */
+	u32 child; /* entity index of the winner, INF_IDX_NONE for a task */
+	s32 first; /* identity of the queue head */
+	s32 root; /* identity of the queue tree root */
+	s32 pid; /* pid of the winner when it is a task */
+	u32 depth; /* depth of the queue, root is zero */
+	u32 state; /* state of the winner */
+	u32 refs; /* hold count of the winner */
+	u32 scan; /* inf_band_scan() return, as a signed value */
+	u32 class; /* insertion class of the winner */
+	u32 flags; /* INF_SEL_F_* */
+};
+
+/*
+ * The persistent dispatch snapshot of one CPU.
+ *
+ * A selection that finds no leaf records every queue it inspected here
+ * before the steal overwrites the selection scratch of that CPU. The record
+ * is written at the failure, not at exit: the exit snapshots of
+ * inf_dump_queues() run after the disable pass has emptied every tree, so
+ * they cannot show a stalled state.
+ *
+ * The map is pinned in bpffs, so the entry outlives the scheduler process
+ * and user space reads it after the run. It is never cleared by the
+ * scheduler, and it is taken before stealing on purpose: a steal that
+ * succeeds would otherwise erase the only record of a local selection that
+ * handed out nothing while the tree still held tasks.
+ *
+ * reason_count[] counts every failure by reason, so a clean run shows that
+ * the depth, retry, zero-count and scan reasons never happened, not only
+ * that the last one did not.
+ */
+struct inf_dispatch_snap {
+	u64 ts; /* scx_bpf_now() of the last failure */
+	u64 reason_count[INF_SEL_REASONS]; /* failures per reason */
+	u64 cpu;
+	u64 depth; /* the advisory tree depth at the failure */
+	u64 generation; /* live configuration generation */
+	u64 attempts; /* selection attempts of the last failure */
+	u64 band_full; /* band scans that reached INF_BAND_SCAN_MAX */
+	u64 band_tail_node; /* of those, the first uninspected child */
+	u64 band_tail_null; /* of those, the queue ended at the bound */
+	u32 reason; /* INF_SEL_* of the last failure */
+	u32 cause; /* reason of the last restart, zero when none */
+	u32 nr_levels; /* levels recorded */
+	u32 pad;
+	struct inf_sel_level lvl[INF_SEL_DEPTH_MAX];
 };
 
 struct inf_cpu_ctx {

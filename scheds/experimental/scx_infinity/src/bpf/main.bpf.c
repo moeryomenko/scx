@@ -106,6 +106,25 @@ struct {
 } stats_stor SEC(".maps");
 
 /*
+ * The persistent dispatch snapshot, one entry per possible CPU.
+ *
+ * It is written when a local selection returns no leaf, before the steal
+ * overwrites the selection scratch of that CPU, and it is never cleared.
+ * The map is pinned in bpffs, so the entry survives the scheduler process:
+ * the exit dump of main.rs runs after the disable pass and cannot show a
+ * state the disable pass has already rewritten. A stalled run reads the
+ * entry through bpftool, and a clean run shows that the depth, retry,
+ * zero-count and scan reasons of the selection never happened.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, INF_MAX_CPUS);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+	__type(key, u32);
+	__type(value, struct inf_dispatch_snap);
+} dsnap_stor SEC(".maps");
+
+/*
  * One group entity of the tree.
  *
  * The node is at offset 0, so a queue that holds group entities returns
@@ -201,6 +220,25 @@ struct inf_cpu_block {
 	 * path arrays have no static bound for the verifier to check.
 	 */
 	struct inf_path path;
+	/*
+	 * The queues the last selection attempt inspected, and why it
+	 * returned no leaf. The dispatch copies this into dsnap_stor before
+	 * the steal reuses the scratch, so a stalled CPU keeps a record of
+	 * the selection that handed out nothing.
+	 */
+	struct inf_sel_level sel[INF_SEL_DEPTH_MAX];
+	u32		     sel_levels;
+	u32		     sel_attempts;
+	u32		     sel_reason;
+	u32		     sel_cause;
+	/*
+	 * The band scans of this CPU that reached INF_BAND_SCAN_MAX, and
+	 * whether the first uninspected child was a node or the end of the
+	 * walk. The counter is copied into the persistent snapshot.
+	 */
+	u64 band_full;
+	u64 band_tail_node;
+	u64 band_tail_null;
 	/*
 	 * The winner of a band scan. The scan reports it through the
 	 * scratch, so its return value carries no pointer and the caller
@@ -707,7 +745,7 @@ static __noinline void inf_snap_path(task_ctx *tctx, struct inf_task_snap *snap)
 }
 
 /* True when a RUNNABLE task cannot be reached from the root of its tree. */
-static __always_inline bool inf_path_lost(task_ctx *tctx,
+static __always_inline bool inf_path_lost(task_ctx	       *tctx,
 					  struct inf_task_snap *snap)
 {
 	if (tctx->state != INF_ENTITY_RUNNABLE)
@@ -753,13 +791,13 @@ static __noinline void inf_trace_path_lost(task_ctx *tctx, u32 op)
 	}
 
 	{
-		u32 slot2 = tctx->hist_idx & 7;
+		u32 slot2		 = tctx->hist_idx & 7;
 
-		tctx->hist[slot2].op	  = INF_TR_PATH_LOST;
-		tctx->hist[slot2].src	  = tctx->queued_cpu;
-		tctx->hist[slot2].dst	  = (s32)op;
-		tctx->hist[slot2].result  = (s32)tctx->parent_idx;
-		tctx->hist[slot2].state	  = tctx->state;
+		tctx->hist[slot2].op	 = INF_TR_PATH_LOST;
+		tctx->hist[slot2].src	 = tctx->queued_cpu;
+		tctx->hist[slot2].dst	 = (s32)op;
+		tctx->hist[slot2].result = (s32)tctx->parent_idx;
+		tctx->hist[slot2].state	 = tctx->state;
 		tctx->hist_idx++;
 	}
 }
@@ -914,11 +952,11 @@ static __noinline void inf_dump_queues(void)
 			continue;
 
 		__builtin_memset(qs, 0, sizeof(*qs));
-		qs->cpu	  = (s32)cpu;
-		qs->depth = READ_ONCE(cctx->depth);
+		qs->cpu	     = (s32)cpu;
+		qs->depth    = READ_ONCE(cctx->depth);
 		qs->local_nr = scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu);
 
-		root	  = inf_entity(blk, 0);
+		root	     = inf_entity(blk, 0);
 		if (!root)
 			continue;
 
@@ -1902,20 +1940,37 @@ static __noinline int inf_band_scan(inf_cpu_block_t *blk, scx_edq_t *queue,
 
 	scanned = scratch->counter[INF_COUNTER_BAND];
 
+	/*
+	 * The loop stops on the bound before it inspects the next child, so
+	 * n is the first child the scan did not visit. It is NULL when the
+	 * queue ran out exactly at the bound: inf_queue_next() dereferences
+	 * node->right (queue.h), so the walk must not advance it again. The
+	 * old code did, and an arena READ fault at offset 0x10 of a NULL node
+	 * was that read, not a corrupt tree link.
+	 */
 	if (scanned >= INF_BAND_SCAN_MAX) {
-		/* The next child decides whether the band is wider. */
-		scx_edq_node_t *next = inf_queue_next(n);
+		/*
+		 * The three counters live in the block, so the scan takes no
+		 * map pointer and keeps no state across the queue lock. A
+		 * later selection failure copies them into the persistent
+		 * snapshot, and they are cumulative, so a copy taken after a
+		 * full scan still reports that scan.
+		 */
+		__sync_fetch_and_add(&scratch->band_full, 1);
 
-		if (next) {
-			scx_edq_task_t *nt = inf_queue_node_task(next);
+		if (n) {
+			scx_edq_task_t *nt = inf_queue_node_task(n);
 			u64		nv, ntie;
 			u32		ncls;
 
+			__sync_fetch_and_add(&scratch->band_tail_node, 1);
 			inf_node_info(blk, (u64)nt, &nv, &ncls, &ntie);
 			if (inf_in_band_mask(nv, vmin)) {
 				*truncated = true;
 				INF_STAT_INC(band_scan_truncated);
 			}
+		} else {
+			__sync_fetch_and_add(&scratch->band_tail_null, 1);
 		}
 	}
 
@@ -1934,41 +1989,162 @@ static __noinline int inf_band_scan(inf_cpu_block_t *blk, scx_edq_t *queue,
 }
 
 /*
+ * The identity of one child of a parent queue.
+ *
+ * A raw arena address cannot be stored in a map value, so a group entity is
+ * named by its entity index and a task by its pid. Both name the child
+ * across a dump, and the index is also what a later lookup takes.
+ */
+static __always_inline void inf_child_identity(inf_cpu_block_t *blk,
+					       scx_edq_node_t *node, s32 *id,
+					       u32 *is_group)
+{
+	scx_edq_task_t *t;
+
+	*id	  = -1;
+	*is_group = 0;
+	if (!node)
+		return;
+
+	t = inf_queue_node_task(node);
+	if (inf_node_is_group(blk, (u64)t)) {
+		*id	  = (s32)inf_entity_index(blk, (inf_group_entity_t *)t);
+		*is_group = 1;
+		return;
+	}
+	*id = (s32)inf_task_from_qnode(t)->pid;
+}
+
+/*
+ * Record one parent queue that the current selection attempt inspected.
+ *
+ * Only the fields that the failure path cannot rebuild are stored here: the
+ * owner, the depth, the queue minimum, the scan return and the identity of
+ * the winner. Everything else is read back from the entities when the
+ * persistent snapshot is taken. The function is inlined, and the split is
+ * not cosmetic: every field written here costs verifier states in the
+ * dispatch program, which is at the instruction limit, while the failure
+ * path runs once per failed selection.
+ */
+static __always_inline void inf_sel_note(inf_cpu_block_t *blk,
+					 inf_cpu_block_t *scratch, u32 depth,
+					 u32 parent, u64 vmin, int scan)
+{
+	struct inf_sel_level __arena *lvl;
+	u32			      is_group;
+	s32			      id;
+
+	if (depth >= INF_SEL_DEPTH_MAX)
+		return;
+
+	lvl	    = &scratch->sel[depth];
+	lvl->depth  = depth;
+	lvl->parent = parent;
+	lvl->vmin   = vmin;
+	lvl->scan   = (u32)scan;
+	lvl->child  = INF_IDX_NONE;
+	lvl->pid    = -1;
+	lvl->flags  = 0;
+
+	if (scratch->win.valid) {
+		inf_child_identity(blk, &scratch->win.task->node, &id,
+				   &is_group);
+		if (is_group) {
+			lvl->child  = (u32)id;
+			lvl->flags |= INF_SEL_F_WIN_GROUP;
+		} else {
+			lvl->pid = id;
+		}
+	}
+
+	if (scratch->sel_levels <= depth)
+		scratch->sel_levels = depth + 1;
+}
+
+/*
  * Descend from the root of the tree and return the leaf task and the path
  * that holds it. The scan changes no key, no gate, no service and no
  * frontier. The caller applies the frontier when it commits the
  * selection.
+ *
+ * The descent inspects INF_SEL_DEPTH_MAX queues: the root queue, one queue
+ * per group descent, and the terminal queue that holds the task. A chain of
+ * INF_MAX_LEVELS group levels therefore ends at depth INF_MAX_LEVELS, which
+ * is the terminal inspection. A group entity found at that depth is deeper
+ * than the chain builder can produce, so the selection refuses it and names
+ * the level instead of writing past path->ent[].
  */
 static __noinline bool
 inf_select_leaf(inf_cpu_block_t *blk, inf_cpu_block_t *scratch, task_ctx **leaf)
 {
 	struct inf_path __arena *path = &scratch->path;
 	u32			 attempt;
-	u32			 depth	 = 0;
 	u32			 parent	 = 0;
+	u32			 cause	 = 0;
 	bool			 restart = false;
 	int			 ret;
 
-	for (attempt = 0; attempt < 4; attempt++) {
-		restart = false;
-		parent	= 0;
-		depth	= 0;
+	scratch->sel_levels   = 0;
+	scratch->sel_attempts = 0;
+	scratch->sel_reason   = INF_SEL_EMPTY;
+	scratch->sel_cause    = 0;
+
+	/*
+	 * Both counters live in the arena, so the verifier sees imprecise
+	 * values and analyses one descent in one converging state instead of
+	 * once per attempt and level. The dispatch program is at the
+	 * verifier instruction limit and an unrolled terminal level does not
+	 * fit. The bounds are the same.
+	 */
+	scratch->counter[INF_COUNTER_RETRY] = 0;
+	while (can_loop) {
+		attempt = scratch->counter[INF_COUNTER_RETRY];
+		if (attempt >= INF_SELECT_RETRY_MAX)
+			break;
+		scratch->counter[INF_COUNTER_RETRY] = attempt + 1;
+
+		restart		      = false;
+		parent		      = 0;
+		scratch->sel_levels   = 0;
+		scratch->sel_attempts = attempt + 1;
+		scratch->counter[INF_COUNTER_DEPTH] = 0;
 
 		/*
-		 * The depth is the loop counter, so the verifier sees the
-		 * bound of the path arrays.
+		 * INF_SEL_DEPTH_MAX inspections: the root queue, one queue
+		 * per group descent, and the terminal queue that holds the
+		 * task. A four-level chain ends at the terminal queue, which
+		 * the selection used to leave uninspected.
 		 */
-		for (depth = 0; depth < INF_MAX_LEVELS && can_loop; depth++) {
-			inf_group_entity_t *pe = inf_entity(blk, parent);
-			struct inf_cand	    win;
+		while (can_loop) {
+			inf_group_entity_t *pe;
+			u32		    depth;
 			u64		    vmin  = 0;
 			bool		    trunc = false;
 
-			if (!pe)
+			/*
+			 * One load, so the verifier can bound the value it
+			 * indexed: after the check the index is inside
+			 * path->vmin[].
+			 */
+			depth = scratch->counter[INF_COUNTER_DEPTH];
+			if (depth >= INF_SEL_DEPTH_MAX)
+				break;
+			scratch->counter[INF_COUNTER_DEPTH] = depth + 1;
+
+			pe = inf_entity(blk, parent);
+			if (!pe) {
+				scratch->sel_reason = INF_SEL_NO_ENTITY;
 				return false;
+			}
 
 			ret = inf_band_scan(blk, &pe->children, scratch,
 					    pe->frontier_q16, &vmin, &trunc);
+			/*
+			 * Record the queue before the branch, so a refused
+			 * scan and a stale winner leave the same record as a
+			 * good one.
+			 */
+			inf_sel_note(blk, scratch, depth, parent, vmin, ret);
 			if (ret) {
 				/*
 				 * A group entity that sits in its parent queue
@@ -1987,18 +2163,21 @@ inf_select_leaf(inf_cpu_block_t *blk, inf_cpu_block_t *scratch, task_ctx **leaf)
 					pe->state = INF_ENTITY_INACTIVE;
 					pe->count = 0;
 					INF_STAT_INC(state_repairs);
+					cause	= INF_SEL_EMPTY;
 					restart = true;
 					break;
 				}
+				scratch->sel_reason = ret == -ENOENT ?
+							      INF_SEL_EMPTY :
+							      INF_SEL_SCAN;
 				return false;
 			}
-			win		  = scratch->win;
 
 			path->vmin[depth] = vmin;
 
-			if (inf_node_is_group(blk, (u64)win.task)) {
+			if (inf_node_is_group(blk, (u64)scratch->win.task)) {
 				inf_group_entity_t *e =
-					(inf_group_entity_t *)win.task;
+					(inf_group_entity_t *)scratch->win.task;
 
 				if (e->count == 0) {
 					/*
@@ -2014,50 +2193,92 @@ inf_select_leaf(inf_cpu_block_t *blk, inf_cpu_block_t *scratch, task_ctx **leaf)
 							     &e->qnode);
 					e->state = INF_ENTITY_INACTIVE;
 					INF_STAT_INC(state_repairs);
-					inf_queue_drop(win.task);
+					inf_queue_drop(scratch->win.task);
+					cause	= INF_SEL_ZERO_COUNT;
 					restart = true;
 					break;
 				}
 
+				/*
+				 * A group at the terminal depth has no queue
+				 * left to inspect. The chain builder caps the
+				 * entity chain at INF_MAX_LEVELS group levels,
+				 * so this is a tree defect. Refuse it here
+				 * instead of writing path->ent[] one past its
+				 * last element.
+				 */
+				if (depth >= INF_MAX_LEVELS) {
+					scratch->sel_reason = INF_SEL_DEPTH;
+					inf_queue_drop(scratch->win.task);
+					return false;
+				}
+
 				path->ent[depth] = inf_entity_index(blk, e);
 				parent		 = path->ent[depth];
-				inf_queue_drop(win.task);
+				inf_queue_drop(scratch->win.task);
 				continue;
 			}
 
 			/* The winner is a task: the leaf of the path. */
 			path->depth = depth;
-			*leaf	    = inf_task_from_qnode(win.task);
-			inf_queue_drop(win.task);
+			*leaf	    = inf_task_from_qnode(scratch->win.task);
+			inf_queue_drop(scratch->win.task);
 			return true;
 		}
 
-		if (!restart)
-			return false;
+		if (restart)
+			continue;
+
+		/*
+		 * The bound was reached with a group still on the path: the
+		 * same defect as a group found at the terminal depth.
+		 */
+		scratch->sel_reason = INF_SEL_DEPTH;
+		return false;
 	}
 
+	scratch->sel_reason = INF_SEL_RETRY;
+	scratch->sel_cause  = cause;
 	return false;
 }
 
 /*
- * The service minimum of every level of a path becomes the frontier of
- * the queue at that level. The frontier never decreases.
+ * The service minimum of every queue the selection inspected becomes the
+ * frontier of that queue. The frontier never decreases.
+ *
+ * The terminal queue counts too. The selected task is the band minimum of
+ * the queue that held it, and that queue advances to the same frontier as
+ * every queue above it: a task that re-enters later must not be able to
+ * pass the task that was just selected. The terminal queue is at depth
+ * path->depth and its owner is path->ent[path->depth - 1], or the root
+ * entity for a task of the root cgroup.
  */
 static __always_inline void inf_apply_frontier(inf_cpu_block_t	       *blk,
 					       struct inf_path __arena *path)
 {
-	u32 i;
+	u32 i, depth = path->depth;
 
-	for (i = 0; i < path->depth && i < INF_MAX_LEVELS; i++) {
-		inf_group_entity_t *par = inf_entity(
-			blk,
-			i == 0 ? 0 : path->ent[(i - 1) & (INF_MAX_LEVELS - 1)]);
+	if (depth >= INF_SEL_DEPTH_MAX)
+		depth = INF_SEL_DEPTH_MAX - 1;
+
+	for (i = 0; i <= depth && can_loop; i++) {
+		inf_group_entity_t *par;
+		u32 vi = i < INF_SEL_DEPTH_MAX ? i : INF_SEL_DEPTH_MAX - 1;
+
+		if (i == 0) {
+			par = inf_entity(blk, 0);
+		} else {
+			u32 pi = i - 1;
+
+			if (pi >= INF_MAX_LEVELS)
+				pi = INF_MAX_LEVELS - 1;
+			par = inf_entity(blk, path->ent[pi]);
+		}
 
 		if (!par)
 			continue;
 		par->frontier_q16 =
-			inf_service_max(par->frontier_q16,
-					path->vmin[i & (INF_MAX_LEVELS - 1)]);
+			inf_service_max(par->frontier_q16, path->vmin[vi]);
 	}
 }
 
@@ -2615,7 +2836,13 @@ static __noinline bool inf_wakee_wins(inf_cpu_block_t *blk, task_ctx *tctx)
 	u32		idx  = (u32)tctx->parent_idx;
 	u32		level;
 
-	for (level = 0; level < INF_MAX_LEVELS && can_loop; level++) {
+	/*
+	 * The walk checks the queue of the leaf parent and the queue of every
+	 * ancestor, the root queue included. A four-level chain has five
+	 * queues on its path, so the bound is INF_MAX_LEVELS levels plus the
+	 * root.
+	 */
+	for (level = 0; level <= INF_MAX_LEVELS && can_loop; level++) {
 		inf_group_entity_t *pe = inf_entity(blk, idx);
 		scx_edq_node_t	   *hn;
 		scx_edq_task_t	   *head;
@@ -3265,6 +3492,15 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 		inf_trace(INF_TR_REQUEUE, tctx,
 			  INF_TR_WHERE(tctx->path_cpu, cpu), (s64)event);
 		inf_resolve_pending(tctx);
+		/*
+		 * The path re-entered the tree of @cpu. When this callback
+		 * runs on another CPU, the owner of that tree can be idle,
+		 * and an idle CPU has nothing to wake it: a task that
+		 * re-enters without a kick waits for the watchdog. The
+		 * admission below kicks for the same reason.
+		 */
+		if (cpu != bpf_get_smp_processor_id())
+			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
 		return 0;
 	}
 
@@ -3394,6 +3630,129 @@ static __noinline bool inf_steal_one(s32 cpu, struct inf_cpu_ctx *cctx,
 				     task_ctx **out, u32 *leaf_out);
 
 /*
+ * Copy the selection scratch of @cpu into the persistent dispatch snapshot.
+ *
+ * This runs when the local selection found no leaf, before the steal reuses
+ * the path and the counters of the block. The entry is written once per
+ * failed selection and is never cleared, so the state of the last failure
+ * outlives the scheduler: the exit dump of main.rs runs after the disable
+ * pass and cannot show a tree that the disable pass has already emptied.
+ *
+ * The per-reason counters are the other half of the record. A stall that
+ * aborts the scheduler leaves the reason of its last selection here, and a
+ * clean run shows that the depth, retry, zero-count and scan reasons never
+ * happened at all.
+ */
+static __noinline void inf_snap_selection(s32 cpu, inf_cpu_block_t *blk)
+{
+	struct inf_dispatch_snap *snap;
+	struct inf_cfg		 *cfg;
+	struct inf_cpu_ctx	 *cctx;
+	u32			  key = (u32)cpu;
+	u32			  i, n, reason;
+
+	snap = bpf_map_lookup_elem(&dsnap_stor, &key);
+	if (!snap)
+		return;
+
+	reason = blk->sel_reason;
+	if (reason >= INF_SEL_REASONS)
+		reason = 0;
+
+	n = blk->sel_levels;
+	if (n > INF_SEL_DEPTH_MAX)
+		n = INF_SEL_DEPTH_MAX;
+
+	snap->ts	 = bpf_ktime_get_ns();
+	snap->cpu	 = (u64)cpu;
+	snap->reason	 = blk->sel_reason;
+	snap->cause	 = blk->sel_cause;
+	snap->attempts	 = blk->sel_attempts;
+	snap->nr_levels	 = n;
+	snap->generation = 0;
+	snap->depth	 = 0;
+
+	cfg		 = inf_cfg();
+	if (cfg)
+		snap->generation = READ_ONCE(cfg->generation);
+
+	cctx = inf_cpu_ctx(cpu);
+	if (cctx && cctx->depth > 0)
+		snap->depth = (u64)cctx->depth;
+
+	snap->band_full	     = blk->band_full;
+	snap->band_tail_node = blk->band_tail_node;
+	snap->band_tail_null = blk->band_tail_null;
+
+	__sync_fetch_and_add(&snap->reason_count[reason], 1);
+
+	/*
+	 * An empty root queue has nothing to descend into, so its record says
+	 * only that the tree was empty. Every other failure keeps the queues
+	 * it inspected.
+	 */
+	if (reason == INF_SEL_EMPTY && n <= 1)
+		return;
+
+	for (i = 0; i < INF_SEL_DEPTH_MAX && can_loop; i++) {
+		struct inf_sel_level __arena *src;
+		inf_group_entity_t	     *pe;
+		u32			      is_group;
+		s32			      id;
+
+		if (i >= n)
+			break;
+		src = &blk->sel[i];
+
+		snap->lvl[i].depth  = src->depth;
+		snap->lvl[i].parent = src->parent;
+		snap->lvl[i].vmin   = src->vmin;
+		snap->lvl[i].scan   = src->scan;
+		snap->lvl[i].child  = src->child;
+		snap->lvl[i].pid    = src->pid;
+		snap->lvl[i].flags  = src->flags;
+
+		/*
+		 * The queue of the level: its size, its frontier and the
+		 * identity of its tree root and its head. The scan left the
+		 * queue unlocked, so these fields are advisory, which is what
+		 * the record is.
+		 */
+		pe = inf_entity(blk, src->parent);
+		if (pe) {
+			snap->lvl[i].nr	     = inf_queue_nr(&pe->children);
+			snap->lvl[i].frontier = pe->frontier_q16;
+			inf_child_identity(blk, pe->children.first, &id,
+					   &is_group);
+			snap->lvl[i].first = id;
+			if (is_group)
+				snap->lvl[i].flags |= INF_SEL_F_FIRST_GROUP;
+			inf_child_identity(blk, pe->children.root, &id,
+					   &is_group);
+			snap->lvl[i].root = id;
+			if (is_group)
+				snap->lvl[i].flags |= INF_SEL_F_ROOT_GROUP;
+			if (!pe->children.first)
+				snap->lvl[i].flags |= INF_SEL_F_EMPTY;
+		}
+
+		/* The winning group of the level. */
+		if (src->flags & INF_SEL_F_WIN_GROUP) {
+			inf_group_entity_t *e = inf_entity(blk, src->child);
+
+			if (e) {
+				snap->lvl[i].v	   = e->v_q16;
+				snap->lvl[i].class = e->class;
+				snap->lvl[i].count = e->count;
+				snap->lvl[i].state = e->state;
+				snap->lvl[i].refs  = e->refs;
+				snap->lvl[i].generation = e->generation;
+			}
+		}
+	}
+}
+
+/*
  * Select the leaf task of this CPU's tree and hand it to the local DSQ.
  * The path of the task leaves the tree and is held by the reservation.
  */
@@ -3434,6 +3793,15 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 						       (INF_MAX_LEVELS - 1)] :
 					     0;
 	} else {
+		/*
+		 * The local selection handed out nothing. Copy its scratch
+		 * into the persistent snapshot before the steal overwrites
+		 * it: a stall on this CPU is an idle CPU with tasks in core
+		 * custody and no other record, because the exit snapshots run
+		 * after the disable pass.
+		 */
+		inf_snap_selection(cpu, blk);
+
 		if (!inf_steal_one(cpu, cctx, &tctx, &leaf_idx)) {
 			/*
 			 * The tree reports runnable tasks through its depth,
@@ -4132,7 +4500,8 @@ void BPF_STRUCT_OPS(infinity_dequeue, struct task_struct *p, u64 deq_flags)
 		return;
 
 	{
-		struct inf_cpu_ctx *cc = inf_cpu_ctx(bpf_get_smp_processor_id());
+		struct inf_cpu_ctx *cc =
+			inf_cpu_ctx(bpf_get_smp_processor_id());
 
 		if (cc)
 			cc->deq_calls++;
@@ -4217,7 +4586,8 @@ void BPF_STRUCT_OPS(infinity_quiescent, struct task_struct *p, u64 deq_flags)
 		return;
 
 	{
-		struct inf_cpu_ctx *cc = inf_cpu_ctx(bpf_get_smp_processor_id());
+		struct inf_cpu_ctx *cc =
+			inf_cpu_ctx(bpf_get_smp_processor_id());
 
 		if (cc)
 			cc->q_calls++;
@@ -4543,7 +4913,7 @@ inf_probe_target(struct inf_fault_ctl *fault)
 	if (!e)
 		return NULL;
 	n = e->children.first;
-	for (level = 0; n && level < INF_MAX_LEVELS && can_loop; level++) {
+	for (level = 0; n && level <= INF_MAX_LEVELS && can_loop; level++) {
 		scx_edq_task_t *node = inf_queue_node_task(n);
 
 		if (!inf_node_is_group(blk, (u64)node)) {
@@ -4618,7 +4988,8 @@ void BPF_STRUCT_OPS(infinity_running, struct task_struct *p)
 		return;
 
 	{
-		struct inf_cpu_ctx *cc = inf_cpu_ctx(bpf_get_smp_processor_id());
+		struct inf_cpu_ctx *cc =
+			inf_cpu_ctx(bpf_get_smp_processor_id());
 
 		if (cc)
 			cc->run_calls++;
@@ -4689,7 +5060,8 @@ void BPF_STRUCT_OPS(infinity_tick, struct task_struct *p)
 		return;
 
 	{
-		struct inf_cpu_ctx *cc = inf_cpu_ctx(bpf_get_smp_processor_id());
+		struct inf_cpu_ctx *cc =
+			inf_cpu_ctx(bpf_get_smp_processor_id());
 
 		if (cc)
 			cc->tick_calls++;
@@ -4748,7 +5120,8 @@ void BPF_STRUCT_OPS(infinity_stopping, struct task_struct *p, bool runnable)
 		return;
 
 	{
-		struct inf_cpu_ctx *cc = inf_cpu_ctx(bpf_get_smp_processor_id());
+		struct inf_cpu_ctx *cc =
+			inf_cpu_ctx(bpf_get_smp_processor_id());
 
 		if (cc)
 			cc->stop_calls++;
