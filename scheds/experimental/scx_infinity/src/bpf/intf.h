@@ -705,6 +705,7 @@ struct inf_task_ctx_layout {
 	u64 cgrp_id;
 	u64 slice_ns;
 	u64 last_running_ns;
+	u64 park_ns;
 	u64 base_weight;
 	u64 pending_weight;
 	u32 path_ent[INF_MAX_LEVELS];
@@ -751,6 +752,59 @@ struct inf_stats {
 	u64 yields;
 	u64 cgrp_throttled;
 	u64 cgrp_reenqueued;
+	/*
+	 * One counter per bandwidth integration point. The quota path is a
+	 * chain of hooks, and a chain that never fires is invisible without
+	 * them: bw_gate counts the enqueue hooks that reach the throttle
+	 * test, bw_eagain the ones it refuses, bw_park_ok the tasks the
+	 * backlog accepted, bw_cb the reenqueue callbacks the library runs,
+	 * bw_drain the dispatch drains, bw_consume the settles that pass
+	 * actual runtime, and bw_consume_ns the runtime they pass, so the
+	 * sum can be compared with the cgroup's own cpu.stat.
+	 */
+	u64 bw_gate;
+	u64 bw_eagain;
+	u64 bw_terr;
+	u64 bw_park_ok;
+	u64 bw_park_fail;
+	u64 bw_cb;
+	u64 bw_drain;
+	u64 bw_drain_err;
+	u64 bw_consume;
+	u64 bw_consume_ns;
+	u64 bw_consume_err;
+	u64 bw_consume_skip;
+	u64 bw_set;
+	u64 bw_set_err;
+	u64 bw_init;
+	u64 bw_init_err;
+	u64 bw_move;
+	u64 bw_move_err;
+	u64 bw_cancel;
+	u64 bw_lib_init_err;
+	/* Renewed slots that opened a reservation for the slot they renew. */
+	u64 resv_renew;
+	/*
+	 * The actual-runtime charge, split by the locality of the slot it
+	 * settles. A local settle reads the clock of the CPU that runs the
+	 * task; a remote settle cannot and counts one reserved slot. The
+	 * two sums tell which one the runtime of a run came from.
+	 */
+	u64 settle_local;
+	u64 settle_local_ns;
+	u64 settle_remote;
+	u64 settle_remote_ns;
+	u64 settle_max_ns;
+	u64 settle_over_slot;
+	/*
+	 * The residency of a parked task: the sum of the intervals between
+	 * the put-aside and the reenqueue callback, and the number of parks
+	 * that closed. A parked task is re-enqueued when its period refills,
+	 * so the residency of a 50 percent quota is about half its period.
+	 */
+	u64 bw_park_wait_ns;
+	u64 bw_park_closed;
+	u64 bw_park_open_max_ns;
 	u64 cgrp_eff_weight;
 	u64 cgrp_eff_min;
 	u64 cgrp_eff_max;
@@ -1263,8 +1317,8 @@ struct inf_tt_val {
 	 * seen once; a task that stays without a reference is seen again
 	 * after the window and only then frozen.
 	 */
-	u64 lost_first_ns;
-	u64 lost_count;
+	u64		  lost_first_ns;
+	u64		  lost_count;
 	struct inf_tt_rec rec[INF_TT_CAP];
 };
 
@@ -1341,13 +1395,13 @@ struct inf_chain_level {
 };
 
 struct inf_chain_snap {
-	u64 ts;
-	s32 pid;
-	s32 parent_idx;
-	s32 queued_cpu;
-	u32 node_owner;
-	u32 depth;
-	u32 nr_levels;
+	u64		       ts;
+	s32		       pid;
+	s32		       parent_idx;
+	s32		       queued_cpu;
+	u32		       node_owner;
+	u32		       depth;
+	u32		       nr_levels;
 	struct inf_chain_level lvl[INF_MAX_LEVELS];
 };
 

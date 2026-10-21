@@ -818,6 +818,42 @@ impl<'a> Scheduler<'a> {
         let mut yields = 0u64;
         let mut cgrp_throttled = 0u64;
         let mut cgrp_reenqueued = 0u64;
+        let mut bw_gate = 0u64;
+        let mut bw_eagain = 0u64;
+        let mut bw_terr = 0u64;
+        let mut bw_park_ok = 0u64;
+        let mut bw_park_fail = 0u64;
+        let mut bw_cb = 0u64;
+        let mut bw_drain = 0u64;
+        let mut bw_drain_err = 0u64;
+        let mut bw_consume = 0u64;
+        let mut bw_consume_ns = 0u64;
+        let mut bw_consume_err = 0u64;
+        let mut bw_consume_skip = 0u64;
+        let mut bw_set = 0u64;
+        let mut bw_set_err = 0u64;
+        let mut bw_init = 0u64;
+        let mut bw_init_err = 0u64;
+        let mut bw_move = 0u64;
+        let mut bw_move_err = 0u64;
+        let mut bw_cancel = 0u64;
+        let mut bw_lib_init_err = 0u64;
+        let mut resv_renew = 0u64;
+        let mut resv_open = 0u64;
+        let mut resv_settled = 0u64;
+        let mut resv_none = 0u64;
+        let mut resv_closed = 0u64;
+        let mut resv_stale = 0u64;
+        let mut resv_mismatch = 0u64;
+        let mut settle_local = 0u64;
+        let mut settle_local_ns = 0u64;
+        let mut settle_remote = 0u64;
+        let mut settle_remote_ns = 0u64;
+        let mut settle_max_ns = 0u64;
+        let mut settle_over_slot = 0u64;
+        let mut bw_park_wait_ns = 0u64;
+        let mut bw_park_closed = 0u64;
+        let mut bw_park_open_max_ns = 0u64;
         let mut cgrp_eff_weight = 0u64;
         let mut cgrp_eff_min = 0u64;
         let mut cgrp_eff_max = 0u64;
@@ -899,6 +935,42 @@ impl<'a> Scheduler<'a> {
                 yields += stats.yields;
                 cgrp_throttled += stats.cgrp_throttled;
                 cgrp_reenqueued += stats.cgrp_reenqueued;
+                bw_gate += stats.bw_gate;
+                bw_eagain += stats.bw_eagain;
+                bw_terr += stats.bw_terr;
+                bw_park_ok += stats.bw_park_ok;
+                bw_park_fail += stats.bw_park_fail;
+                bw_cb += stats.bw_cb;
+                bw_drain += stats.bw_drain;
+                bw_drain_err += stats.bw_drain_err;
+                bw_consume += stats.bw_consume;
+                bw_consume_ns += stats.bw_consume_ns;
+                bw_consume_err += stats.bw_consume_err;
+                bw_consume_skip += stats.bw_consume_skip;
+                bw_set += stats.bw_set;
+                bw_set_err += stats.bw_set_err;
+                bw_init += stats.bw_init;
+                bw_init_err += stats.bw_init_err;
+                bw_move += stats.bw_move;
+                bw_move_err += stats.bw_move_err;
+                bw_cancel += stats.bw_cancel;
+                bw_lib_init_err += stats.bw_lib_init_err;
+                resv_renew += stats.resv_renew;
+                resv_open += stats.resv_open;
+                resv_settled += stats.resv_settled;
+                resv_none += stats.resv_none;
+                resv_closed += stats.resv_closed;
+                resv_stale += stats.resv_stale;
+                resv_mismatch += stats.resv_mismatch;
+                settle_local += stats.settle_local;
+                settle_local_ns += stats.settle_local_ns;
+                settle_remote += stats.settle_remote;
+                settle_remote_ns += stats.settle_remote_ns;
+                settle_max_ns = settle_max_ns.max(stats.settle_max_ns);
+                settle_over_slot += stats.settle_over_slot;
+                bw_park_wait_ns += stats.bw_park_wait_ns;
+                bw_park_closed += stats.bw_park_closed;
+                bw_park_open_max_ns = bw_park_open_max_ns.max(stats.bw_park_open_max_ns);
                 cgrp_eff_weight = cgrp_eff_weight.max(stats.cgrp_eff_weight);
                 if stats.cgrp_eff_min != 0 {
                     cgrp_eff_min = if cgrp_eff_min == 0 {
@@ -1029,7 +1101,24 @@ impl<'a> Scheduler<'a> {
             "inserts: head={head} tail={tail} exempt={exempt} \
              expiries={expiries} preemptions={preemptions} yields={yields} \
              depth={depth} cgrp: throttled={cgrp_throttled} \
-             reenqueued={cgrp_reenqueued} eff_weight={cgrp_eff_weight} \
+             reenqueued={cgrp_reenqueued} bw: gate={bw_gate} \
+             eagain={bw_eagain} terr={bw_terr} park_ok={bw_park_ok} \
+             park_fail={bw_park_fail} cb={bw_cb} drain={bw_drain} \
+             drain_err={bw_drain_err} consume={bw_consume} \
+             consume_ns={bw_consume_ns} consume_err={bw_consume_err} \
+             consume_skip={bw_consume_skip} set={bw_set} \
+             set_err={bw_set_err} init={bw_init} init_err={bw_init_err} \
+             move={bw_move} move_err={bw_move_err} cancel={bw_cancel} \
+             lib_init_err={bw_lib_init_err} resv_renew={resv_renew} \
+             resv: open={resv_open} settled={resv_settled} \
+             none={resv_none} closed={resv_closed} stale={resv_stale} \
+             mismatch={resv_mismatch} \
+             settle: local={settle_local} local_ns={settle_local_ns} \
+             remote={settle_remote} remote_ns={settle_remote_ns} \
+             max_ns={settle_max_ns} over_slot={settle_over_slot} \
+             park: closed={bw_park_closed} wait_ns={bw_park_wait_ns} \
+             wait_max_ns={bw_park_open_max_ns} \
+             eff_weight={cgrp_eff_weight} \
              eff_min={cgrp_eff_min} eff_max={cgrp_eff_max} \
              eff_samples={cgrp_eff_samples} scale_q10={cgrp_scale} \
              refolds={cgrp_refolds} deq: sleep={deq_sleep} \
