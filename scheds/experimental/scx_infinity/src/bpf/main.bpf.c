@@ -80,17 +80,6 @@ struct {
 } cgrp_state_stor SEC(".maps");
 
 /*
- * The number of live task contexts. The pool is bounded, and a full pool
- * fails ops.init_task() with -ENOMEM.
- */
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, 1);
-	__type(key, u32);
-	__type(value, u64);
-} task_count_stor SEC(".maps");
-
-/*
  * Scheduler-local topology. The loader fills one row per CPU and one
  * distance row per node before load. Keeping the data here leaves the
  * placement policy out of the shared utilities.
@@ -310,14 +299,6 @@ static u32		inf_nr_blocks;
  */
 static u64 inf_gen_counter;
 
-/*
- * Set from ops.disable(), which runs for every task while the scheduler is
- * being torn down. ops.exit_task() uses it to tell a task that died during
- * the run from one that is only being unregistered: a run-time exit drops
- * the task snapshot, a teardown keeps it for the exit dump.
- */
-static bool inf_shutting_down;
-
 #define TOUCH_ARENA()                           \
 	do {                                    \
 		asm volatile("" ::"r"(&arena)); \
@@ -508,6 +489,24 @@ static __noinline void inf_task_attach(task_ctx *tctx, inf_cpu_block_t *blk,
 				       s32 cpu, u32 leaf);
 static __noinline void inf_task_detach(task_ctx *tctx);
 
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct inf_task_pool);
+} task_pool_stor SEC(".maps");
+
+/*
+ * The live task contexts of the arena pool. One lookup per init and per
+ * exit, and one per stats interval from user space.
+ */
+static __always_inline struct inf_task_pool *inf_task_pool(void)
+{
+	u32 key = 0;
+
+	return bpf_map_lookup_elem(&task_pool_stor, &key);
+}
+
 /*
  * Diagnostic trace, disabled unless the loader sets it before load. It is
  * a ring of queue transitions plus one task snapshot that keeps the last
@@ -540,8 +539,19 @@ struct {
 	__type(value, struct inf_queue_snap);
 } qsnap_stor SEC(".maps");
 
+/*
+ * The diagnostic snapshot table. The map is an LRU hash of the last
+ * INF_TASK_SNAP_MAX distinct tasks: a task that exits stays readable for
+ * the exit dump while a newer task pushes it out, so the table is bounded
+ * without a delete on the exit path. A plain hash was exhausted by the pid
+ * churn of a fork workload, and every later snapshot update then failed:
+ * the ring kept recording but the per-task history was frozen on the pids
+ * of the first minute. The counter `task_overflow` is still kept, and a
+ * nonzero value now means a real update error, not the steady state of a
+ * full table.
+ */
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, INF_TASK_SNAP_MAX);
 	__type(key, s32);
 	__type(value, struct inf_task_snap);
@@ -610,7 +620,9 @@ static __always_inline bool inf_fault_take(u64 *counter)
  * The ring records only transitions that can lose a task or repair one.
  * A normal insert or pop is kept in the per-task snapshot instead, so a
  * ten-minute campaign does not overwrite the ring with steady-state
- * traffic. `total` counts every transition; `next` counts ringed ones.
+ * traffic and `overwritten` stays zero, which is what the stall campaign
+ * requires: a non-zero value means the anomalous-event record is
+ * incomplete. `total` counts every transition; `next` counts ringed ones.
  */
 static __always_inline bool inf_trace_in_ring(u32 op)
 {
@@ -822,8 +834,34 @@ static __noinline void inf_dump_queues(void)
 }
 
 /*
+ * Arm the trace from ops.init(), before the first transition. The ring
+ * control entry is a map value and starts zeroed, so a cap that is written
+ * only by the exit path reads as zero for the whole run: the periodic stats
+ * then report cap=0 and the exit dump cannot map a sequence number to a
+ * slot. Writing cap, enabled and the counters here makes the entry
+ * describe the live ring from the first dispatch on.
+ */
+static __noinline void inf_trace_arm(void)
+{
+	struct inf_trace_ctl *ctl;
+	u32		      key = 0;
+
+	ctl = bpf_map_lookup_elem(&trace_ctl_stor, &key);
+	if (!ctl)
+		return;
+	WRITE_ONCE(ctl->next, 0);
+	WRITE_ONCE(ctl->overwritten, 0);
+	WRITE_ONCE(ctl->task_overflow, 0);
+	WRITE_ONCE(ctl->total, 0);
+	WRITE_ONCE(ctl->cap, INF_TRACE_CAP);
+	WRITE_ONCE(ctl->enabled, enable_trace ? 1 : 0);
+}
+
+/*
  * Write the exit status of the trace into the control entry, so the
- * loader knows whether the ring ran over before it reads it.
+ * loader knows whether the ring ran over before it reads it. The cap and
+ * enabled fields are written again here because an exit can follow a run
+ * whose init never armed the trace.
  */
 static __noinline void inf_trace_seal(void)
 {
@@ -4474,27 +4512,49 @@ void BPF_STRUCT_OPS(infinity_stopping, struct task_struct *p, bool runnable)
 s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init_task, struct task_struct *p,
 			     struct scx_init_task_args *args)
 {
-	task_ctx *tctx;
-	u64	 *count;
-	u32	  key = 0;
-	int	  i;
+	task_ctx	     *tctx;
+	struct inf_task_pool *pool;
+	bool		      fresh = false;
+	u64		      live;
+	int		      i;
 
 	(void)args;
 
 	TOUCH_ARENA();
 
-	/* The task pool is bounded. A full pool fails the task. */
-	count = bpf_map_lookup_elem(&task_count_stor, &key);
-	if (count && __sync_fetch_and_add(count, 1) >= INF_TASKS_MAX) {
-		__sync_fetch_and_add(count, -1);
-		return -ENOMEM;
-	}
+	pool = inf_task_pool();
 
-	tctx = inf_task_ctx_alloc(p);
-	if (!tctx) {
-		if (count)
-			__sync_fetch_and_add(count, -1);
-		return -ENOMEM;
+	/*
+	 * One context per task for the whole task lifetime. init_task can run
+	 * again for a task that already has a context, for example on a
+	 * re-registration. Allocating a second context would orphan the
+	 * first one in the arena pool for as long as the scheduler runs, so
+	 * the live context is reused and re-seeded instead.
+	 */
+	tctx = inf_task_ctx(p);
+	if (tctx) {
+		if (pool)
+			__sync_fetch_and_add(&pool->reinits, 1);
+	} else {
+		/* The task pool is bounded. A full pool fails the task. */
+		if (pool && READ_ONCE(pool->live) >= INF_TASKS_MAX) {
+			__sync_fetch_and_add(&pool->pool_full, 1);
+			return -ENOMEM;
+		}
+
+		tctx = inf_task_ctx_alloc(p);
+		if (!tctx) {
+			if (pool)
+				__sync_fetch_and_add(&pool->alloc_fail, 1);
+			return -ENOMEM;
+		}
+		fresh = true;
+		if (pool) {
+			live = __sync_fetch_and_add(&pool->live, 1) + 1;
+			__sync_fetch_and_add(&pool->inits, 1);
+			if (live > READ_ONCE(pool->peak))
+				WRITE_ONCE(pool->peak, live);
+		}
 	}
 
 	/* Zero the whole context, then seed the live fields. */
@@ -4506,8 +4566,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init_task, struct task_struct *p,
 	/* The queue node starts detached with a zero hold count. */
 	if (inf_queue_node_init(&tctx->qnode)) {
 		scx_task_free_rcu(p);
-		if (count)
-			__sync_fetch_and_add(count, -1);
+		if (fresh && pool)
+			__sync_fetch_and_add(&pool->live, -1);
 		return -EINVAL;
 	}
 
@@ -4539,17 +4599,20 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init_task, struct task_struct *p,
 s32 BPF_STRUCT_OPS(infinity_exit_task, struct task_struct *p,
 		   struct scx_exit_task_args *args)
 {
-	task_ctx *tctx;
-	u64	 *count;
-	u32	  key = 0;
-	int	  ret;
+	task_ctx	     *tctx;
+	struct inf_task_pool *pool;
+	int		      ret;
 
 	(void)args;
 
 	TOUCH_ARENA();
 
+	pool = inf_task_pool();
+
 	tctx = inf_task_ctx(p);
 	if (!tctx) {
+		if (pool)
+			__sync_fetch_and_add(&pool->no_ctx, 1);
 		scx_task_free_rcu(p);
 		return 0;
 	}
@@ -4558,6 +4621,12 @@ s32 BPF_STRUCT_OPS(infinity_exit_task, struct task_struct *p,
 	inf_settle_slot(p, tctx, inf_slot_event(tctx),
 			inf_resv_local(inf_cpu_ctx(tctx->path_cpu)));
 	INF_STAT_INC(resv_exit);
+
+	/*
+	 * Record the exit before the context is freed, so the ring still
+	 * names the last transition of a task that died.
+	 */
+	inf_trace(INF_TR_EXIT, tctx, INF_TR_WHERE(tctx->queued_cpu, -1), 0);
 
 	/*
 	 * The task leaves while it still reports its live state, so a
@@ -4575,11 +4644,16 @@ s32 BPF_STRUCT_OPS(infinity_exit_task, struct task_struct *p,
 
 	/*
 	 * Unlink any remaining node and wait for the last pop or steal
-	 * hold. A non-zero return means a hold never dropped; leak the
-	 * context rather than free memory another CPU may still use.
+	 * hold. A non-zero return means a hold never dropped. The hold is a
+	 * write into this node, so freeing the context below it would let a
+	 * stale holder corrupt a recycled allocation. Count it, keep the
+	 * context and stop: the live-context counter shows the leak instead
+	 * of hiding it.
 	 */
 	ret = inf_queue_node_detach(&tctx->qnode);
 	if (ret) {
+		if (pool)
+			__sync_fetch_and_add(&pool->detach_fail, 1);
 		scx_bpf_error("infinity: queue detach failed for pid %d: %d",
 			      p->pid, ret);
 		return 0;
@@ -4592,21 +4666,10 @@ s32 BPF_STRUCT_OPS(infinity_exit_task, struct task_struct *p,
 	if (inf_cpu_bw_enabled())
 		scx_cgroup_ctl_cancel((u64)tctx, SCX_CGROUP_BW_CANCEL_DROP);
 
-	/*
-	 * A run-time exit drops the snapshot, so the table holds only live
-	 * tasks and cannot fill under fork load. During teardown every task
-	 * passes here, including a stranded one, so keep the snapshots for
-	 * the exit dump.
-	 */
-	if (!inf_shutting_down) {
-		s32 pid = (s32)tctx->pid;
-
-		bpf_map_delete_elem(&tsnap_stor, &pid);
+	if (pool) {
+		__sync_fetch_and_add(&pool->frees, 1);
+		__sync_fetch_and_add(&pool->live, -1);
 	}
-
-	count = bpf_map_lookup_elem(&task_count_stor, &key);
-	if (count)
-		__sync_fetch_and_add(count, -1);
 
 	scx_task_free_rcu(p);
 	return 0;
@@ -4895,6 +4958,9 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init)
 		return ret;
 	}
 
+	/* Arm the diagnostic ring before the first transition. */
+	inf_trace_arm();
+
 	/*
 	 * The entity store of every possible CPU: the group entities, the
 	 * cgroup index and the occupancy bitmap. The block lives in the BPF
@@ -4968,12 +5034,6 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init)
 	return 0;
 }
 
-void BPF_STRUCT_OPS(infinity_disable, struct task_struct *p)
-{
-	(void)p;
-	inf_shutting_down = true;
-}
-
 void BPF_STRUCT_OPS(infinity_exit, struct scx_exit_info *ei)
 {
 	TOUCH_ARENA();
@@ -5012,7 +5072,6 @@ SCX_OPS_DEFINE(infinity_ops, .select_cpu = (void *)infinity_select_cpu,
 	       .cgroup_move	     = (void *)infinity_cgroup_move,
 	       .init_task	     = (void *)infinity_init_task,
 	       .exit_task	     = (void *)infinity_exit_task,
-	       .disable		     = (void *)infinity_disable,
 	       .init = (void *)infinity_init, .exit = (void *)infinity_exit,
 	       .flags	   = SCX_OPS_ENQ_LAST | SCX_OPS_ENQ_EXITING,
 	       .timeout_ms = 20000, .name = "infinity");

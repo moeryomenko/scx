@@ -348,6 +348,42 @@ impl<'a> Scheduler<'a> {
         })
     }
 
+    /// Read the arena task-context counters. The map entry is written by
+    /// `ops.init_task()` and `ops.exit_task()` on the BPF side.
+    fn task_pool(&self) -> Option<bpf_intf::inf_task_pool> {
+        read_map_value::<bpf_intf::inf_task_pool, _>(
+            &self.skel.maps.task_pool_stor,
+            &0u32.to_ne_bytes(),
+        )
+    }
+
+    /// Print the lifetime of the arena task contexts.
+    ///
+    /// A context that is allocated and never freed keeps its arena pages
+    /// for the rest of the run, so the pool eventually refuses an
+    /// allocation and a fork fails with `scx_alloc failed`. The live value
+    /// must return to zero when the workload drains; a peak far above the
+    /// live count is the signature of a leak.
+    fn log_task_pool(&self, when: &str) {
+        let Some(pool) = self.task_pool() else {
+            error!("tasks[{when}]: the task-context counter entry is missing");
+            return;
+        };
+
+        info!(
+            "tasks[{when}]: live={} peak={} inits={} reinits={} frees={} alloc_fail={} pool_full={} detach_fail={} no_ctx={}",
+            pool.live,
+            pool.peak,
+            pool.inits,
+            pool.reinits,
+            pool.frees,
+            pool.alloc_fail,
+            pool.pool_full,
+            pool.detach_fail,
+            pool.no_ctx
+        );
+    }
+
     /// Print the diagnostic trace, the per-CPU queue snapshot and the task
     /// snapshot written by the BPF exit hook. A run without `--trace` prints
     /// nothing.
@@ -379,6 +415,11 @@ impl<'a> Scheduler<'a> {
             ctl.task_overflow,
             ctl.next.saturating_sub(start)
         );
+        if cap == 0 {
+            error!(
+                "diagnostics: the ring control entry carries no cap, so the ring was not armed by ops.init() and no record can be read"
+            );
+        }
 
         for cpu in 0..*NR_CPU_IDS {
             let key = (cpu as u32).to_ne_bytes();
@@ -722,6 +763,9 @@ impl<'a> Scheduler<'a> {
                 ctl.total, ctl.next, ctl.cap, ctl.overwritten, ctl.task_overflow
             );
         }
+
+        /* The arena task-context lifetime, once per stats interval. */
+        self.log_task_pool("periodic");
     }
 
     fn run(
@@ -746,6 +790,8 @@ impl<'a> Scheduler<'a> {
         }
 
         let _ = self.struct_ops.take();
+        /* The quiescent value of the pool, after the workload drained. */
+        self.log_task_pool("exit");
         self.dump_diagnostics();
         uei_report!(&self.skel, uei)
     }

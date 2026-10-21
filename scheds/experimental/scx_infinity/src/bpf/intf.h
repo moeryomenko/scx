@@ -553,14 +553,60 @@ struct inf_stats {
 /*
  * Diagnostic trace. The trace is compiled in but disabled unless the
  * loader sets `enable_trace` before load. It records every queue
- * transition that can lose a runnable task, plus one task snapshot that
- * keeps the last transition of each live task. The trace is a ring: once
- * INF_TRACE_CAP records are written the oldest slot is overwritten and
- * `overwritten` counts every replacement. A stall campaign reads the ring
- * and the snapshots from the exit dump.
+ * transition, plus one task snapshot that keeps the last transition of
+ * each live task. The trace is a ring of a fixed size: once INF_TRACE_CAP
+ * records are written the oldest slot is replaced and `overwritten` counts
+ * every replacement. A stall campaign reads the ring and the per-task
+ * snapshots from the exit dump.
+ *
+ * `cap`, `next`, `overwritten`, `total` and `enabled` are all written by
+ * ops.init(), before the first transition, so the control entry describes
+ * the live ring and not only its state at exit. `next` is the number of
+ * records written and equals the ring sequence number of the next write.
+ * `total` counts every transition and `next` only the ones the ring keeps,
+ * so a reader can see how much traffic the ring filtered. The arm step and
+ * the exit step are idempotent, so a run that is killed without an exit
+ * dump still reports a correct cap.
+ *
+ * The ring keeps the anomalous transitions: an insert, a pop or a requeue
+ * fills the per-task history instead. A ring of INF_TRACE_CAP records is
+ * therefore complete for an ordinary campaign, and `overwritten` counts
+ * the records a warm ring replaced so an incomplete record is reported as
+ * incomplete. The per-task snapshot is the longer-lived record: it keeps
+ * each task's last two transitions and its eight-step history, and the
+ * table is an LRU of the last INF_TASK_SNAP_MAX distinct tasks. A stalled
+ * task that is never traced again is eventually replaced by newer tasks,
+ * so a dump taken long after the loss shows the ring and the recent tasks,
+ * not the lost one.
  */
 #define INF_TRACE_CAP 65536
 #define INF_TASK_SNAP_MAX 65536
+
+/*
+ * Arena task-context lifetime. The pool is the arena allocator behind
+ * scx_task_alloc(); a context is one per live task and is freed by
+ * ops.exit_task(). A pool that only grows is a leak, so the scheduler
+ * counts every context it allocates and every one it returns, and the
+ * loader prints the live value in the periodic stats and at exit.
+ *
+ * `live` is the number of contexts the scheduler owns right now. `peak` is
+ * its high-water mark. `reinits` counts an init_task that found a live
+ * context for the task and reused it instead of allocating a second one.
+ * `detach_fail` counts an exit that found a queue-node hold still
+ * outstanding: the context is not freed below the last hold, so this must
+ * stay zero.
+ */
+struct inf_task_pool {
+	u64 live;
+	u64 peak;
+	u64 inits;
+	u64 reinits;
+	u64 alloc_fail;
+	u64 pool_full;
+	u64 frees;
+	u64 detach_fail;
+	u64 no_ctx;
+};
 
 /* One trace operation. The order is stable; the loader names each one. */
 #define INF_TR_ENQ_PARK 1
