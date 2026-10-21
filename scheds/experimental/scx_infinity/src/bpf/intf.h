@@ -814,10 +814,38 @@ struct inf_stats {
 	 */
 	u64 run_unowned; /* ops.running for a task not selected or running */
 	u64 stop_unowned; /* ops.stopping for a task not selected or running */
+	/*
+	 * The state each callback observed, indexed by the entity state and
+	 * by whether the task still names a queue CPU:
+	 *
+	 *   index = (state & 7) | (queued_cpu >= 0 ? 8 : 0)
+	 *
+	 * A clean run is run_state[2] == stop_state[3] == the number of
+	 * starts, and every other slot is zero. The two slots a start can
+	 * legitimately occupy without a tree admission are named in the
+	 * evidence: a restored current task, whose dequeue the core undoes
+	 * with ENQUEUE_RESTORE, and an exit hand-back.
+	 */
+	u64 run_state[16];
+	u64 stop_state[16];
+	/*
+	 * The starts and stops of a task that the enqueue handed to the local
+	 * DSQ because it is exiting. They are counted in run_unowned and
+	 * stop_unowned, and this pair separates them from a start that lost
+	 * its admission: a clean run keeps run_unowned equal to
+	 * run_exit_handoff and stop_unowned equal to stop_exit_handoff.
+	 */
+	u64 run_exit_handoff;
+	u64 stop_exit_handoff;
 	u64 q_unowned; /* ops.quiescent ended a period this context lost */
 	u64 slot_end_stop; /* a live slot ended in ops.stopping */
 	u64 disp_renew_unowned; /* a renew refused an unowned previous task */
 	u64 runnable_unlinked; /* a runnable task was in no reachable queue */
+	u64 resv_none; /* a settle found no slot of its task */
+	u64 resv_stale; /* a start closed a slot whose owner had gone */
+	u64 depth_under; /* a depth decrement found nothing counted */
+	u64 depth_mismatch; /* depth disagreed with the root count */
+	u64 admit_fallbacks; /* a refused leaf admission re-entered at the root */
 	u64 stop_slice_refused; /* the core refused the end-of-slot write */
 	/*
 	 * Preemption decision counters, one per refusal path. A refusal
