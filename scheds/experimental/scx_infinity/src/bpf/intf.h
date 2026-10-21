@@ -573,6 +573,17 @@ struct inf_enq_rec {
  * that can strand one take a record. */
 #define INF_ENQ_SNAP_MAX 2048
 
+/* The pids one CPU remembers for the custody check. A power of two. */
+#define INF_TT_TRACK_SLOTS 16
+
+/*
+ * The custody checks a CPU must count a gap in a row before the check names
+ * a stranded task. One sample can land inside a handoff window; eight
+ * consecutive samples of the same CPU span at least one service slot and
+ * cannot be a window.
+ */
+#define INF_TT_MISS_RUN 8
+
 struct inf_cpu_ctx {
 	struct inf_reservation resv;
 	u64		       root_idx;
@@ -617,6 +628,26 @@ struct inf_cpu_ctx {
 	u64 ho_start_ns[INF_HO_SLOTS];
 	u32 ho_seq;
 	u32 pad_ho;
+	/*
+	 * The tasks this CPU admitted, newest first. A stranded task is in no
+	 * queue of this scheduler, so the tree, the queues and the selection
+	 * cannot name it. This ring keeps the pids the CPU handled recently,
+	 * and the custody check of ops.tick() and ops.dispatch() tests each
+	 * one against the core's own state. The ring is written only when the
+	 * diagnostic trace is enabled.
+	 */
+	u64 tt_pid[INF_TT_TRACK_SLOTS];
+	u32 tt_next;
+	/* Set by the first dispatch of this CPU that sees a custody gap. */
+	u32 custody_seen;
+	/*
+	 * Consecutive custody checks that counted more runnable tasks than
+	 * the tree, the local DSQ and the outgoing task hold. One sample is
+	 * a window; a sustained count is a task in core custody with no
+	 * scheduler reference.
+	 */
+	u32 miss_run;
+	u32 pad_mr;
 };
 
 /*
@@ -844,6 +875,7 @@ struct inf_stats {
 	 */
 	u64 link_lost; /* a counted entity is not in its parent queue */
 	u64 count_lost; /* an entity left its parent queue with children */
+	u64 count_repairs; /* an entity count repaired from its queue */
 	u64 admit_unlinked; /* a task entered a leaf that is not linked */
 	u64 disp_empty_lost; /* the tree had depth but nothing to select */
 	/*
@@ -1144,6 +1176,177 @@ struct inf_task_snap {
 	struct inf_hist hist[8];
 	u32		hist_count;
 	u32		pad;
+};
+
+/*
+ * Per-task transition trace.
+ *
+ * This is the lossless record of the callbacks that touch one task. It is
+ * wider than the transition ring: every one of the eleven callbacks of the
+ * scheduler appends one record that carries the arguments the callback
+ * saw and the state of both sides of the boundary:
+ *
+ * - the scheduler's own state: the entity state, the CPU whose tree holds
+ *   the task, the CPU that owns the held path, and whether the queue node
+ *   of the task still sits in the child queue of its own leaf entity;
+ * - the core's state: the SCX_TASK_* flags, the ops_state machine, the DSQ
+ *   the task is on, the CPU the core placed it on, and the holding CPU of
+ *   an in-flight move;
+ * - the shape of the CPU at that moment: the advisory tree depth and the
+ *   core's local DSQ depth.
+ *
+ * The record is the ground truth a stall report needs. A task that becomes
+ * runnable in core custody with no scheduler reference has a last record,
+ * and that record names the callback that took the reference away or the
+ * callback that should have taken it and did not.
+ *
+ * The table is a per-pid array limited to INF_TT_SLOTS entries and indexed
+ * by the low bits of the pid. An entry belongs to the pid stored in it; the
+ * first record of another pid clears the sequence, so a recycled pid never
+ * reports the history of its predecessor. INF_TT_CAP records are kept per
+ * task and the ring overwrites the oldest one, which the control entry
+ * counts.
+ *
+ * A record that shows the invariant violation below is copied to the
+ * frozen table, so it survives both the ring and the table.
+ */
+#define INF_TT_CAP 32
+#define INF_TT_SLOTS 2048
+#define INF_TT_FROZEN_MAX 16
+
+/* Extra callback codes of the trace, on top of the INF_CB_* set. */
+#define INF_TT_ENQ_RET 0x40 /* ops.enqueue returned */
+#define INF_TT_DISP_RET 0x41 /* ops.dispatch returned */
+#define INF_TT_TICK_CHECK 0x42 /* a tick-side custody check */
+#define INF_TT_DISP_CHECK 0x43 /* a dispatch-side custody check */
+#define INF_TT_ENQ_CHECK 0x44 /* an enqueue-side custody check */
+
+/* The queue membership of the node of a task, as the record reads it. */
+#define INF_TT_NODE_NONE 0 /* the node is in no queue */
+#define INF_TT_NODE_OWN 1 /* the node is in its own leaf queue */
+#define INF_TT_NODE_OTHER 2 /* the node is in some other queue */
+
+struct inf_tt_rec {
+	u64 ts; /* scx_bpf_now() */
+	u64 enq_flags; /* enq_flags of the callback, 0 when it has none */
+	u64 deq_flags; /* deq_flags of the callback, 0 when it has none */
+	u64 dsq; /* p->scx.dsq, 0 when the task is on no DSQ */
+	u64 ops_state; /* p->scx.ops_state.counter */
+	s32 pid;
+	s32 cb; /* INF_CB_* or INF_TT_* */
+	s32 task_cpu; /* p->scx.runnable_cpu, the rq the core queued it on */
+	s32 holding_cpu; /* p->scx.holding_cpu */
+	s32 queued_cpu; /* the CPU whose tree holds the task, -1 for none */
+	s32 path_cpu; /* the CPU that owns the held path, -1 for none */
+	u32 scx_flags; /* p->scx.flags */
+	u32 ent_state; /* enum inf_task_state of the task context */
+	u32 node_owner; /* INF_TT_NODE_* */
+	u32 chain_broken; /* group entities outside their own parent queue */
+	u32 tree_depth; /* advisory depth of queued_cpu at the record */
+	u32 local_nr; /* the core's local DSQ depth of the record CPU */
+	u32 rq_nr; /* the core's queued task count of the record CPU */
+	u32 ho_pending; /* the task has an in-flight local DSQ handoff */
+	s64 last_dsq_ret; /* the last local DSQ submission of the task */
+};
+
+struct inf_tt_val {
+	u64 next; /* records written, the index of the next one */
+	u64 frozen; /* the trace was frozen by a custody check */
+	u64 frozen_seq; /* slot of the frozen table, 0 when not frozen */
+	s32 pid; /* the task this entry describes */
+	u32 detected_cb; /* the check that froze it, 0 while live */
+	/*
+	 * The first custody-check verdict that did not find a reference, and
+	 * how many such verdicts followed. A transient handoff window is
+	 * seen once; a task that stays without a reference is seen again
+	 * after the window and only then frozen.
+	 */
+	u64 lost_first_ns;
+	u64 lost_count;
+	struct inf_tt_rec rec[INF_TT_CAP];
+};
+
+/*
+ * The reason a custody check kept or flagged a task. The value names the
+ * state the task was in, so a run reports why the check fired instead of
+ * only that it did.
+ */
+#define INF_TT_WHY_OWNED 0 /* a queue of the task's own leaf holds it */
+#define INF_TT_WHY_INFLIGHT 1 /* SELECTED, the local DSQ insert in flight */
+#define INF_TT_WHY_NO_CTX 2 /* no task context at all */
+#define INF_TT_WHY_UNLINKED 3 /* RUNNABLE, node in no reachable queue */
+#define INF_TT_WHY_NO_DSQ 4 /* SELECTED, no DSQ, handoff past its slot */
+#define INF_TT_WHY_PARKED 5 /* PARKED or EXITING, an intended handoff */
+#define INF_TT_WHY_NO_STATE 6 /* INACTIVE or unknown with custody */
+#define INF_TT_WHY_REASONS 8
+
+struct inf_tt_ctl {
+	u64 created; /* entries claimed by a new pid */
+	u64 checks; /* custody checks that ran */
+	u64 scans; /* task lookups of those checks */
+	u64 stranded; /* tasks that failed the invariant */
+	u64 frozen; /* traces copied to the frozen table */
+	u64 canaries; /* CANARY lines written to dmesg */
+	u64 overwritten; /* records a per-task ring replaced */
+	u64 why[INF_TT_WHY_REASONS]; /* verdicts, indexed by INF_TT_WHY_* */
+	u32 cap;
+	u32 enabled;
+};
+
+/*
+ * The first bad unlinks of the entity counts. A count reaches zero while the
+ * child queue of the entity still holds nodes: the entity leaves its parent
+ * queue and every task below it becomes unreachable, which is the strand.
+ * Each entry names the site that removed the child, the entity, its stored
+ * count, the number of children it still held, and the task that left.
+ */
+#define INF_DEPTH_LOSS_MAX 8
+
+/* The site of one count-down, so a bad unlink names its caller. */
+#define INF_CD_POP 1 /* a dispatch removed the selected task */
+#define INF_CD_LEAVE 2 /* a task left the tree */
+#define INF_CD_STEAL 3 /* a steal removed the task from the source */
+
+struct inf_depth_loss {
+	u64 ts;
+	u64 cgrp_id;
+	s32 site;
+	s32 pid;
+	u32 level;
+	u32 idx;
+	u32 count;
+	u32 nr_children;
+	u32 ent_state;
+	u32 cpu;
+	u32 seq;
+};
+
+/*
+ * The entity chain of a task that a custody check froze, one entry per group
+ * level from the task's leaf parent to the root. A task is reachable from the
+ * root only when every entity on its chain is RUNNABLE and sits in the child
+ * queue of the entity above it, so one record names the level that broke and
+ * whether its count agreed with the children it still held.
+ */
+struct inf_chain_level {
+	u64 cgrp_id;
+	u32 idx;
+	u32 state;
+	u32 count;
+	u32 nr_children;
+	u32 linked; /* the node is in the child queue of the level above */
+	u32 level;
+};
+
+struct inf_chain_snap {
+	u64 ts;
+	s32 pid;
+	s32 parent_idx;
+	s32 queued_cpu;
+	u32 node_owner;
+	u32 depth;
+	u32 nr_levels;
+	struct inf_chain_level lvl[INF_MAX_LEVELS];
 };
 
 /* Controlled-refusal counter for the local DSQ insert regression test. */

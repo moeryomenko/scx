@@ -217,6 +217,31 @@ fn read_map_value<T: Copy, M: MapCore>(map: &M, key: &[u8]) -> Option<T> {
     Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const T) })
 }
 
+/// Name of one callback of the per-task transition trace, from `intf.h`.
+fn callback_name(cb: i32) -> &'static str {
+    match cb as u32 {
+        bpf_intf::INF_CB_NONE => "none",
+        bpf_intf::INF_CB_SELECT_CPU => "select_cpu",
+        bpf_intf::INF_CB_ENQUEUE => "enqueue",
+        bpf_intf::INF_CB_RUNNING => "running",
+        bpf_intf::INF_CB_TICK => "tick",
+        bpf_intf::INF_CB_STOPPING => "stopping",
+        bpf_intf::INF_CB_DEQUEUE => "dequeue",
+        bpf_intf::INF_CB_QUIESCENT => "quiescent",
+        bpf_intf::INF_CB_DISPATCH => "dispatch",
+        bpf_intf::INF_CB_YIELD => "yield",
+        bpf_intf::INF_CB_SET_WEIGHT => "set_weight",
+        bpf_intf::INF_CB_CGROUP_MOVE => "cgroup_move",
+        bpf_intf::INF_CB_EXIT_TASK => "exit_task",
+        bpf_intf::INF_TT_ENQ_RET => "enqueue_ret",
+        bpf_intf::INF_TT_DISP_RET => "dispatch_ret",
+        bpf_intf::INF_TT_TICK_CHECK => "tick_check",
+        bpf_intf::INF_TT_DISP_CHECK => "dispatch_check",
+        bpf_intf::INF_TT_ENQ_CHECK => "enqueue_check",
+        _ => "unknown",
+    }
+}
+
 /// Name of one trace operation, from `intf.h`.
 fn trace_op_name(op: u32) -> &'static str {
     match op {
@@ -264,6 +289,8 @@ struct Scheduler<'a> {
     live: LiveConfig,
     generation: u32,
     trace: bool,
+    /* The next frozen per-task trace the loader prints. */
+    frozen_printed: std::sync::atomic::AtomicU32,
     /* Kept alive for as long as the scheduler uses the arena. */
     _arenalib: ArenaLib,
 }
@@ -422,6 +449,7 @@ impl<'a> Scheduler<'a> {
             live,
             generation: 1,
             trace: opts.trace,
+            frozen_printed: std::sync::atomic::AtomicU32::new(0),
             _arenalib: arenalib,
         })
     }
@@ -636,6 +664,116 @@ impl<'a> Scheduler<'a> {
                 rec.ts
             );
         }
+
+        self.dump_task_traces();
+    }
+
+    /// Print one frozen trace: the detection line and every record the ring
+    /// kept, oldest first.
+    fn log_frozen_value(&self, slot: u32, fz: &bpf_intf::inf_tt_val) {
+        info!(
+            "infttfrozen: slot={} pid={} detected_cb={} records={}",
+            slot,
+            fz.pid,
+            callback_name(fz.detected_cb as i32),
+            fz.next
+        );
+        for rec in fz.rec.iter() {
+            if rec.ts == 0 {
+                break;
+            }
+            info!(
+                "inftt: pid={} cb={} ts={} enq_flags=0x{:x} deq_flags=0x{:x} scx_flags=0x{:x} ops_state=0x{:x} dsq=0x{:x} task_cpu={} holding_cpu={} queued_cpu={} path_cpu={} ent_state={} node_owner={} chain_broken={} depth={} local_nr={} rq_nr={} ho_pending={} last_dsq_ret={}",
+                rec.pid,
+                callback_name(rec.cb),
+                rec.ts,
+                rec.enq_flags,
+                rec.deq_flags,
+                rec.scx_flags,
+                rec.ops_state,
+                rec.dsq,
+                rec.task_cpu,
+                rec.holding_cpu,
+                rec.queued_cpu,
+                rec.path_cpu,
+                rec.ent_state,
+                rec.node_owner,
+                rec.chain_broken,
+                rec.tree_depth,
+                rec.local_nr,
+                rec.rq_nr,
+                rec.ho_pending,
+                rec.last_dsq_ret
+            );
+        }
+    }
+
+    /// Print and publish every frozen trace that this run has not printed yet.
+    ///
+    /// The freeze happens in the BPF custody check, which sees the violation
+    /// before the watchdog does. The loader prints the trace as soon as the
+    /// frozen table names it, so the record survives even when the watchdog
+    /// aborts the scheduler, and it writes one CANARY line to dmesg with the
+    /// pid so the kernel log names the stranded task as well.
+    fn log_new_frozen(&self) {
+        let key = 0u32.to_ne_bytes();
+        let Some(ctl) = read_map_value::<bpf_intf::inf_tt_ctl, _>(&self.skel.maps.ttctl_stor, &key)
+        else {
+            return;
+        };
+        let present = u32::try_from(ctl.frozen.min(u64::from(bpf_intf::INF_TT_FROZEN_MAX)))
+            .unwrap_or(bpf_intf::INF_TT_FROZEN_MAX);
+        let mut slot = self.frozen_printed.load(Ordering::Relaxed);
+        while slot < present {
+            let Some(fz) = read_map_value::<bpf_intf::inf_tt_val, _>(
+                &self.skel.maps.ttfrozen_stor,
+                &slot.to_ne_bytes(),
+            ) else {
+                break;
+            };
+            if fz.frozen_seq == 0 || fz.pid <= 0 {
+                break;
+            }
+            self.log_frozen_value(slot, &fz);
+            let canary = format!(
+                "scx_infinity: CANARY stranded pid={} cb={} slot={}",
+                fz.pid,
+                callback_name(fz.detected_cb as i32),
+                slot
+            );
+            if let Err(err) = std::fs::write("/dev/kmsg", format!("{canary}\n")) {
+                error!("CANARY: cannot write to /dev/kmsg: {err}");
+            } else {
+                info!("{canary}");
+            }
+            slot += 1;
+        }
+        self.frozen_printed.store(slot, Ordering::Relaxed);
+    }
+
+    /// Print the per-task trace control entry and every frozen trace.
+    fn dump_task_traces(&self) {
+        let key = 0u32.to_ne_bytes();
+        let Some(ctl) = read_map_value::<bpf_intf::inf_tt_ctl, _>(&self.skel.maps.ttctl_stor, &key)
+        else {
+            error!("diagnostics: the per-task trace control entry is missing");
+            return;
+        };
+
+        info!(
+            "inftt: enabled={} cap={} created={} checks={} scans={} stranded={} frozen={} canaries={} overwritten={}",
+            ctl.enabled,
+            ctl.cap,
+            ctl.created,
+            ctl.checks,
+            ctl.scans,
+            ctl.stranded,
+            ctl.frozen,
+            ctl.canaries,
+            ctl.overwritten
+        );
+
+        self.log_new_frozen();
     }
 
     fn exited(&self) -> bool {
@@ -933,6 +1071,11 @@ impl<'a> Scheduler<'a> {
 
         /* The arena task-context lifetime, once per stats interval. */
         self.log_task_pool("periodic");
+
+        /* A frozen custody trace is printed as soon as it exists. */
+        if self.trace {
+            self.log_new_frozen();
+        }
     }
 
     fn run(

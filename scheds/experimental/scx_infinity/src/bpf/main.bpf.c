@@ -754,6 +754,73 @@ struct {
 	__type(value, struct inf_task_snap);
 } tsnap_scratch SEC(".maps");
 
+/*
+ * The per-task transition trace. One entry per pid, indexed by the low
+ * bits of the pid, and one ring of INF_TT_CAP records per entry. The map
+ * is pinned, so a run that the watchdog aborts still describes every task
+ * the scheduler touched.
+ *
+ * The entry is written in place: an ARRAY map always returns a value
+ * pointer, so the callback appends a record with plain stores and never
+ * copies the 2.7 KiB value onto the 512-byte BPF stack. An entry whose
+ * stored pid differs belongs to a recycled pid, and the appender resets
+ * the sequence before it writes, so a task never reads the history of
+ * another task that held the same slot.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, INF_TT_SLOTS);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+	__type(key, u32);
+	__type(value, struct inf_tt_val);
+} ttrace_stor SEC(".maps");
+
+/*
+ * The frozen traces. A custody check copies the trace of a task that is
+ * runnable in core custody with no scheduler reference into this table, so
+ * the record survives both the per-task ring and a later reuse of the pid
+ * slot. The table is pinned and read after the run.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, INF_TT_FROZEN_MAX);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+	__type(key, u32);
+	__type(value, struct inf_tt_val);
+} ttfrozen_stor SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+	__type(key, u32);
+	__type(value, struct inf_tt_ctl);
+} ttctl_stor SEC(".maps");
+
+/*
+ * The entity chain of each frozen trace, keyed by the frozen slot, pinned so
+ * a run that the watchdog aborts still names the level that broke.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, INF_TT_FROZEN_MAX);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+	__type(key, u32);
+	__type(value, struct inf_chain_snap);
+} chain_stor SEC(".maps");
+
+/*
+ * The first bad unlinks of the entity counts, pinned so a run that the
+ * watchdog aborts still names the site that stranded a subtree.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, INF_DEPTH_LOSS_MAX + 1);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+	__type(key, u32);
+	__type(value, struct inf_depth_loss);
+} depth_loss_stor SEC(".maps");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
@@ -845,8 +912,8 @@ static __always_inline bool inf_ho_fault(u32 kind)
  * that survives one service slot is a task the core never placed, which is
  * the deviation D7 window of specification section 2.11.
  */
-static __always_inline void inf_ho_enter(struct inf_cpu_ctx *cctx, task_ctx *tctx,
-					 u64 now)
+static __always_inline void inf_ho_enter(struct inf_cpu_ctx *cctx,
+					 task_ctx *tctx, u64 now)
 {
 	u32 slot;
 
@@ -858,14 +925,15 @@ static __always_inline void inf_ho_enter(struct inf_cpu_ctx *cctx, task_ctx *tct
 		INF_STAT_INC(handoff_duplicates);
 	tctx->ho_pending = 1;
 
-	slot			= cctx->ho_seq & (INF_HO_SLOTS - 1);
+	slot		 = cctx->ho_seq & (INF_HO_SLOTS - 1);
 	cctx->ho_seq++;
 	cctx->ho_pid[slot]	= tctx->pid;
 	cctx->ho_start_ns[slot] = now;
 }
 
 /* The task started: its in-flight entry closes. */
-static __always_inline void inf_ho_leave(struct inf_cpu_ctx *cctx, task_ctx *tctx)
+static __always_inline void inf_ho_leave(struct inf_cpu_ctx *cctx,
+					 task_ctx	    *tctx)
 {
 	u32 i;
 
@@ -1277,6 +1345,537 @@ static __noinline void inf_trace_seal(void)
 		return;
 	WRITE_ONCE(ctl->cap, INF_TRACE_CAP);
 	WRITE_ONCE(ctl->enabled, enable_trace ? 1 : 0);
+}
+
+/* The control entry of the per-task transition trace. */
+static __always_inline struct inf_tt_ctl *inf_tt_ctl(void)
+{
+	u32 key = 0;
+
+	return bpf_map_lookup_elem(&ttctl_stor, &key);
+}
+
+/*
+ * The queue membership of the node of @tctx, read from the side the record
+ * documents: 1 when the node sits in the child queue of the task's own leaf
+ * entity, 2 when it sits in another queue, 0 when no queue holds it. A
+ * RUNNABLE task with a membership other than 1 is unreachable from the
+ * selection, which is the first half of the invariant violation.
+ */
+static __noinline u32 inf_tt_node_owner(task_ctx *tctx, u32 *chain_broken)
+{
+	inf_cpu_block_t	   *blk;
+	inf_group_entity_t *e;
+	scx_edq_t	   *owner;
+	u32		    idx, broken = 0, level;
+
+	*chain_broken = 0;
+	if (!tctx)
+		return INF_TT_NODE_NONE;
+
+	owner = inf_queue_node_owner(&tctx->qnode);
+	blk   = inf_block(tctx->queued_cpu);
+	if (!blk)
+		return owner ? INF_TT_NODE_OTHER : INF_TT_NODE_NONE;
+
+	e = inf_entity(blk, (u32)tctx->parent_idx);
+	if (!e)
+		return owner ? INF_TT_NODE_OTHER : INF_TT_NODE_NONE;
+
+	if (owner != &e->children) {
+		*chain_broken = 0;
+		return owner ? INF_TT_NODE_OTHER : INF_TT_NODE_NONE;
+	}
+
+	for (level = 0; level < INF_MAX_LEVELS && can_loop; level++) {
+		inf_group_entity_t *par;
+
+		idx = e->parent_idx;
+		if (!idx)
+			break;
+		par = inf_entity(blk, idx);
+		if (!par)
+			break;
+		if (e->state != INF_ENTITY_RUNNABLE ||
+		    inf_queue_node_owner(&e->qnode) != &par->children)
+			broken++;
+		e = par;
+	}
+	*chain_broken = broken;
+	return INF_TT_NODE_OWN;
+}
+
+/*
+ * Append one record of @cb to the trace of @p.
+ *
+ * The entry is looked up by the low bits of the pid and claimed when the
+ * stored pid differs, so a recycled pid starts from an empty ring. The
+ * append is a set of plain stores into the pinned map value: no stack
+ * buffer and no map update, so a callback that runs a hundred thousand
+ * times a second pays one lookup and one cache line.
+ *
+ * A frozen trace is not appended to. The freeze means the record already
+ * holds the moment the task lost its last reference, and a later callback
+ * would only replace the evidence.
+ */
+static __noinline void inf_tt(u32 cb, struct task_struct *p, task_ctx *tctx,
+			      u64 enq_flags, u64 deq_flags)
+{
+	struct inf_tt_val *v;
+	struct inf_tt_ctl *ctl;
+	struct inf_tt_rec *rec;
+	struct rq	  *rq;
+	u64		   idx;
+	u32		   chain_broken = 0, key, slot, owner;
+	s32		   pid;
+	s32		   this_cpu;
+
+	if (!enable_trace || !p)
+		return;
+
+	ctl = inf_tt_ctl();
+	if (!ctl)
+		return;
+
+	pid = (s32)p->pid;
+	key = (u32)pid & (INF_TT_SLOTS - 1);
+	v   = bpf_map_lookup_elem(&ttrace_stor, &key);
+	if (!v)
+		return;
+
+	if (READ_ONCE(v->pid) != pid) {
+		WRITE_ONCE(v->pid, pid);
+		WRITE_ONCE(v->next, 0);
+		WRITE_ONCE(v->frozen, 0);
+		WRITE_ONCE(v->frozen_seq, 0);
+		__sync_fetch_and_add(&ctl->created, 1);
+	}
+	if (READ_ONCE(v->frozen))
+		return;
+
+	idx  = __sync_fetch_and_add(&v->next, 1);
+	slot = (u32)idx & (INF_TT_CAP - 1);
+	rec  = &v->rec[slot];
+	if (idx >= INF_TT_CAP)
+		__sync_fetch_and_add(&ctl->overwritten, 1);
+
+	this_cpu	  = bpf_get_smp_processor_id();
+	owner		  = inf_tt_node_owner(tctx, &chain_broken);
+
+	rec->ts		  = scx_bpf_now();
+	rec->enq_flags	  = enq_flags;
+	rec->deq_flags	  = deq_flags;
+	rec->dsq	  = (u64)(unsigned long)READ_ONCE(p->scx.dsq);
+	rec->ops_state	  = (u64)READ_ONCE(p->scx.ops_state.counter);
+	rec->pid	  = pid;
+	rec->cb		  = (s32)cb;
+	rec->task_cpu	  = (s32)READ_ONCE(p->scx.runnable_cpu);
+	rec->holding_cpu  = p->scx.holding_cpu;
+	rec->queued_cpu	  = tctx ? tctx->queued_cpu : -1;
+	rec->path_cpu	  = tctx ? tctx->path_cpu : -1;
+	rec->scx_flags	  = READ_ONCE(p->scx.flags);
+	rec->ent_state	  = tctx ? tctx->state : 0xff;
+	rec->node_owner	  = owner;
+	rec->chain_broken = chain_broken;
+
+	rec->local_nr	  = 0;
+	rec->rq_nr	  = 0;
+	rec->tree_depth	  = 0;
+	/*
+	 * A task in the handoff window is the one case in which a missing
+	 * DSQ is not a loss. The two fields below tell the window from the
+	 * loss: ho_pending is set by the dispatch that inserted the task and
+	 * cleared by its ops.running(), and last_dsq_ret is the verdict of
+	 * the last local DSQ submission.
+	 */
+	rec->ho_pending	  = tctx ? READ_ONCE(tctx->ho_pending) : 0;
+	rec->last_dsq_ret = tctx ? tctx->last_dsq_ret : 0;
+
+	/*
+	 * The core's own counters are read only from a callback that holds
+	 * the runqueue lock. ops.select_cpu() and ops.cgroup_move() run
+	 * without it, and scx_bpf_locked_rq() reports an error that disables
+	 * the scheduler when no lock is held, so the two callbacks record the
+	 * scheduler side only.
+	 */
+	if (cb != INF_CB_SELECT_CPU && cb != INF_CB_CGROUP_MOVE) {
+		rq = scx_bpf_locked_rq();
+		if (rq) {
+			struct inf_cpu_ctx *cctx = inf_cpu_ctx(this_cpu);
+			s64 depth	= cctx ? READ_ONCE(cctx->depth) : 0;
+
+			rec->local_nr	= rq->scx.local_dsq.nr;
+			rec->rq_nr	= rq->scx.nr_running;
+			rec->tree_depth = (u32)(depth < 0 ? 0 : depth);
+		}
+	}
+
+	/*
+	 * Remember the pid on this CPU, so the custody check can look it up
+	 * again after the core has taken it out of every queue of this
+	 * scheduler. The enqueue and the dispatch are the two callbacks a
+	 * stranded task must have passed through.
+	 */
+	if (cb == INF_CB_ENQUEUE || cb == INF_CB_DISPATCH) {
+		/*
+		 * The ring belongs to the CPU the core queued the task on, not
+		 * to the CPU that ran the callback: a remote wakeup runs
+		 * ops.enqueue() on the waker. A custody check of the stranded
+		 * CPU reads its own ring, so the entry must be there.
+		 */
+		s32		   rq_cpu = READ_ONCE(p->scx.runnable_cpu);
+		struct inf_cpu_ctx *cc;
+
+		if (rq_cpu < 0)
+			rq_cpu = this_cpu;
+		cc = inf_cpu_ctx(rq_cpu);
+		if (cc) {
+			cc->tt_pid[(u32)cc->tt_next & (INF_TT_TRACK_SLOTS - 1)] =
+				(u64)pid;
+			cc->tt_next++;
+		}
+	}
+}
+
+static __noinline void inf_chain_note(task_ctx *tctx, u32 slot);
+
+/* Copy the trace of @pid into the next frozen slot and count it. */
+static __noinline void inf_tt_freeze(s32 pid, u32 cb, u32 cpu, task_ctx *tctx)
+{
+	struct inf_tt_val *v;
+	struct inf_tt_val *fz;
+	struct inf_tt_ctl *ctl;
+	u32		   slot;
+	s32		   pkey;
+
+	ctl = inf_tt_ctl();
+	if (!ctl)
+		return;
+
+	pkey = pid & (INF_TT_SLOTS - 1);
+	v    = bpf_map_lookup_elem(&ttrace_stor, &pkey);
+	if (!v || READ_ONCE(v->pid) != pid)
+		return;
+	if (READ_ONCE(v->frozen))
+		return;
+
+	slot = (u32)__sync_fetch_and_add(&ctl->frozen, 1);
+	if (slot >= INF_TT_FROZEN_MAX)
+		return;
+
+	if (bpf_map_update_elem(&ttfrozen_stor, &slot, v, BPF_ANY) != 0)
+		return;
+
+	fz = bpf_map_lookup_elem(&ttfrozen_stor, &slot);
+	if (fz) {
+		/*
+		 * The slot number is the key, so the entry only has to name
+		 * the check that froze it. The copy kept the pid, the ring
+		 * and the records of the task.
+		 */
+		fz->frozen_seq	= (u64)slot + 1;
+		fz->detected_cb = cb;
+	}
+	WRITE_ONCE(v->frozen, 1);
+	WRITE_ONCE(v->frozen_seq, (u64)slot + 1);
+	inf_chain_note(tctx, slot);
+	__sync_fetch_and_add(&ctl->canaries, 1);
+	bpf_printk("SCX_INFINITY_CANARY pid=%d cb=%d", pid, (int)cb);
+}
+
+/*
+ * Test the invariant that a runnable task always has a scheduler reference.
+ *
+ * The core counts a task as runnable from the moment it sets SCX_TASK_QUEUED
+ * until the dequeue clears it, and it sets SCX_TASK_IN_CUSTODY when
+ * ops.enqueue() leaves the task with this scheduler. A task in that state
+ * must be reachable by a selection of this scheduler: it is either in the
+ * child queue of its own leaf entity, or it is SELECTED with the dispatch's
+ * local DSQ insert in flight, or it is running. The one state that no
+ * selection and no callback of this scheduler can recover is:
+ *
+ *   (SCX_TASK_QUEUED | SCX_TASK_IN_CUSTODY) set,
+ *   ops_state == SCX_OPSS_QUEUED,
+ *   p->scx.dsq == NULL,          the core gave the task no DSQ,
+ *   no tree membership and no held path.
+ *
+ * The core cannot recover it either: enqueue_task_scx() returns early for a
+ * task that is already queued (kernel/sched/ext/ext.c:2201), so no later
+ * enqueue reaches ops.enqueue(). The watchdog names the pid after the
+ * timeout, and the frozen trace names the callbacks before it.
+ *
+ * Only a task this CPU admitted is tested, because the lookup is by pid and
+ * the ring is per CPU. The test runs only on the diagnostic build and only
+ * when the core counts more runnable tasks than the tree and the local DSQ
+ * hold, so a clean run pays nothing.
+ */
+/*
+ * Mark a dispatch that finds the core counting more runnable tasks than the
+ * tree and the local DSQ hold.
+ *
+ * The dispatch program has no instruction budget for the full check: a
+ * pid lookup plus a trace append costs more states than the program can
+ * spend. This marker therefore only names the CPU and the size of the gap in
+ * dmesg, once per CPU. The pids that CPU handled are in its per-CPU ring and
+ * the full check of ops.tick() freezes the trace of the task it finds.
+ */
+static __noinline void inf_custody_mark(s32 cpu, struct inf_cpu_ctx *cctx)
+{
+	struct rq *rq = scx_bpf_locked_rq();
+	s64	   depth, missing;
+
+	if (!enable_trace || !rq || !cctx)
+		return;
+	if (READ_ONCE(cctx->custody_seen))
+		return;
+
+	depth = READ_ONCE(cctx->depth);
+	if (depth < 0)
+		depth = 0;
+	missing = (s64)rq->scx.nr_running - depth - (s64)rq->scx.local_dsq.nr;
+	if (rq->curr && rq->curr != rq->idle &&
+	    (READ_ONCE(rq->curr->scx.flags) & SCX_TASK_QUEUED))
+		missing--;
+	if (missing <= 0)
+		return;
+
+	WRITE_ONCE(cctx->custody_seen, 1);
+	{
+		struct inf_tt_ctl *ctl = inf_tt_ctl();
+
+		if (ctl)
+			__sync_fetch_and_add(&ctl->checks, 1);
+	}
+	bpf_printk("SCX_INFINITY_CUSTODY cpu=%d missing=%d depth=%d local=%d",
+		   cpu, (int)missing, (int)depth, (int)rq->scx.local_dsq.nr);
+}
+
+/*
+ * Decide whether a task that the core counts as runnable has a reference in
+ * this scheduler, and record why.
+ *
+ * A reference is one of: the node sits in the child queue of the task's own
+ * leaf entity; or the task is SELECTED and its local DSQ insert is still
+ * inside the handoff window (one service slot, counted from the in-flight
+ * ring of the CPU that handed it out); or the task is PARKED by the
+ * bandwidth controller or EXITING on its final hand-back, which are moves
+ * out of the tree by design.
+ *
+ * Every other state is a task the core holds and no selection of this
+ * scheduler can reach. The verdict is returned and counted, so a run shows
+ * how often each class happened and not only that a check ran.
+ */
+static __noinline u32 inf_tt_lost(task_ctx *tctx)
+{
+	struct inf_cpu_ctx *pc;
+	u64		    now, slot;
+	u32		    i, owner, broken;
+
+	if (!tctx)
+		return INF_TT_WHY_NO_CTX;
+
+	if (tctx->state == INF_ENTITY_RUNNABLE) {
+		owner = inf_tt_node_owner(tctx, &broken);
+		if (owner == INF_TT_NODE_OWN && broken == 0)
+			return INF_TT_WHY_OWNED;
+		return INF_TT_WHY_UNLINKED;
+	}
+
+	if (tctx->state == INF_ENTITY_SELECTED) {
+		/*
+		 * The dispatch removed the node and inserted the task into the
+		 * local DSQ of the CPU that owns its path. The core places the
+		 * task after ops.dispatch() returns, so a task in that window
+		 * has no DSQ yet and is not lost. The window is one service
+		 * slot; an entry that survives it names a handoff the core
+		 * dropped, which is the D7 window of the specification.
+		 */
+		pc = inf_cpu_ctx(tctx->path_cpu);
+		if (pc) {
+			now  = scx_bpf_now();
+			slot = READ_ONCE(pc->slot_ns);
+			if (!slot)
+				slot = INF_SLOT_NS;
+			slot *= 2;
+
+			bpf_for(i, 0, INF_HO_SLOTS)
+			{
+				if (pc->ho_pid[i] != (u64)tctx->pid)
+					continue;
+				if (now - READ_ONCE(pc->ho_start_ns[i]) <= slot)
+					return INF_TT_WHY_INFLIGHT;
+			}
+		}
+		return INF_TT_WHY_NO_DSQ;
+	}
+
+	if (tctx->state == INF_ENTITY_PARKED ||
+	    tctx->state == INF_ENTITY_EXITING)
+		return INF_TT_WHY_PARKED;
+
+	return INF_TT_WHY_NO_STATE;
+}
+
+static __noinline u32 inf_tt_check_one(s32 pid, s32 cpu, u32 cb)
+{
+	struct inf_tt_ctl  *ctl;
+	struct task_struct *p;
+	task_ctx	   *tctx;
+	u32		    why, flags, opss;
+
+	if (pid <= 0)
+		return 0;
+
+	ctl = inf_tt_ctl();
+	if (!ctl)
+		return 0;
+	__sync_fetch_and_add(&ctl->scans, 1);
+
+	p = bpf_task_from_pid(pid);
+	if (!p)
+		return 0;
+
+	flags = READ_ONCE(p->scx.flags);
+	opss  = (u32)(READ_ONCE(p->scx.ops_state.counter) & 0x3);
+	if ((flags & 0x3) != 0x3 || opss != 2 || READ_ONCE(p->scx.dsq) != NULL) {
+		/*
+		 * The core does not hold the task in custody with a queued
+		 * ops_state, so it has a DSQ or another owner. Not this
+		 * invariant, and not a strand.
+		 */
+		bpf_task_release(p);
+		return 0;
+	}
+
+	tctx = inf_task_ctx(p);
+	why  = inf_tt_lost(tctx);
+	__sync_fetch_and_add(&ctl->why[why & (INF_TT_WHY_REASONS - 1)], 1);
+	if (why == INF_TT_WHY_OWNED || why == INF_TT_WHY_INFLIGHT ||
+	    why == INF_TT_WHY_PARKED) {
+		bpf_task_release(p);
+		return 0;
+	}
+
+	/*
+	 * A verdict without a reference is not yet proof. The dispatch hands
+	 * a selected task to a local DSQ and the core places it after the
+	 * callback returns, so one read can land inside that window. The
+	 * verdict must repeat after one service slot before the task is
+	 * called stranded: a window is never seen twice, a lost task is.
+	 */
+	{
+		struct inf_tt_val *v;
+		u32		    vkey = (u32)pid & (INF_TT_SLOTS - 1);
+		u64		    now  = scx_bpf_now();
+		u64		    wait = inf_cpu_slot_ns(cpu);
+		bool		    proven;
+
+		if (!wait)
+			wait = INF_SLOT_NS;
+
+		v = bpf_map_lookup_elem(&ttrace_stor, &vkey);
+		if (v && READ_ONCE(v->pid) == pid) {
+			if (!v->lost_count) {
+				v->lost_first_ns = now;
+				v->lost_count	 = 1;
+			} else {
+				v->lost_count++;
+			}
+			proven = v->lost_count > 1 && now - v->lost_first_ns > wait;
+		} else {
+			proven = false;
+		}
+
+		if (!proven) {
+			/* Keep the first sighting in the per-task ring. */
+			inf_tt(cb, p, tctx, 0, 0);
+			bpf_task_release(p);
+			return 0;
+		}
+	}
+
+	__sync_fetch_and_add(&ctl->stranded, 1);
+	inf_tt(cb, p, tctx, 0, 0);
+	inf_tt_freeze(pid, cb, (u32)cpu, tctx);
+	bpf_task_release(p);
+	return 1;
+}
+
+/*
+ * Test the invariant over the tasks this CPU handled recently.
+ *
+ * The test runs only when the core counts more runnable tasks than the tree
+ * and the local DSQ hold, so a clean run never pays a pid lookup. The pids
+ * come from the ring that the enqueue writes, because the stranded task is
+ * in no queue of this scheduler and no structure of the policy can name it.
+ */
+static __noinline u32 inf_tt_check(u32 cb)
+{
+	struct inf_cpu_ctx *cctx;
+	struct inf_tt_ctl  *ctl;
+	struct rq	   *rq;
+	u32		    i, found = 0;
+	s32		    cpu;
+	s64		    depth, missing;
+
+	if (!enable_trace)
+		return 0;
+
+	/*
+	 * The check describes the runqueue the callback holds. A remote
+	 * wakeup runs ops.enqueue() on the waker, so the callback CPU is not
+	 * the CPU whose tasks are counted.
+	 */
+	rq = scx_bpf_locked_rq();
+	if (!rq)
+		return 0;
+	cpu  = (s32)READ_ONCE(rq->cpu);
+	cctx = inf_cpu_ctx(cpu);
+	if (!cctx)
+		return 0;
+
+	depth = READ_ONCE(cctx->depth);
+	if (depth < 0)
+		depth = 0;
+	missing = (s64)rq->scx.nr_running - depth - (s64)rq->scx.local_dsq.nr;
+
+	/*
+	 * The task the core is switching out is counted on the runqueue and
+	 * is enqueued only after the callback returns, so it is a gap of one
+	 * on almost every sample. It is not a lost task.
+	 */
+	if (rq->curr && rq->curr != rq->idle &&
+	    (READ_ONCE(rq->curr->scx.flags) & SCX_TASK_QUEUED))
+		missing--;
+
+	if (missing <= 0) {
+		WRITE_ONCE(cctx->miss_run, 0);
+		return 0;
+	}
+
+	/*
+	 * One sample of a gap is a window between a release and the core's
+	 * placement of a task. A CPU that counts a gap on several samples in
+	 * a row holds a task that neither the tree nor the local DSQ names,
+	 * and that no later callback of this scheduler will recover.
+	 */
+	{
+		u32 run = READ_ONCE(cctx->miss_run) + 1;
+
+		WRITE_ONCE(cctx->miss_run, run);
+		if (run < INF_TT_MISS_RUN)
+			return 0;
+	}
+
+	ctl = inf_tt_ctl();
+	if (!ctl)
+		return 0;
+	__sync_fetch_and_add(&ctl->checks, 1);
+
+	bpf_for(i, 0, INF_TT_TRACK_SLOTS)
+		found += inf_tt_check_one((s32)cctx->tt_pid[i], cpu, cb);
+
+	return found;
 }
 
 static __always_inline bool inf_cpu_bw_enabled(void)
@@ -1959,16 +2558,21 @@ static __noinline void inf_count_up(inf_cpu_block_t *blk, u32 idx, u32 mode)
 			return;
 		dormant = e->count == 0;
 		e->count++;
-		if (!dormant) {
-			/*
-			 * A counted entity must sit in its parent queue. A
-			 * counted entity that is not linked cannot be reached
-			 * by the selection, so the tasks below it stall.
-			 */
-			if (e->state != INF_ENTITY_RUNNABLE)
-				INF_STAT_INC(link_lost);
+		if (!dormant && e->state == INF_ENTITY_RUNNABLE)
 			return;
-		}
+
+		/*
+		 * A counted entity must sit in its parent queue. The count
+		 * alone is not proof: an entity can hold a positive count and
+		 * still be unlinked, and every task below it is then
+		 * unreachable from the root. The link is repaired here, and the
+		 * walk continues so the ancestors that were left unlinked with
+		 * it are repaired as well. The count of an ancestor that was
+		 * already linked is not increased twice, because the repair
+		 * only runs for an entity whose link is missing.
+		 */
+		if (!dormant)
+			INF_STAT_INC(link_lost);
 		if (inf_link_entity(blk, e, mode))
 			return;
 		idx = e->parent_idx;
@@ -1976,11 +2580,132 @@ static __noinline void inf_count_up(inf_cpu_block_t *blk, u32 idx, u32 mode)
 }
 
 /*
+ * Publish the entity chain of a frozen task. The walk follows parent_idx from
+ * the task's leaf to the root and records, for every level, whether the entity
+ * is RUNNABLE and whether it sits in the child queue of the entity above it.
+ * The first level that fails is the level that broke the reachability of the
+ * task, and its count next to its child count says whether the count or the
+ * link was wrong.
+ */
+static __noinline void inf_chain_note(task_ctx *tctx, u32 slot)
+{
+	struct inf_chain_snap *snap;
+	inf_cpu_block_t	      *blk;
+	inf_group_entity_t    *e;
+	u32		       idx, level;
+	s32		       parent, queued;
+	u32		       owner = INF_TT_NODE_NONE, broken = 0;
+
+	if (!tctx)
+		return;
+
+	snap = bpf_map_lookup_elem(&chain_stor, &slot);
+	if (!snap)
+		return;
+
+	parent = tctx->parent_idx;
+	queued = tctx->queued_cpu;
+	owner  = inf_tt_node_owner(tctx, &broken);
+
+	snap->ts	 = scx_bpf_now();
+	snap->pid	 = (s32)tctx->pid;
+	snap->parent_idx = parent;
+	snap->queued_cpu = queued;
+	snap->node_owner = owner;
+	snap->depth	 = 0;
+	snap->nr_levels	 = 0;
+
+	blk = inf_block(queued);
+	if (!blk)
+		return;
+
+	idx = (u32)parent;
+	bpf_for(level, 0, INF_MAX_LEVELS)
+	{
+		inf_group_entity_t *par;
+		u32		    linked = 0;
+
+		e = inf_entity(blk, idx);
+		if (!e)
+			break;
+		snap->lvl[level].cgrp_id     = e->cgrp_id;
+		snap->lvl[level].idx	     = idx;
+		snap->lvl[level].state	     = e->state;
+		snap->lvl[level].count	     = e->count;
+		snap->lvl[level].nr_children = inf_queue_nr(&e->children);
+		snap->lvl[level].level	     = level;
+
+		if (idx == 0)
+			linked = 1; /* the root has no parent queue */
+		else {
+			par = inf_entity(blk, e->parent_idx);
+			if (par && inf_queue_node_owner(&e->qnode) == &par->children)
+				linked = 1;
+		}
+		snap->lvl[level].linked = linked;
+		snap->nr_levels		= level + 1;
+
+		if (!linked)
+			break;
+		idx = e->parent_idx;
+		if (idx == 0) {
+			/* Record the root too, then stop. */
+			e = inf_entity(blk, 0);
+			if (e && level + 1 < INF_MAX_LEVELS) {
+				snap->lvl[level + 1].cgrp_id	= e->cgrp_id;
+				snap->lvl[level + 1].idx	= 0;
+				snap->lvl[level + 1].state	= e->state;
+				snap->lvl[level + 1].count	= e->count;
+				snap->lvl[level + 1].nr_children =
+					inf_queue_nr(&e->children);
+				snap->lvl[level + 1].linked = 1;
+				snap->lvl[level + 1].level  = level + 1;
+				snap->nr_levels		    = level + 2;
+			}
+			break;
+		}
+	}
+}
+
+/* Publish one bad unlink of the entity counts. The first eight are kept. */
+static __noinline void inf_depth_loss_note(inf_cpu_block_t    *blk,
+					   inf_group_entity_t *e, u32 idx,
+					   u32 site, s32 pid)
+{
+	struct inf_depth_loss *d, *ctl;
+	u32		       slot;
+	u32		       key = INF_DEPTH_LOSS_MAX;
+
+	/* The last entry of the map is the counter, not a record. */
+	ctl = bpf_map_lookup_elem(&depth_loss_stor, &key);
+	if (!ctl)
+		return;
+	slot = (u32)__sync_fetch_and_add(&ctl->seq, 1);
+	if (slot >= INF_DEPTH_LOSS_MAX)
+		return;
+	d = bpf_map_lookup_elem(&depth_loss_stor, &slot);
+	if (!d)
+		return;
+	d->ts	  = scx_bpf_now();
+	d->cgrp_id = e->cgrp_id;
+	d->site	  = (s32)site;
+	d->pid	  = pid;
+	d->level  = (u32)site;
+	d->idx	  = idx;
+	d->count  = e->count;
+	d->nr_children = inf_queue_nr(&e->children);
+	d->ent_state   = e->state;
+	d->cpu	       = (u32)inf_entity_index(blk, e);
+	d->seq	       = slot;
+}
+
+/*
  * One dispatchable child of @idx left. The entity and its dormant
  * ancestors leave their parent queues and keep their history. The walk is
  * bounded by the maximum number of tree levels.
  */
-static __noinline void inf_count_down(inf_cpu_block_t *blk, u32 idx)
+static __noinline void inf_count_down(inf_cpu_block_t *blk, u32 idx, u32 site,
+				      s32 pid)
 {
 	u32 i;
 
@@ -1996,16 +2721,25 @@ static __noinline void inf_count_down(inf_cpu_block_t *blk, u32 idx)
 		if (e->state == INF_ENTITY_RUNNABLE) {
 			inf_group_entity_t *par =
 				inf_entity(blk, e->parent_idx);
+			u32 nr = inf_queue_nr(&e->children);
 
 			/*
-			 * The entity leaves its parent queue because its
-			 * last counted child left. A child that is still
-			 * queued here is not counted, so the entity is about
-			 * to unlink a non-empty queue: the child is stranded
-			 * and the selection can never reach it.
+			 * The entity is about to leave its parent queue
+			 * because its last counted child left. A child that is
+			 * still queued here is not counted, so the count is
+			 * wrong and the queue is not. Unlinking it would strand
+			 * every task below it, so the count is repaired from
+			 * the queue and the entity keeps its link. The defect is
+			 * still counted, and the repair is not a rescue: no task
+			 * leaves a queue and no task is re-admitted.
 			 */
-			if (inf_queue_nr(&e->children))
+			if (nr) {
 				INF_STAT_INC(count_lost);
+				INF_STAT_INC(count_repairs);
+				inf_depth_loss_note(blk, e, idx, site, pid);
+				WRITE_ONCE(e->count, nr);
+				return;
+			}
 			if (par)
 				inf_q_remove(&par->children, &e->qnode);
 			e->state = INF_ENTITY_INACTIVE;
@@ -2458,23 +3192,43 @@ inf_select_leaf(inf_cpu_block_t *blk, inf_cpu_block_t *scratch, task_ctx **leaf)
 					(inf_group_entity_t *)scratch->win.task;
 
 				if (e->count == 0) {
-					/*
-					 * A group without a dispatchable
-					 * descendant is stale. Remove it and
-					 * start the selection again.
-					 */
-					inf_group_entity_t *par =
-						inf_entity(blk, e->parent_idx);
+					u32 nr = inf_queue_nr(&e->children);
 
-					if (par)
-						inf_q_remove(&par->children,
-							     &e->qnode);
-					e->state = INF_ENTITY_INACTIVE;
-					INF_STAT_INC(state_repairs);
-					inf_queue_drop(scratch->win.task);
-					cause	= INF_SEL_ZERO_COUNT;
-					restart = true;
-					break;
+					/*
+					 * A group with no counted descendant
+					 * is stale only when its queue is
+					 * empty too. A queue that still holds
+					 * children makes the count wrong, not
+					 * the group: unlinking it would strand
+					 * every task below it, and the task's
+					 * node would sit in the child queue of
+					 * an entity that no queue reaches.
+					 * The count is repaired from the queue
+					 * and the descent continues into the
+					 * winner the band scan already chose.
+					 */
+					if (!nr) {
+						inf_group_entity_t *par =
+							inf_entity(
+								blk,
+								e->parent_idx);
+
+						if (par)
+							inf_q_remove(
+								&par->children,
+								&e->qnode);
+						e->state =
+							INF_ENTITY_INACTIVE;
+						INF_STAT_INC(state_repairs);
+						inf_queue_drop(
+							scratch->win.task);
+						cause	= INF_SEL_ZERO_COUNT;
+						restart = true;
+						break;
+					}
+					INF_STAT_INC(count_lost);
+					INF_STAT_INC(count_repairs);
+					WRITE_ONCE(e->count, nr);
 				}
 
 				/*
@@ -2599,25 +3353,31 @@ static __always_inline void inf_depth_add(s32 cpu, s64 delta)
 static __noinline void inf_depth_sync(s32 cpu)
 {
 	struct inf_cpu_ctx *cctx = inf_cpu_ctx(cpu);
-	inf_cpu_block_t	   *blk	 = inf_block(cpu);
-	inf_group_entity_t *root;
-	u64		    count;
 	s64		    depth;
 
-	if (!cctx || !blk)
+	if (!cctx)
 		return;
 
-	root = inf_entity(blk, 0);
-	if (!root)
-		return;
-
-	count = READ_ONCE(root->count);
+	/*
+	 * The advisory depth counts tasks, and the root count of the entity
+	 * tree counts children: a task inside a group is one child of its
+	 * group and the group is one child of the root, so the two numbers
+	 * are not the same quantity. Repairing the task count from the child
+	 * count set the depth to zero on every tree whose tasks sit inside a
+	 * group, which is every tree of a real workload, and every later
+	 * emptiness test then read the tree as empty.
+	 *
+	 * The depth is therefore only clamped here. The leak a mismatch
+	 * would report is still counted: a decrement that finds nothing
+	 * counted clamps the depth in inf_depth_add() and increments
+	 * depth_under, and a tree that reports work while the selection
+	 * finds none increments disp_empty_lost.
+	 */
 	depth = READ_ONCE(cctx->depth);
-	if ((u64)(depth < 0 ? 0 : depth) == count)
-		return;
-
-	INF_STAT_INC(depth_mismatch);
-	WRITE_ONCE(cctx->depth, (s64)count);
+	if (depth < 0) {
+		INF_STAT_INC(depth_mismatch);
+		WRITE_ONCE(cctx->depth, 0);
+	}
 }
 
 /*
@@ -2801,7 +3561,7 @@ static __noinline void inf_task_leave_tree(task_ctx *tctx)
 	inf_depth_add(tctx->queued_cpu, -1);
 	tctx->state	 = INF_ENTITY_INACTIVE;
 	tctx->queued_cpu = -1;
-	inf_count_down(blk, (u32)tctx->parent_idx);
+	inf_count_down(blk, (u32)tctx->parent_idx, INF_CD_LEAVE, tctx->pid);
 }
 
 /*
@@ -3496,6 +4256,7 @@ s32 BPF_STRUCT_OPS(infinity_select_cpu, struct task_struct *p, s32 prev_cpu,
 	tctx = inf_task_ctx(p);
 	if (tctx)
 		tctx->wake_fork = !!(wake_flags & SCX_WAKE_FORK);
+	inf_tt(INF_CB_SELECT_CPU, p, tctx, wake_flags, 0);
 
 	/* A pinned task has no choice beyond its mask. */
 	if (p->nr_cpus_allowed == 1 || is_migration_disabled(p)) {
@@ -4148,7 +4909,10 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 void BPF_STRUCT_OPS(infinity_enqueue, struct task_struct *p, u64 enq_flags)
 {
 	inf_cb_note(INF_CB_ENQUEUE);
+	inf_tt(INF_CB_ENQUEUE, p, inf_task_ctx(p), enq_flags, 0);
 	inf_enqueue_common(p, enq_flags, false);
+	inf_tt(INF_TT_ENQ_RET, p, inf_task_ctx(p), enq_flags, 0);
+	inf_tt_check(INF_TT_ENQ_CHECK);
 }
 
 /*
@@ -4729,7 +5493,7 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 	inf_depth_add(cpu, -1);
 
 	/* The counts below the leaf follow the task. */
-	inf_count_down(blk, leaf_idx);
+	inf_count_down(blk, leaf_idx, INF_CD_POP, tctx->pid);
 
 	if (stolen) {
 		/*
@@ -5082,7 +5846,7 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 	 */
 	tctx->state	 = INF_ENTITY_HANDOFF;
 	tctx->queued_cpu = -1;
-	inf_count_down(pblk, sleaf_idx);
+	inf_count_down(pblk, sleaf_idx, INF_CD_STEAL, tctx->pid);
 	inf_depth_add(peer, -1);
 
 	/*
@@ -5391,6 +6155,7 @@ void BPF_STRUCT_OPS(infinity_dispatch, s32 cpu, struct task_struct *prev)
 		}
 	}
 
+	inf_custody_mark(cpu, cctx);
 	cctx->disp_empty++;
 	cctx->last_disp_ns = scx_bpf_now();
 	inf_trace(INF_TR_DISPATCH_EMPTY, tctx, INF_TR_WHERE(cpu, -1),
@@ -5434,6 +6199,7 @@ void BPF_STRUCT_OPS(infinity_dequeue, struct task_struct *p, u64 deq_flags)
 		if (cc)
 			cc->deq_calls++;
 	}
+	inf_tt(INF_CB_DEQUEUE, p, tctx, 0, deq_flags);
 
 	/*
 	 * Count the reason before the lifecycle decision. The counters are the
@@ -5522,6 +6288,7 @@ void BPF_STRUCT_OPS(infinity_quiescent, struct task_struct *p, u64 deq_flags)
 		if (cc)
 			cc->q_calls++;
 	}
+	inf_tt(INF_CB_QUIESCENT, p, tctx, 0, deq_flags);
 
 	if ((deq_flags & (SCX_DEQ_SLEEP | SCX_DEQ_SCHED_CHANGE)) &&
 	    tctx->state != INF_ENTITY_RUNNABLE &&
@@ -5599,7 +6366,8 @@ void BPF_STRUCT_OPS(infinity_set_weight, struct task_struct *p, u32 weight)
 
 	new_weight = weight ? weight : INF_WEIGHT_DEFAULT;
 	if (new_weight < INF_WEIGHT_MIN)
-		new_weight = INF_WEIGHT_MIN;
+		inf_tt(INF_CB_SET_WEIGHT, p, tctx, (u64)weight, 0);
+	new_weight = INF_WEIGHT_MIN;
 	if (new_weight > INF_WEIGHT_MAX)
 		new_weight = INF_WEIGHT_MAX;
 	if (p->policy == INF_SCHED_IDLE)
@@ -5891,6 +6659,7 @@ bool BPF_STRUCT_OPS(infinity_yield, struct task_struct *from,
 
 	if (!from)
 		return false;
+	inf_tt(INF_CB_YIELD, from, inf_task_ctx(from), 0, 0);
 
 	/* Yield forfeits the remaining slice; the core re-enqueues. */
 	scx_bpf_task_set_slice(from, 0);
@@ -5945,6 +6714,7 @@ void BPF_STRUCT_OPS(infinity_running, struct task_struct *p)
 
 	cpu  = bpf_get_smp_processor_id();
 	cctx = inf_cpu_ctx(cpu);
+	inf_tt(INF_CB_RUNNING, p, tctx, 0, 0);
 
 	/*
 	 * The task started, so its handoff closed. The in-flight entry lives
@@ -6066,6 +6836,8 @@ void BPF_STRUCT_OPS(infinity_tick, struct task_struct *p)
 			inf_snap_core_tick(bpf_get_smp_processor_id(), cc);
 		}
 	}
+	inf_tt(INF_CB_TICK, p, tctx, 0, 0);
+	inf_tt_check(INF_TT_TICK_CHECK);
 
 	if (tctx->state != INF_ENTITY_RUNNING &&
 	    tctx->state != INF_ENTITY_SELECTED)
@@ -6133,6 +6905,7 @@ void BPF_STRUCT_OPS(infinity_stopping, struct task_struct *p, bool runnable)
 		if (cc)
 			cc->stop_calls++;
 	}
+	inf_tt(INF_CB_STOPPING, p, tctx, 0, (u64)runnable);
 
 	if (tctx->state != INF_ENTITY_SELECTED &&
 	    tctx->state != INF_ENTITY_RUNNING) {
@@ -6373,6 +7146,8 @@ void BPF_STRUCT_OPS(infinity_cgroup_move, struct task_struct *p,
 	tctx = inf_task_ctx(p);
 	if (!tctx)
 		return;
+
+	inf_tt(INF_CB_CGROUP_MOVE, p, tctx, 0, 0);
 
 	/*
 	 * The move settles the current reservation against the old
@@ -6650,6 +7425,16 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init)
 
 	/* Arm the diagnostic ring before the first transition. */
 	inf_trace_arm();
+
+	/* Arm the per-task transition trace beside the ring. */
+	{
+		struct inf_tt_ctl *ttc = inf_tt_ctl();
+
+		if (ttc) {
+			WRITE_ONCE(ttc->cap, INF_TT_CAP);
+			WRITE_ONCE(ttc->enabled, enable_trace ? 1 : 0);
+		}
+	}
 
 	/*
 	 * The entity store of every possible CPU: the group entities, the
