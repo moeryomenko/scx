@@ -408,6 +408,13 @@ struct task_ctx {
 	u64 enq_gen;
 	u64 last_enq_flags;
 	s64 last_dsq_ret;
+	/*
+	 * One when the task was handed to a local DSQ and has not started
+	 * yet. A second handoff of the same task without a start in between
+	 * is a duplicate ownership and is counted as one.
+	 */
+	u32 ho_pending;
+	u32 pad_ho;
 };
 
 typedef struct task_ctx __arena task_ctx;
@@ -689,6 +696,13 @@ const volatile bool enable_trace = false;
 /* Controlled refusal of the local DSQ insert, for the fallback test. */
 const volatile bool inject_dsq_refusal = false;
 
+/*
+ * Controlled refusal of a handoff operation, armed by
+ * --test-handoff-fail KIND:COUNT. A normal run never sets it, so the hot
+ * path does not read the fault map at all.
+ */
+const volatile bool inject_handoff_fault = false;
+
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(max_entries, 1);
@@ -777,6 +791,98 @@ static __always_inline bool inf_fault_take(u64 *counter)
 		return false;
 	__sync_fetch_and_add(counter, -1);
 	return true;
+}
+
+/*
+ * A handoff starts when the scheduler releases its own reference to a
+ * task and ends when the task is running, queued in a tree, in a local
+ * DSQ, parked, or owned by the core. The window runs with the runqueue
+ * locked and cannot be preempted, so a completed handoff is far below one
+ * service slot and a longer one is an anomaly.
+ */
+static __always_inline void inf_ho_record(u64 start_ns)
+{
+	struct inf_stats *st = inf_stats();
+	u64		  now, delta;
+
+	if (!start_ns || !st)
+		return;
+
+	now   = scx_bpf_now();
+	delta = now > start_ns ? now - start_ns : 0;
+
+	__sync_fetch_and_add(&st->handoffs, 1);
+	if (delta > READ_ONCE(st->handoff_max_ns))
+		WRITE_ONCE(st->handoff_max_ns, delta);
+	if (delta > INF_SLOT_NS)
+		__sync_fetch_and_add(&st->handoff_overdue, 1);
+}
+
+/*
+ * Take one armed refusal for handoff @kind. The hot path reads the fault
+ * map only when the loader armed the rodata gate, so a run without
+ * --test-handoff-fail takes the unarmed branch.
+ */
+static __always_inline bool inf_ho_fault(u32 kind)
+{
+	struct inf_fault_ctl *fault;
+
+	if (!inject_handoff_fault || kind >= 8)
+		return false;
+
+	fault = inf_fault();
+	if (!fault || !inf_fault_take(&fault->handoff_fail[kind & 7]))
+		return false;
+
+	INF_STAT_INC(faults_injected);
+	return true;
+}
+
+/*
+ * The in-flight handoffs of a CPU. A dispatch hands a selected task to the
+ * local DSQ and clears its tree entry in the same call; the entry of this
+ * ring names the task until ops.running() of that task closes it. An entry
+ * that survives one service slot is a task the core never placed, which is
+ * the deviation D7 window of specification section 2.11.
+ */
+static __always_inline void inf_ho_enter(struct inf_cpu_ctx *cctx, task_ctx *tctx,
+					 u64 now)
+{
+	u32 slot;
+
+	if (!cctx || !tctx)
+		return;
+
+	/* The same task handed out twice without starting is a duplicate. */
+	if (READ_ONCE(tctx->ho_pending))
+		INF_STAT_INC(handoff_duplicates);
+	tctx->ho_pending = 1;
+
+	slot			= cctx->ho_seq & (INF_HO_SLOTS - 1);
+	cctx->ho_seq++;
+	cctx->ho_pid[slot]	= tctx->pid;
+	cctx->ho_start_ns[slot] = now;
+}
+
+/* The task started: its in-flight entry closes. */
+static __always_inline void inf_ho_leave(struct inf_cpu_ctx *cctx, task_ctx *tctx)
+{
+	u32 i;
+
+	if (!tctx)
+		return;
+
+	WRITE_ONCE(tctx->ho_pending, 0);
+
+	if (!cctx)
+		return;
+
+	for (i = 0; i < INF_HO_SLOTS && can_loop; i++) {
+		if (cctx->ho_pid[i] == (u64)tctx->pid) {
+			cctx->ho_pid[i]	     = 0;
+			cctx->ho_start_ns[i] = 0;
+		}
+	}
 }
 
 /*
@@ -2492,11 +2598,11 @@ static __always_inline void inf_depth_add(s32 cpu, s64 delta)
  */
 static __noinline void inf_depth_sync(s32 cpu)
 {
-	struct inf_cpu_ctx	*cctx = inf_cpu_ctx(cpu);
-	inf_cpu_block_t		*blk  = inf_block(cpu);
-	inf_group_entity_t	*root;
-	u64			 count;
-	s64			 depth;
+	struct inf_cpu_ctx *cctx = inf_cpu_ctx(cpu);
+	inf_cpu_block_t	   *blk	 = inf_block(cpu);
+	inf_group_entity_t *root;
+	u64		    count;
+	s64		    depth;
 
 	if (!cctx || !blk)
 		return;
@@ -2693,8 +2799,8 @@ static __noinline void inf_task_leave_tree(task_ctx *tctx)
 		INF_STAT_INC(state_repairs);
 	}
 	inf_depth_add(tctx->queued_cpu, -1);
-	tctx->state	    = INF_ENTITY_INACTIVE;
-	tctx->queued_cpu    = -1;
+	tctx->state	 = INF_ENTITY_INACTIVE;
+	tctx->queued_cpu = -1;
 	inf_count_down(blk, (u32)tctx->parent_idx);
 }
 
@@ -2716,9 +2822,9 @@ static __noinline void inf_task_leave(task_ctx *tctx)
 		 * the deadlines of the ancestors need a refresh.
 		 */
 		inf_rekey_ancestors(tctx, false, INF_INS_NORMAL);
-		tctx->state	    = INF_ENTITY_INACTIVE;
-		tctx->path_depth    = 0;
-		tctx->path_cpu	    = -1;
+		tctx->state	 = INF_ENTITY_INACTIVE;
+		tctx->path_depth = 0;
+		tctx->path_cpu	 = -1;
 	}
 }
 
@@ -3767,7 +3873,13 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 		 * timeout.
 		 */
 		INF_STAT_INC(enq_no_ctx);
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+		/*
+		 * The last hand-back of the enqueue path. It has no task
+		 * context to re-admit, so a refusal cannot be repaired here;
+		 * it is counted instead of being dropped silently.
+		 */
+		if (!scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0))
+			INF_STAT_INC(dsq_refusals);
 		return 0;
 	}
 
@@ -3833,7 +3945,14 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 	 * open slot.
 	 */
 	if (inf_cpu_bw_enabled() && !reenq) {
-		ret = scx_cgroup_ctl_throttled(p, (u64)tctx);
+		/*
+		 * The park is one handoff: the task leaves its tree into the
+		 * bandwidth backlog, and a refused put-aside leaves it in
+		 * the tree through the enqueue below.
+		 */
+		u64 ho_park = scx_bpf_now();
+
+		ret	    = scx_cgroup_ctl_throttled(p, (u64)tctx);
 		if (ret == -EAGAIN) {
 			if (!scx_cgroup_ctl_put_aside(p, (u64)tctx, 0)) {
 				if (enq_flags & SCX_ENQ_LAST)
@@ -3845,6 +3964,7 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 				tctx->state = INF_ENTITY_PARKED;
 				INF_STAT_INC(cgrp_throttled);
 				INF_STAT_INC(park_settled);
+				inf_ho_record(ho_park);
 				inf_trace(INF_TR_ENQ_PARK, tctx,
 					  INF_TR_WHERE(cpu, -1), ret);
 				return 0;
@@ -3854,6 +3974,7 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 			 * through and enqueue it normally.
 			 */
 			INF_STAT_INC(park_failed);
+			inf_ho_record(ho_park);
 		}
 	}
 
@@ -3967,7 +4088,8 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 		 */
 		if (!inf_admit_root(p, tctx, cpu, mode, fresh)) {
 			INF_STAT_INC(admit_fallbacks);
-			inf_trace(INF_TR_INSERT, tctx, INF_TR_WHERE(-1, cpu), 2);
+			inf_trace(INF_TR_INSERT, tctx, INF_TR_WHERE(-1, cpu),
+				  2);
 			if (enq_flags & SCX_ENQ_LAST)
 				inf_enq_note(tctx, enq_flags, 0, 1);
 			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
@@ -4368,6 +4490,89 @@ static __noinline void inf_snap_selection(s32 cpu, inf_cpu_block_t *blk)
 }
 
 /*
+ * Rescue every task of this CPU that the core holds with no scheduler
+ * reference.
+ *
+ * The scheduler hands a selected task to the local DSQ and clears its tree
+ * entry in the same call. The core places the task after the insert
+ * returns, and it drops the request when the task or the runqueue changed
+ * in that window. The task then sits on the runqueue in core custody with
+ * no DSQ, so no selection of this scheduler can reach it and only the
+ * watchdog notices.
+ *
+ * The in-flight ring of the CPU names the tasks. The rescue re-admits a
+ * task only when the local DSQ of this CPU is empty and the task is still
+ * SELECTED: a task the core placed in a DSQ or started is not rescued, so
+ * no task is ever owned twice.
+ *
+ * The built-in global DSQ cannot be drained from BPF: the kfunc
+ * scx_bpf_dsq_move_to_local() rejects SCX_DSQ_GLOBAL and takes scx_error()
+ * on it (kernel/sched/ext/ext.c:9333), which aborts the scheduler. The
+ * core drains that DSQ itself on every dispatch, before ops.dispatch()
+ * and again when the local DSQ is still empty after it
+ * (kernel/sched/ext/inlines.h:39 and :114, scx_consume_global_dsq() at
+ * ext.c:2744). This function covers the other way a task stays in core
+ * custody: the insert the core dropped.
+ */
+static __noinline u32 inf_rescue_core(s32 cpu, struct inf_cpu_ctx *cctx,
+				      u64 now)
+{
+	struct rq *rq = scx_bpf_locked_rq();
+	u64	   slot;
+	u32	   i, rescued = 0;
+
+	if (!cctx || !rq)
+		return 0;
+
+	/* A task of this CPU is already queued locally: nothing is lost. */
+	if (rq->scx.local_dsq.nr)
+		return 0;
+
+	/* The core counts more runnable tasks than the tree holds. */
+	if ((s64)rq->scx.nr_running > (s64)(cctx->depth > 0 ? cctx->depth : 0))
+		INF_STAT_INC(core_missing_seen);
+
+	slot = cctx->slot_ns ? cctx->slot_ns : INF_SLOT_NS;
+
+	for (i = 0; i < INF_HO_SLOTS && can_loop; i++) {
+		struct task_struct *p;
+		task_ctx	   *tctx;
+
+		if (!cctx->ho_pid[i])
+			continue;
+		if (now - cctx->ho_start_ns[i] <= slot)
+			continue;
+
+		p = bpf_task_from_pid((s32)cctx->ho_pid[i]);
+		if (p) {
+			tctx = inf_task_ctx(p);
+			/*
+			 * The task is still selected and holds the path it
+			 * was handed out with. A task that started on another
+			 * CPU is RUNNING and a dequeued one is not SELECTED,
+			 * so either is a stale entry and not an orphan.
+			 */
+			if (tctx && tctx->state == INF_ENTITY_SELECTED &&
+			    bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+				INF_STAT_INC(handoff_orphans);
+				inf_requeue_path(tctx, INF_INS_TAIL);
+				INF_STAT_INC(core_rescues);
+				rescued++;
+			}
+			bpf_task_release(p);
+		}
+
+		cctx->ho_pid[i]	     = 0;
+		cctx->ho_start_ns[i] = 0;
+	}
+
+	if (rescued)
+		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+
+	return rescued;
+}
+
+/*
  * Select the leaf task of this CPU's tree and hand it to the local DSQ.
  * The path of the task leaves the tree and is held by the reservation.
  *
@@ -4381,7 +4586,8 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 	inf_group_entity_t	*leaf;
 	struct inf_path __arena *path;
 	struct task_struct	*p;
-	task_ctx		*tctx = NULL;
+	task_ctx		*tctx  = NULL;
+	u64			 ho_t0 = 0;
 	u32			 i;
 	u32			 leaf_idx;
 	int			 ret;
@@ -4484,6 +4690,7 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 	}
 
 	/* The leaf task leaves the queue of its parent. */
+	ho_t0 = scx_bpf_now();
 	inf_queue_hold(&tctx->qnode);
 	ret = inf_q_remove(&leaf->children, &tctx->qnode);
 	if (ret) {
@@ -4585,7 +4792,8 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 	}
 
 	if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
-		s32 target = inf_task_allowed_cpu(p, cpu);
+		s32 target  = inf_task_allowed_cpu(p, cpu);
+		u64 ho_move = scx_bpf_now();
 
 		/*
 		 * The task may not run here. It leaves this tree and enters
@@ -4600,6 +4808,7 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 			INF_STAT_INC(lost_state_errors);
 			INF_STAT_INC(disp_affinity_fail);
 		}
+		inf_ho_record(ho_move);
 		inf_trace(INF_TR_POP_AFFINITY, tctx, INF_TR_WHERE(cpu, target),
 			  0);
 		bpf_task_release(p);
@@ -4626,12 +4835,25 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 			__sync_fetch_and_add(&tc->dsq_refuse, -1);
 			inf_trace(INF_TR_DSQ_REFUSED, tctx,
 				  INF_TR_WHERE(cpu, cpu), 1);
+			INF_STAT_INC(dsq_refusals);
+			inf_ho_record(ho_t0);
 			/* Put the path back with its saved records. */
 			inf_requeue_path(tctx, INF_INS_TAIL);
 			bpf_task_release(p);
 			inf_queue_drop(&tctx->qnode);
 			return false;
 		}
+	}
+
+	/* An armed --test-handoff-fail dsq:K counts one refusal here. */
+	if (inf_ho_fault(INF_HO_DSQ)) {
+		inf_trace(INF_TR_DSQ_REFUSED, tctx, INF_TR_WHERE(cpu, cpu), 1);
+		INF_STAT_INC(dsq_refusals);
+		inf_ho_record(ho_t0);
+		inf_requeue_path(tctx, INF_INS_TAIL);
+		bpf_task_release(p);
+		inf_queue_drop(&tctx->qnode);
+		return false;
 	}
 
 	if (!scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, tctx->slice_ns, 0)) {
@@ -4644,7 +4866,9 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 		 */
 		inf_trace(INF_TR_DSQ_REFUSED, tctx, INF_TR_WHERE(cpu, cpu), 0);
 		INF_STAT_INC(disp_dsq_fail);
+		INF_STAT_INC(dsq_refusals);
 		tctx->last_dsq_ret = -EAGAIN;
+		inf_ho_record(ho_t0);
 		inf_requeue_path(tctx, INF_INS_TAIL);
 		bpf_task_release(p);
 		inf_queue_drop(&tctx->qnode);
@@ -4652,6 +4876,13 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 	}
 	tctx->last_dsq_ret = 0;
 	inf_trace(INF_TR_DSQ_OK, tctx, INF_TR_WHERE(cpu, cpu), 0);
+	inf_ho_record(ho_t0);
+	/*
+	 * The core places the task after this call returns. The entry keeps
+	 * the task named until ops.running() of the task closes it, so a
+	 * placement the core drops is visible to the next dispatch.
+	 */
+	inf_ho_enter(cctx, tctx, scx_bpf_now());
 
 	bpf_task_release(p);
 	inf_queue_drop(&tctx->qnode);
@@ -4736,6 +4967,7 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 	struct task_struct   *p;
 	task_ctx	     *tctx = NULL;
 	u64		      saved_v, saved_rem, saved_tie, tie = 0, cgrp_id;
+	u64		      ho_t0;
 	u32		      saved_cls, leaf_parent = 0, sleaf_idx, cls;
 	int		      ret;
 
@@ -4769,6 +5001,20 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 
 	INF_STAT_INC(steal_attempts);
 
+	/*
+	 * The steal is one handoff: the source tree loses the task, and the
+	 * destination tree, or the rollback, places it again.
+	 */
+	ho_t0 = scx_bpf_now();
+
+	/* An armed --test-handoff-fail steal:K refuses the move here. */
+	if (inf_ho_fault(INF_HO_STEAL)) {
+		inf_ho_record(ho_t0);
+		bpf_task_release(p);
+		INF_STAT_INC(steal_owner_refusals);
+		return false;
+	}
+
 	/* One writer owns the move. A lost race is a refusal. */
 	inf_queue_hold(&tctx->qnode);
 	if (cmpxchg(&tctx->moving, 0, 1)) {
@@ -4794,6 +5040,7 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 		inf_queue_drop(&tctx->qnode);
 		bpf_task_release(p);
 		INF_STAT_INC(steal_failures);
+		inf_ho_record(ho_t0);
 		return false;
 	}
 
@@ -4803,6 +5050,20 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 	saved_cls = tctx->class;
 	saved_tie = tctx->tie;
 
+	/*
+	 * An armed --test-handoff-fail source-remove:K refuses the removal
+	 * before the queue is touched, so the source tree keeps the task and
+	 * no rollback is needed.
+	 */
+	if (inf_ho_fault(INF_HO_SOURCE_REMOVE)) {
+		tctx->moving = 0;
+		inf_queue_drop(&tctx->qnode);
+		bpf_task_release(p);
+		INF_STAT_INC(steal_failures);
+		inf_ho_record(ho_t0);
+		return false;
+	}
+
 	/* The task leaves the source queue. */
 	ret = inf_q_remove(&sleaf->children, &tctx->qnode);
 	if (ret) {
@@ -4810,6 +5071,7 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 		inf_queue_drop(&tctx->qnode);
 		bpf_task_release(p);
 		INF_STAT_INC(steal_failures);
+		inf_ho_record(ho_t0);
 		return false;
 	}
 	/*
@@ -4864,6 +5126,15 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 	tctx->rem   = 0;
 	tctx->class = cls;
 	tctx->tie   = tie;
+	/*
+	 * Two armed refusals of the destination step: the leaf insert
+	 * itself, and a lost hold, which leaves the destination leaf
+	 * untouched and restores the source record.
+	 */
+	if (inf_ho_fault(INF_HO_DEST_INSERT) || inf_ho_fault(INF_HO_HOLD)) {
+		INF_STAT_INC(steal_insert_refusals);
+		goto restore;
+	}
 	if (fault && inf_fault_take(&fault->steal_insert_refuse)) {
 		INF_STAT_INC(steal_insert_refusals);
 		goto restore;
@@ -4903,6 +5174,7 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 	inf_depth_add(dst, 1);
 	INF_STAT_INC(steals);
 	INF_STAT_INC(disp_steal);
+	inf_ho_record(ho_t0);
 	inf_trace(INF_TR_STEAL, tctx, INF_TR_WHERE(peer, dst), 0);
 
 	*out	     = tctx;
@@ -4940,6 +5212,7 @@ restore:
 	tctx->moving = 0;
 	INF_STAT_INC(steal_failures);
 	INF_STAT_INC(steal_rollbacks);
+	inf_ho_record(ho_t0);
 	inf_trace(INF_TR_STEAL_SKIP, tctx, INF_TR_WHERE(peer, dst), -1);
 	inf_queue_drop(&tctx->qnode);
 	bpf_task_release(p);
@@ -5087,6 +5360,16 @@ void BPF_STRUCT_OPS(infinity_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 
 	/*
+	 * The tree and the steal tiers handed out nothing. A task this CPU
+	 * released into a local DSQ and that never started is in core
+	 * custody with no reference, so the rescue re-admits it to the tree
+	 * and the next dispatch runs it. This runs before the renew: a
+	 * stranded task must reach the tree while the CPU still asks for
+	 * work.
+	 */
+	inf_rescue_core(cpu, cctx, scx_bpf_now());
+
+	/*
 	 * The tree is empty and the previous task is still runnable with
 	 * no slice left. Renew it in place instead of waiting for a round
 	 * trip through enqueue.
@@ -5210,7 +5493,7 @@ void BPF_STRUCT_OPS(infinity_dequeue, struct task_struct *p, u64 deq_flags)
 		tctx->state = INF_ENTITY_RUNNING;
 	} else if (ended) {
 		if (tctx->state != INF_ENTITY_EXITING) {
-			tctx->state	    = INF_ENTITY_INACTIVE;
+			tctx->state = INF_ENTITY_INACTIVE;
 		}
 	}
 }
@@ -5663,6 +5946,13 @@ void BPF_STRUCT_OPS(infinity_running, struct task_struct *p)
 	cpu  = bpf_get_smp_processor_id();
 	cctx = inf_cpu_ctx(cpu);
 
+	/*
+	 * The task started, so its handoff closed. The in-flight entry lives
+	 * on the CPU that handed the task out, which is the CPU of the
+	 * dispatch and not necessarily this one.
+	 */
+	inf_ho_leave(cctx, tctx);
+
 	if (cctx)
 		cctx->run_calls++;
 
@@ -5755,6 +6045,14 @@ void BPF_STRUCT_OPS(infinity_tick, struct task_struct *p)
 	TOUCH_ARENA();
 	inf_cb_note(INF_CB_TICK);
 
+	/*
+	 * One ops.tick call is one service slot, and the counter is taken
+	 * here so it names every tick of the CPU, not only the ticks of a
+	 * task that holds a path. The revision-4 harness measures the kernel
+	 * tick from this counter.
+	 */
+	INF_STAT_INC(tick_slots);
+
 	tctx = inf_task_ctx(p);
 	if (!tctx)
 		return;
@@ -5793,7 +6091,6 @@ void BPF_STRUCT_OPS(infinity_tick, struct task_struct *p)
 	 * reserves.
 	 */
 	inf_tick_measure(cctx, scx_bpf_now(), local);
-	INF_STAT_INC(tick_slots);
 
 	/*
 	 * The settle charges the service of the path and the actual runtime
@@ -6066,6 +6363,7 @@ void BPF_STRUCT_OPS(infinity_cgroup_move, struct task_struct *p,
 	inf_group_entity_t *leaf;
 	struct cgroup	   *cgrp;
 	u64		    cgrp_id;
+	u64		    ho_t0;
 	u32		    leaf_parent;
 	s32		    cpu;
 	int		    ret;
@@ -6101,6 +6399,12 @@ void BPF_STRUCT_OPS(infinity_cgroup_move, struct task_struct *p,
 	if (!blk)
 		return;
 
+	/*
+	 * The move is one handoff: the task leaves the old ancestry and
+	 * enters the destination entity.
+	 */
+	ho_t0 = scx_bpf_now();
+
 	/* The task leaves the old parent. */
 	if (tctx->state == INF_ENTITY_RUNNABLE) {
 		inf_task_leave_tree(tctx);
@@ -6117,8 +6421,10 @@ void BPF_STRUCT_OPS(infinity_cgroup_move, struct task_struct *p,
 	cgrp	    = to ? to : inf_task_cgroup(p);
 	leaf_parent = inf_resolve_leaf(blk, cgrp, &cgrp_id);
 	leaf	    = inf_entity(blk, leaf_parent);
-	if (!leaf)
+	if (!leaf) {
+		inf_ho_record(ho_t0);
 		return;
+	}
 
 	/* The task now references the destination entity. */
 	inf_task_attach(tctx, blk, cpu, leaf_parent);
@@ -6142,6 +6448,7 @@ void BPF_STRUCT_OPS(infinity_cgroup_move, struct task_struct *p,
 
 	tctx->state = INF_ENTITY_INACTIVE;
 	inf_admit_task(blk, tctx, leaf_parent, INF_INS_NORMAL);
+	inf_ho_record(ho_t0);
 	INF_STAT_INC(cgrp_cpu_moves);
 	INF_STAT_INC(move_admits);
 }
@@ -6470,4 +6777,4 @@ SCX_OPS_DEFINE(infinity_ops, .select_cpu = (void *)infinity_select_cpu,
 		*/
 	       .flags	   = SCX_OPS_ENQ_LAST | SCX_OPS_ENQ_EXITING |
 			     SCX_OPS_ENQ_MIGRATION_DISABLED,
-	       .timeout_ms = 20000, .name = "infinity");
+	       .timeout_ms = 20000, .name = "scx_infinity");

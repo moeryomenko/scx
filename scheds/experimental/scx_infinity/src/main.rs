@@ -29,6 +29,8 @@ use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
 use clap::Parser;
 use config::LiveConfig;
 use config::Overrides;
@@ -122,6 +124,42 @@ struct Opts {
     /// requeue fallback. Requires --trace for the transition records.
     #[clap(long, value_name = "N", hide = true)]
     test_dsq_refuse: Option<u64>,
+
+    /// Diagnostic: refuse this many handoff operations of KIND, where KIND
+    /// is dsq, dest-insert, source-remove, steal or hold. Each refusal is
+    /// counted by faults_injected. Without the option no handoff is
+    /// refused.
+    #[clap(long, value_name = "KIND:COUNT", hide = true)]
+    test_handoff_fail: Option<String>,
+}
+
+/// The handoff kinds of `--test-handoff-fail`, in the same order as the
+/// `INF_HO_*` constants of the BPF interface.
+const HANDOFF_FAULT_KINDS: [&str; 5] = ["dsq", "dest-insert", "source-remove", "steal", "hold"];
+
+/// Parse `KIND:COUNT` into the kind index of the BPF interface and the
+/// number of refusals to arm.
+fn parse_handoff_fault(spec: &str) -> Result<(u32, u64)> {
+    let (kind, count) = spec
+        .split_once(':')
+        .ok_or_else(|| anyhow!("--test-handoff-fail expects KIND:COUNT, got '{spec}'"))?;
+    let index = HANDOFF_FAULT_KINDS
+        .iter()
+        .position(|name| *name == kind)
+        .ok_or_else(|| {
+            anyhow!(
+                "--test-handoff-fail: unknown handoff kind '{kind}', expected one of {}",
+                HANDOFF_FAULT_KINDS.join(", ")
+            )
+        })?;
+    let count: u64 = count
+        .parse()
+        .with_context(|| format!("--test-handoff-fail: '{count}' is not a count of refusals"))?;
+    if count == 0 {
+        bail!("--test-handoff-fail: the count of refusals must be at least one");
+    }
+    /* Kind 0 is INF_HO_NONE, so the first injectable kind is 1. */
+    Ok(((index + 1) as u32, count))
 }
 
 impl Opts {
@@ -292,6 +330,15 @@ impl<'a> Scheduler<'a> {
         rodata.enable_cpu_bw = cpu_bw;
         rodata.enable_trace = opts.trace;
         rodata.inject_dsq_refusal = opts.test_dsq_refuse.is_some();
+        /*
+         * The handoff refusals are parsed before the load, so an invalid
+         * KIND:COUNT fails before the scheduler attaches.
+         */
+        let handoff_fault = match opts.test_handoff_fail.as_deref() {
+            Some(spec) => Some(parse_handoff_fault(spec)?),
+            None => None,
+        };
+        rodata.inject_handoff_fault = handoff_fault.is_some();
         if opts.trace {
             info!("Diagnostic trace enabled");
         }
@@ -338,6 +385,31 @@ impl<'a> Scheduler<'a> {
                 .update(&0u32.to_ne_bytes(), bytes, libbpf_rs::MapFlags::ANY)
                 .context("failed to arm the DSQ refusal injection")?;
             info!("Controlled DSQ refusal armed for {count} inserts");
+        }
+
+        /*
+         * Arm one handoff refusal. The array is indexed by the INF_HO_*
+         * kind, so the loader and the BPF side share the order of
+         * HANDOFF_FAULT_KINDS.
+         */
+        if let Some((kind, count)) = handoff_fault {
+            let mut value: bpf_intf::inf_fault_ctl = unsafe { std::mem::zeroed() };
+            value.handoff_fail[(kind as usize) & 7] = count;
+            /* SAFETY: the value is a plain C-layout struct and its length is exact. */
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::addr_of!(value) as *const u8,
+                    std::mem::size_of::<bpf_intf::inf_fault_ctl>(),
+                )
+            };
+            skel.maps
+                .fault_stor
+                .update(&0u32.to_ne_bytes(), bytes, libbpf_rs::MapFlags::ANY)
+                .context("failed to arm the handoff refusal injection")?;
+            info!(
+                "Handoff refusal armed: {} x {count}",
+                HANDOFF_FAULT_KINDS[(kind as usize) - 1]
+            );
         }
 
         info!("Infinity configuration: {}", describe(&live));
@@ -653,6 +725,17 @@ impl<'a> Scheduler<'a> {
         let mut stop_slice_refused = 0u64;
         let mut disp_renew_unowned = 0u64;
         let mut runnable_unlinked = 0u64;
+        let mut ticks = 0u64;
+        let mut handoffs = 0u64;
+        let mut handoff_max_ns = 0u64;
+        let mut handoff_overdue = 0u64;
+        let mut handoff_orphans = 0u64;
+        let mut handoff_duplicates = 0u64;
+        let mut faults_injected = 0u64;
+        let mut core_rescues = 0u64;
+        let mut core_missing_seen = 0u64;
+        let mut dsq_refusals = 0u64;
+        let mut handoff_inflight = 0u64;
 
         let key = 0u32.to_ne_bytes();
         if let Ok(Some(rows)) = self
@@ -727,6 +810,16 @@ impl<'a> Scheduler<'a> {
                 stop_slice_refused += stats.stop_slice_refused;
                 disp_renew_unowned += stats.disp_renew_unowned;
                 runnable_unlinked += stats.runnable_unlinked;
+                ticks += stats.tick_slots;
+                handoffs += stats.handoffs;
+                handoff_max_ns = handoff_max_ns.max(stats.handoff_max_ns);
+                handoff_overdue += stats.handoff_overdue;
+                handoff_orphans += stats.handoff_orphans;
+                handoff_duplicates += stats.handoff_duplicates;
+                faults_injected += stats.faults_injected;
+                core_rescues += stats.core_rescues;
+                core_missing_seen += stats.core_missing_seen;
+                dsq_refusals += stats.dsq_refusals;
             }
         }
 
@@ -786,6 +879,7 @@ impl<'a> Scheduler<'a> {
                     std::ptr::read_unaligned(row.as_ptr() as *const bpf_intf::inf_cpu_ctx)
                 };
                 depth += cctx.depth;
+                handoff_inflight += cctx.ho_pid.iter().filter(|pid| **pid != 0).count() as u64;
             }
         }
 
@@ -818,7 +912,13 @@ impl<'a> Scheduler<'a> {
              empty_lost={disp_empty_lost} unowned: run={run_unowned} \
              stop={stop_unowned} qui={q_unowned} slot_end_stop={slot_end_stop} \
              stop_slice_refused={stop_slice_refused} \
-             renew_unowned={disp_renew_unowned} runnable_unlinked={runnable_unlinked}"
+             renew_unowned={disp_renew_unowned} runnable_unlinked={runnable_unlinked} \
+             ticks={ticks} handoffs={handoffs} handoff_max_ns={handoff_max_ns} \
+             handoff_overdue={handoff_overdue} handoff_orphans={handoff_orphans} \
+             handoff_duplicates={handoff_duplicates} \
+             faults_injected={faults_injected} core_rescues={core_rescues} \
+             core_missing_seen={core_missing_seen} \
+             handoff_inflight={handoff_inflight} dsq_refusals={dsq_refusals}"
         );
 
         if self.trace
@@ -965,6 +1065,44 @@ mod tests {
         assert!(message.contains("--quantum-us"), "{message}");
         assert!(message.contains("revision 4"), "{message}");
         assert!(message.contains("measured kernel tick"), "{message}");
+    }
+
+    #[test]
+    fn cli_parses_the_handoff_fault_spec() {
+        let opts =
+            Opts::try_parse_from(["scx_infinity", "--test-handoff-fail", "dest-insert:4"]).unwrap();
+
+        assert_eq!(
+            parse_handoff_fault(opts.test_handoff_fail.as_deref().unwrap()).unwrap(),
+            (2, 4)
+        );
+    }
+
+    #[test]
+    fn every_fault_kind_maps_to_its_bpf_index() {
+        for (index, kind) in HANDOFF_FAULT_KINDS.iter().enumerate() {
+            let spec = format!("{kind}:1");
+            assert_eq!(
+                parse_handoff_fault(&spec).unwrap(),
+                ((index + 1) as u32, 1),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_fault_kind_is_rejected() {
+        let error = parse_handoff_fault("nonsense:1").unwrap_err().to_string();
+
+        assert!(error.contains("unknown handoff kind"), "{error}");
+        assert!(error.contains("dest-insert"), "{error}");
+    }
+
+    #[test]
+    fn a_zero_handoff_fault_count_is_rejected() {
+        let error = parse_handoff_fault("dsq:0").unwrap_err().to_string();
+
+        assert!(error.contains("at least one"), "{error}");
     }
 
     #[test]

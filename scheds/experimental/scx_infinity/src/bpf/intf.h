@@ -100,6 +100,30 @@ typedef signed long    s64;
 #define INF_GATE_MASK 7U
 
 /*
+ * The handoff points of the scheduler. A handoff starts when the
+ * scheduler releases its own reference to a task and ends when the task
+ * is running, queued in a tree, in a local DSQ, parked, or owned by the
+ * core. The five kinds are also the fault-injection names of
+ * --test-handoff-fail KIND:COUNT, so their order is part of the loader
+ * and harness contract.
+ */
+#define INF_HO_NONE 0
+#define INF_HO_DSQ 1 /* a local DSQ submission */
+#define INF_HO_DEST_INSERT 2 /* the destination leaf insert of a steal */
+#define INF_HO_SOURCE_REMOVE 3 /* the source queue removal of a steal */
+#define INF_HO_STEAL 4 /* the steal move as one handoff */
+#define INF_HO_HOLD 5 /* the queue hold of a move */
+#define INF_HO_KINDS 6
+
+/*
+ * The in-flight handoffs one CPU keeps. A dispatch hands out one task per
+ * call, so a handful covers the tasks that have left the tree and have
+ * not started yet. An entry that is still open after one service slot is
+ * a task in core custody: dispatch rescues it.
+ */
+#define INF_HO_SLOTS 4
+
+/*
  * The maximum number of group levels of one entity chain, from the leaf
  * parent to the child of the root. A task whose cgroup is deeper joins the
  * deepest ancestor that has an entity, so this is also the bound of the
@@ -581,6 +605,18 @@ struct inf_cpu_ctx {
 	u32 cb[INF_CB_HISTORY];
 	u32 cb_next;
 	u32 pad[2];
+	/*
+	 * The in-flight handoffs of this CPU: every task this CPU handed to
+	 * a local DSQ that has not started yet. The ring is written at the
+	 * submission and cleared at ops.running(). An entry that survives
+	 * more than one service slot is a task the core holds with no
+	 * scheduler reference, and the dispatch rescues it and counts
+	 * core_rescues.
+	 */
+	u64 ho_pid[INF_HO_SLOTS];
+	u64 ho_start_ns[INF_HO_SLOTS];
+	u32 ho_seq;
+	u32 pad_ho;
 };
 
 /*
@@ -670,6 +706,9 @@ struct inf_task_ctx_layout {
 	u64 enq_gen;
 	u64 last_enq_flags;
 	s64 last_dsq_ret;
+	/* One when the task has an in-flight handoff that has not closed. */
+	u32 ho_pending;
+	u32 pad_ho;
 };
 
 struct inf_stats {
@@ -876,6 +915,40 @@ struct inf_stats {
 	u64 yield_to_refuse_running; /* the target is running or dispatched */
 	u64 yield_to_refuse_band; /* the target is outside its band */
 	u64 yield_to_insert_fail; /* the promotion insert failed */
+	/*
+	 * Handoff instrumentation. The revision-4 stall gate reads these
+	 * keys from the statistics line:
+	 *
+	 *   ticks               one ops.tick call, one service slot
+	 *                       (the field is tick_slots)
+	 *   handoffs            completed handoff operations
+	 *   handoff_max_ns      the longest completed handoff
+	 *   handoff_overdue     a completed handoff longer than one slot
+	 *   handoff_orphans     a handoff still open past one slot
+	 *   handoff_duplicates  a task handed out twice without starting
+	 *   faults_injected     injected handoff failures consumed
+	 *
+	 * A handoff operation is short and runs with the runqueue locked, so
+	 * a completed one is far below one slot. An orphan is the opposite
+	 * case: the scheduler released the task and the core never placed
+	 * it, which is the state that used to end at the watchdog.
+	 */
+	u64 handoffs;
+	u64 handoff_max_ns;
+	u64 handoff_overdue;
+	u64 handoff_orphans;
+	u64 handoff_duplicates;
+	u64 faults_injected;
+	/* A rescue re-admitted a task the core held with no reference. */
+	u64 core_rescues;
+	/* A dispatch found the core holding more than the tree and DSQ. */
+	u64 core_missing_seen;
+	/*
+	 * The result of the local DSQ submissions that had no check before:
+	 * a refused submission is a task the core declined to place, and it
+	 * is re-admitted or counted here instead of being dropped.
+	 */
+	u64 dsq_refusals;
 };
 
 /*
@@ -1091,6 +1164,12 @@ struct inf_fault_ctl {
 	u64 yield_probe_band_refuse; /* make the probe fail its band check */
 	u64 yield_probe_running; /* give the probe a running target */
 	u64 yield_insert_refuse; /* skip one promotion insert */
+	/*
+	 * Handoff refusals armed by --test-handoff-fail KIND:COUNT, indexed
+	 * by the INF_HO_* kind. One entry is one armed refusal, and the hot
+	 * path reads the array only when the loader sets the rodata gate.
+	 */
+	u64 handoff_fail[8];
 };
 
 /*
