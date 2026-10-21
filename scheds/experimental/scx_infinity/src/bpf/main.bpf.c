@@ -138,7 +138,7 @@ struct inf_group_entity {
 	u16		    flags;
 	u32		    refs;
 	u32		    state;
-	u32		    idle; /* a cpu.idle flag is at or above this entity */
+	u32 idle; /* a cpu.idle flag is at or above this entity */
 };
 
 typedef struct inf_group_entity __arena inf_group_entity_t;
@@ -644,6 +644,126 @@ static __always_inline bool inf_trace_in_ring(u32 op)
 	}
 }
 
+/*
+ * Record the tree position of a task in its snapshot. The selection reaches
+ * a task only through the child queue of its leaf entity and, above it, the
+ * child queue of every ancestor. A task whose node is in no queue, whose
+ * node sits in another queue, or whose leaf or ancestor left its own parent
+ * queue is unreachable, and the snapshot says which of the three it is.
+ *
+ * The fields are read without a lock: the snapshot is a diagnostic record of
+ * the moment of the transition, and a concurrent change can only make it
+ * stale, never wrong about the queue the node was in.
+ */
+static __noinline void inf_snap_path(task_ctx *tctx, struct inf_task_snap *snap)
+{
+	inf_cpu_block_t	   *blk;
+	inf_group_entity_t *e;
+	scx_edq_t	   *owner;
+	u32		    idx, broken = 0, level;
+
+	snap->node_owner   = 0;
+	snap->leaf_state   = 0xff;
+	snap->leaf_count   = 0;
+	snap->chain_broken = 0;
+	snap->path_depth   = tctx->path_depth;
+	snap->leaf_idx	   = -1;
+	snap->leaf_cpu	   = -1;
+
+	owner		   = inf_queue_node_owner(&tctx->qnode);
+	if (owner)
+		snap->node_owner = 2;
+
+	blk = inf_block(tctx->queued_cpu);
+	if (!blk)
+		return;
+
+	e = inf_entity(blk, (u32)tctx->parent_idx);
+	if (!e)
+		return;
+
+	snap->leaf_idx	 = (s32)inf_entity_index(blk, e);
+	snap->leaf_cpu	 = tctx->queued_cpu;
+	snap->leaf_state = e->state;
+	snap->leaf_count = (s64)e->count;
+	if (owner == &e->children)
+		snap->node_owner = 1;
+
+	for (level = 0; level < INF_MAX_LEVELS && can_loop; level++) {
+		inf_group_entity_t *par;
+
+		idx = e->parent_idx;
+		if (!idx)
+			break;
+		par = inf_entity(blk, idx);
+		if (!par)
+			break;
+		if (e->state != INF_ENTITY_RUNNABLE ||
+		    inf_queue_node_owner(&e->qnode) != &par->children)
+			broken++;
+		e = par;
+	}
+	snap->chain_broken = broken;
+}
+
+/* True when a RUNNABLE task cannot be reached from the root of its tree. */
+static __always_inline bool inf_path_lost(task_ctx *tctx,
+					  struct inf_task_snap *snap)
+{
+	if (tctx->state != INF_ENTITY_RUNNABLE)
+		return false;
+	return snap->node_owner != 1 || snap->chain_broken != 0;
+}
+
+/*
+ * Record a task that is RUNNABLE but whose node sits in no queue, or in a
+ * queue other than the child queue of its own leaf entity. Such a task is in
+ * the custody of the core and in no queue the selection can reach, so the
+ * record carries the operation that left it there in its result field and the
+ * ring holds every occurrence.
+ */
+static __noinline void inf_trace_path_lost(task_ctx *tctx, u32 op)
+{
+	struct inf_trace_ctl *ctl;
+	struct inf_trace_rec *rec;
+	u32		      key = 0;
+	u64		      idx;
+	u32		      slot;
+
+	ctl = bpf_map_lookup_elem(&trace_ctl_stor, &key);
+	if (ctl) {
+		idx  = __sync_fetch_and_add(&ctl->next, 1);
+		slot = (u32)idx & (INF_TRACE_CAP - 1);
+		rec  = bpf_map_lookup_elem(&trace_stor, &slot);
+		if (rec) {
+			rec->ts	       = bpf_ktime_get_ns();
+			rec->seq       = idx;
+			rec->slice     = tctx->slice_ns;
+			rec->result    = (s64)op;
+			rec->pid       = (s32)tctx->pid;
+			rec->src_cpu   = tctx->queued_cpu;
+			rec->dst_cpu   = tctx->path_cpu;
+			rec->op	       = INF_TR_PATH_LOST;
+			rec->state     = tctx->state;
+			rec->hold      = inf_queue_node_hold(&tctx->qnode);
+			rec->group_cpu = tctx->parent_idx;
+		}
+		if (idx >= INF_TRACE_CAP)
+			__sync_fetch_and_add(&ctl->overwritten, 1);
+	}
+
+	{
+		u32 slot2 = tctx->hist_idx & 7;
+
+		tctx->hist[slot2].op	  = INF_TR_PATH_LOST;
+		tctx->hist[slot2].src	  = tctx->queued_cpu;
+		tctx->hist[slot2].dst	  = (s32)op;
+		tctx->hist[slot2].result  = (s32)tctx->parent_idx;
+		tctx->hist[slot2].state	  = tctx->state;
+		tctx->hist_idx++;
+	}
+}
+
 static __noinline void inf_trace(u32 op, task_ctx *tctx, u64 where, s64 result)
 {
 	struct inf_trace_ctl *ctl;
@@ -752,6 +872,12 @@ static __noinline void inf_trace(u32 op, task_ctx *tctx, u64 where, s64 result)
 	snap->last_dst	       = dst;
 	snap->last_result      = result;
 
+	inf_snap_path(tctx, snap);
+	if (inf_path_lost(tctx, snap)) {
+		INF_STAT_INC(runnable_unlinked);
+		inf_trace_path_lost(tctx, op);
+	}
+
 	if (bpf_map_update_elem(&tsnap_stor, &pid, snap, BPF_ANY))
 		__sync_fetch_and_add(&ctl->task_overflow, 1);
 }
@@ -790,6 +916,7 @@ static __noinline void inf_dump_queues(void)
 		__builtin_memset(qs, 0, sizeof(*qs));
 		qs->cpu	  = (s32)cpu;
 		qs->depth = READ_ONCE(cctx->depth);
+		qs->local_nr = scx_bpf_dsq_nr_queued(SCX_DSQ_LOCAL_ON | cpu);
 
 		root	  = inf_entity(blk, 0);
 		if (!root)
@@ -846,7 +973,7 @@ static __noinline void inf_trace_arm(void)
 	struct inf_trace_ctl *ctl;
 	u32		      key = 0;
 
-	ctl = bpf_map_lookup_elem(&trace_ctl_stor, &key);
+	ctl			  = bpf_map_lookup_elem(&trace_ctl_stor, &key);
 	if (!ctl)
 		return;
 	WRITE_ONCE(ctl->next, 0);
@@ -1413,7 +1540,7 @@ static __noinline u32 inf_resolve_leaf(inf_cpu_block_t *blk,
 		id  = inf_cgroup_id(anc);
 		idx = inf_lookup_entity(blk, id);
 		if (idx == INF_IDX_NONE) {
-			bool idle = false;
+			bool idle   = false;
 			u32  weight = inf_cgroup_weight(id, &idle);
 
 			idx = inf_entity_create(blk, id, parent, weight, idle);
@@ -1517,8 +1644,16 @@ static __noinline void inf_count_up(inf_cpu_block_t *blk, u32 idx, u32 mode)
 			return;
 		dormant = e->count == 0;
 		e->count++;
-		if (!dormant)
+		if (!dormant) {
+			/*
+			 * A counted entity must sit in its parent queue. A
+			 * counted entity that is not linked cannot be reached
+			 * by the selection, so the tasks below it stall.
+			 */
+			if (e->state != INF_ENTITY_RUNNABLE)
+				INF_STAT_INC(link_lost);
 			return;
+		}
 		inf_link_entity(blk, e, mode);
 		idx = e->parent_idx;
 	}
@@ -1546,6 +1681,15 @@ static __noinline void inf_count_down(inf_cpu_block_t *blk, u32 idx)
 			inf_group_entity_t *par =
 				inf_entity(blk, e->parent_idx);
 
+			/*
+			 * The entity leaves its parent queue because its
+			 * last counted child left. A child that is still
+			 * queued here is not counted, so the entity is about
+			 * to unlink a non-empty queue: the child is stranded
+			 * and the selection can never reach it.
+			 */
+			if (inf_queue_nr(&e->children))
+				INF_STAT_INC(count_lost);
 			if (par)
 				inf_q_remove(&par->children, &e->qnode);
 			e->state = INF_ENTITY_INACTIVE;
@@ -1970,9 +2114,25 @@ static __noinline void	    inf_admit_task(inf_cpu_block_t *blk, task_ctx *tctx,
 		}
 		INF_STAT_INC(state_repairs);
 	}
+	/*
+	 * The task sits in the child queue of @parent. A leaf that is not
+	 * linked in its own parent queue cannot be reached by the selection,
+	 * so the record names the broken link instead of hiding it. The count
+	 * and the link are checked after the count-up, because a first task in
+	 * a dormant leaf links it as part of that step.
+	 */
 	tctx->state = INF_ENTITY_RUNNABLE;
 	inf_count_up(blk, leaf_parent, mode);
 	inf_depth_add(tctx->queued_cpu, 1);
+
+	if (leaf_parent != 0) {
+		inf_group_entity_t *par = inf_entity(blk, parent->parent_idx);
+
+		if (parent->state != INF_ENTITY_RUNNABLE ||
+		    (par &&
+		     inf_queue_node_owner(&parent->qnode) != &par->children))
+			INF_STAT_INC(admit_unlinked);
+	}
 }
 
 /*
@@ -3010,6 +3170,16 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 		return 0;
 	}
 
+	{
+		struct inf_cpu_ctx *cc = inf_cpu_ctx(cpu);
+
+		if (cc)
+			cc->enq_calls++;
+	}
+
+	inf_trace(INF_TR_ENQ_ENTER, tctx,
+		  INF_TR_WHERE(cpu, bpf_get_smp_processor_id()), enq_flags);
+
 	/*
 	 * An exiting task must not wait in the scheduler queue for a later
 	 * dispatch: by then its pid can be gone, bpf_task_from_pid() fails,
@@ -3260,13 +3430,22 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 		 * task that is a direct child of the root cgroup has no
 		 * group level on its path, and the root entity holds it.
 		 */
-		leaf_idx = path->depth > 0 ?
-				   path->ent[(path->depth - 1) &
-					     (INF_MAX_LEVELS - 1)] :
-				   0;
+		leaf_idx = path->depth > 0 ? path->ent[(path->depth - 1) &
+						       (INF_MAX_LEVELS - 1)] :
+					     0;
 	} else {
-		if (!inf_steal_one(cpu, cctx, &tctx, &leaf_idx))
+		if (!inf_steal_one(cpu, cctx, &tctx, &leaf_idx)) {
+			/*
+			 * The tree reports runnable tasks through its depth,
+			 * but the selection found none and the steal tiers
+			 * had nothing either. The tree and the queues below
+			 * it disagree, and every task in it is stranded
+			 * until the watchdog fires.
+			 */
+			if (READ_ONCE(cctx->depth) > 0)
+				INF_STAT_INC(disp_empty_lost);
 			return false;
+		}
 		stolen = true;
 	}
 
@@ -3362,8 +3541,7 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 		for (i = 0; i < INF_MAX_LEVELS && can_loop; i++) {
 			if (i >= tctx->path_depth)
 				break;
-			tctx->path_ent[i] =
-				path->ent[i & (INF_MAX_LEVELS - 1)];
+			tctx->path_ent[i] = path->ent[i & (INF_MAX_LEVELS - 1)];
 		}
 
 		/* The frontier of every level follows the selection. */
@@ -3719,8 +3897,8 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 	INF_STAT_INC(disp_steal);
 	inf_trace(INF_TR_STEAL, tctx, INF_TR_WHERE(peer, dst), 0);
 
-	*out	  = tctx;
-	*leaf_out = leaf_parent;
+	*out	     = tctx;
+	*leaf_out    = leaf_parent;
 	tctx->moving = 0;
 	inf_queue_drop(&tctx->qnode);
 	bpf_task_release(p);
@@ -3891,6 +4069,8 @@ void BPF_STRUCT_OPS(infinity_dispatch, s32 cpu, struct task_struct *prev)
 	 * nothing to hand out, so the stolen task is selected again in the
 	 * same dispatch.
 	 */
+	cctx->disp_calls++;
+
 	if (inf_dispatch_tree(cpu, cctx))
 		return;
 
@@ -3901,11 +4081,23 @@ void BPF_STRUCT_OPS(infinity_dispatch, s32 cpu, struct task_struct *prev)
 	 */
 	if (prev && !READ_ONCE(prev->scx.slice)) {
 		tctx = inf_task_ctx(prev);
-		if (tctx)
+		/*
+		 * Only a slot this context holds may be renewed. Renewing a
+		 * task it does not hold would keep that task on the core's
+		 * local DSQ without a tree entry, and the dispatch would not
+		 * run again while the local DSQ stays occupied.
+		 */
+		if (tctx && (tctx->state == INF_ENTITY_SELECTED ||
+			     tctx->state == INF_ENTITY_RUNNING)) {
 			scx_bpf_task_set_slice(prev, INF_SLOT_NS);
-		INF_STAT_INC(disp_renew);
+			INF_STAT_INC(disp_renew);
+		} else {
+			INF_STAT_INC(disp_renew_unowned);
+		}
 	}
 
+	cctx->disp_empty++;
+	cctx->last_disp_ns = scx_bpf_now();
 	inf_trace(INF_TR_DISPATCH_EMPTY, tctx, INF_TR_WHERE(cpu, -1),
 		  prev ? 0 : -ENOENT);
 }
@@ -3938,6 +4130,13 @@ void BPF_STRUCT_OPS(infinity_dequeue, struct task_struct *p, u64 deq_flags)
 	tctx = inf_task_ctx(p);
 	if (!tctx)
 		return;
+
+	{
+		struct inf_cpu_ctx *cc = inf_cpu_ctx(bpf_get_smp_processor_id());
+
+		if (cc)
+			cc->deq_calls++;
+	}
 
 	/*
 	 * Count the reason before the lifecycle decision. The counters are the
@@ -4017,6 +4216,22 @@ void BPF_STRUCT_OPS(infinity_quiescent, struct task_struct *p, u64 deq_flags)
 	if (!tctx)
 		return;
 
+	{
+		struct inf_cpu_ctx *cc = inf_cpu_ctx(bpf_get_smp_processor_id());
+
+		if (cc)
+			cc->q_calls++;
+	}
+
+	if ((deq_flags & (SCX_DEQ_SLEEP | SCX_DEQ_SCHED_CHANGE)) &&
+	    tctx->state != INF_ENTITY_RUNNABLE &&
+	    tctx->state != INF_ENTITY_SELECTED &&
+	    tctx->state != INF_ENTITY_RUNNING) {
+		INF_STAT_INC(q_unowned);
+		inf_trace(INF_TR_QUIESCENT, tctx, INF_TR_WHERE(-1, -1),
+			  deq_flags);
+	}
+
 	if (deq_flags & SCX_DEQ_SLEEP)
 		INF_STAT_INC(q_sleep);
 	else if (deq_flags & SCX_DEQ_SCHED_CHANGE)
@@ -4030,6 +4245,9 @@ void BPF_STRUCT_OPS(infinity_quiescent, struct task_struct *p, u64 deq_flags)
 	if (tctx->state == INF_ENTITY_RUNNABLE ||
 	    tctx->state == INF_ENTITY_SELECTED ||
 	    tctx->state == INF_ENTITY_RUNNING) {
+		inf_trace(INF_TR_Q_LEAVE, tctx,
+			  INF_TR_WHERE(tctx->queued_cpu, tctx->path_cpu),
+			  deq_flags);
 		inf_settle_slot(p, tctx, inf_slot_event(tctx),
 				inf_resv_local(inf_cpu_ctx(tctx->path_cpu)));
 		inf_task_leave(tctx);
@@ -4399,6 +4617,26 @@ void BPF_STRUCT_OPS(infinity_running, struct task_struct *p)
 	if (!tctx)
 		return;
 
+	{
+		struct inf_cpu_ctx *cc = inf_cpu_ctx(bpf_get_smp_processor_id());
+
+		if (cc)
+			cc->run_calls++;
+	}
+
+	/*
+	 * The core started a task that this context does not hold as selected
+	 * or running. That is an unowned start: the core placed the task in a
+	 * local DSQ itself, or the last transition of the task never reached
+	 * this context. Either way the next enqueue has to take ownership.
+	 */
+	if (tctx->state != INF_ENTITY_SELECTED &&
+	    tctx->state != INF_ENTITY_RUNNING) {
+		INF_STAT_INC(run_unowned);
+		inf_trace(INF_TR_RUN_START, tctx,
+			  INF_TR_WHERE(tctx->path_cpu, tctx->queued_cpu), 0);
+	}
+
 	tctx->last_running_ns = scx_bpf_now();
 	if (tctx->state == INF_ENTITY_SELECTED)
 		tctx->state = INF_ENTITY_RUNNING;
@@ -4450,6 +4688,13 @@ void BPF_STRUCT_OPS(infinity_tick, struct task_struct *p)
 	if (!tctx)
 		return;
 
+	{
+		struct inf_cpu_ctx *cc = inf_cpu_ctx(bpf_get_smp_processor_id());
+
+		if (cc)
+			cc->tick_calls++;
+	}
+
 	if (tctx->state != INF_ENTITY_RUNNING &&
 	    tctx->state != INF_ENTITY_SELECTED)
 		return;
@@ -4496,17 +4741,54 @@ void BPF_STRUCT_OPS(infinity_stopping, struct task_struct *p, bool runnable)
 {
 	task_ctx *tctx;
 
-	(void)runnable;
-
 	TOUCH_ARENA();
 
 	tctx = inf_task_ctx(p);
 	if (!tctx)
 		return;
 
+	{
+		struct inf_cpu_ctx *cc = inf_cpu_ctx(bpf_get_smp_processor_id());
+
+		if (cc)
+			cc->stop_calls++;
+	}
+
+	if (tctx->state != INF_ENTITY_SELECTED &&
+	    tctx->state != INF_ENTITY_RUNNING) {
+		INF_STAT_INC(stop_unowned);
+		inf_trace(INF_TR_STOPPING, tctx,
+			  INF_TR_WHERE(tctx->path_cpu, tctx->queued_cpu),
+			  runnable ? 1 : 0);
+	}
+
 	inf_settle_slot(p, tctx, inf_slot_event(tctx),
 			inf_resv_local(inf_cpu_ctx(tctx->path_cpu)));
 	INF_STAT_INC(resv_stop);
+
+	/*
+	 * The slot ends when the task stops.
+	 *
+	 * The core keeps a task that stops with a live slice on its local DSQ
+	 * and re-picks it from there. A task in a local DSQ is served before
+	 * ops.dispatch() runs, so a task that keeps a live slice across stops
+	 * hides the whole tree of its CPU: the dispatch is never called while
+	 * the local DSQ holds one task. A task the core re-queues itself
+	 * without ops.enqueue() comes back into our custody only through the
+	 * enqueue path, so leaving it with a live slice also keeps it out of
+	 * the tree for good.
+	 *
+	 * Ending the slice here sends every stopped task back through
+	 * ops.enqueue(), which either re-enters it into the tree or admits it
+	 * anew. The CPU then reaches ops.dispatch() on the same scheduling
+	 * pass. The tick ends a slot at its end and the yield and the
+	 * preemption events keep their own requeue mode; only a stop that no
+	 * event described arrives here with a live slice.
+	 */
+	if (scx_bpf_task_set_slice(p, 0))
+		INF_STAT_INC(slot_end_stop);
+	else
+		INF_STAT_INC(stop_slice_refused);
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init_task, struct task_struct *p,

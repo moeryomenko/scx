@@ -327,6 +327,16 @@ struct inf_cpu_ctx {
 	u32 steal_llc_cursor;
 	u32 steal_node_cursor;
 	u32 online;
+	/* Callback storm diagnosis: how often each callback ran per CPU. */
+	u64 disp_calls; /* ops.dispatch invocations */
+	u64 disp_empty; /* dispatches that handed out nothing */
+	u64 stop_calls; /* ops.stopping invocations */
+	u64 run_calls; /* ops.running invocations */
+	u64 enq_calls; /* ops.enqueue invocations */
+	u64 q_calls; /* ops.quiescent invocations */
+	u64 deq_calls; /* ops.dequeue invocations */
+	u64 tick_calls; /* ops.tick invocations */
+	u64 last_disp_ns; /* scx_bpf_now() of the last dispatch */
 	u32 pad[2];
 };
 
@@ -520,6 +530,28 @@ struct inf_stats {
 	u64 requeue_no_leaf; /* a requeue found no leaf entity */
 	u64 rekey_fail; /* an ancestor re-key could not re-enter its queue */
 	/*
+	 * Tree-path consistency counters. A runnable task reaches the
+	 * selection only while its leaf entity sits in the child queue of its
+	 * parent and every ancestor does the same. Each way that invariant can
+	 * break has its own counter, so a stalled run names the broken link.
+	 */
+	u64 link_lost; /* a counted entity is not in its parent queue */
+	u64 count_lost; /* an entity left its parent queue with children */
+	u64 admit_unlinked; /* a task entered a leaf that is not linked */
+	u64 disp_empty_lost; /* the tree had depth but nothing to select */
+	/*
+	 * Ownership counters of the core callbacks. An unowned event means the
+	 * core ran, stopped or dequeued a task that this context does not hold
+	 * in the state the event implies.
+	 */
+	u64 run_unowned; /* ops.running for a task not selected or running */
+	u64 stop_unowned; /* ops.stopping for a task not selected or running */
+	u64 q_unowned; /* ops.quiescent ended a period this context lost */
+	u64 slot_end_stop; /* a live slot ended in ops.stopping */
+	u64 disp_renew_unowned; /* a renew refused an unowned previous task */
+	u64 runnable_unlinked; /* a runnable task was in no reachable queue */
+	u64 stop_slice_refused; /* the core refused the end-of-slot write */
+	/*
 	 * Preemption decision counters, one per refusal path. A refusal
 	 * changes no state, so only the counter moves.
 	 */
@@ -635,6 +667,22 @@ struct inf_task_pool {
 #define INF_TR_SET_WEIGHT 24
 #define INF_TR_DISPATCH_EMPTY 25
 #define INF_TR_EXIT_PASS 26
+/*
+ * Callback-entry records. They are kept in the per-task history only, so a
+ * stalled task shows the callbacks that ran and the state each one saw. They
+ * are never ringed: they are not anomalous on their own.
+ */
+#define INF_TR_ENQ_ENTER 27
+#define INF_TR_QUIESCENT 28
+#define INF_TR_Q_LEAVE 29
+#define INF_TR_STOPPING 30
+#define INF_TR_RUN_START 31
+/*
+ * A task was RUNNABLE while its queue node sat in no queue, or in a queue
+ * other than the child queue of its own leaf entity. The record is ringed
+ * unconditionally, and the causing operation is packed into result.
+ */
+#define INF_TR_PATH_LOST 32
 
 /* The causal fields of one queue transition. */
 struct inf_trace_rec {
@@ -678,6 +726,7 @@ struct inf_queue_snap {
 	u32 head_state;
 	u32 head_hold;
 	u32 online;
+	s64 local_nr; /* tasks in this CPU's core local DSQ at exit */
 	u32 head_kflags;
 	s64 head_ops_state;
 	s32 head_runnable_cpu;
@@ -686,23 +735,37 @@ struct inf_queue_snap {
 
 /* Exit-time task snapshot, keyed by pid. The last transition is kept. */
 struct inf_task_snap {
-	u64		ts;
-	u64		slice;
-	u64		weight;
-	s32		pid;
-	s32		queued_cpu;
-	s32		group_cpu;
-	u32		state;
-	u32		hold;
-	u32		joined;
-	u32		moving;
-	u32		reweight_pending;
-	u32		dequeue_pending;
-	u32		exit_pending;
-	u32		last_op;
-	s32		last_src;
-	s32		last_dst;
-	s64		last_result;
+	u64 ts;
+	u64 slice;
+	u64 weight;
+	s32 pid;
+	s32 queued_cpu;
+	s32 group_cpu;
+	u32 state;
+	u32 hold;
+	u32 joined;
+	u32 moving;
+	u32 reweight_pending;
+	u32 dequeue_pending;
+	u32 exit_pending;
+	u32 last_op;
+	s32 last_src;
+	s32 last_dst;
+	s64 last_result;
+	/*
+	 * Tree position of the task at the last transition. node_owner is 0
+	 * when no queue holds the node, 1 when the child queue of its leaf
+	 * entity holds it, and 2 when another queue does. chain_broken counts
+	 * the group entities between the leaf and the root that sit outside
+	 * their own parent queue, which is the path the selection walks.
+	 */
+	u32		node_owner;
+	u32		leaf_state;
+	s64		leaf_count;
+	u32		chain_broken;
+	u32		path_depth;
+	s32		leaf_idx;
+	s32		leaf_cpu;
 	u64		prev_ts;
 	u32		prev_op;
 	u32		prev_state;

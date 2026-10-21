@@ -208,6 +208,12 @@ fn trace_op_name(op: u32) -> &'static str {
         bpf_intf::INF_TR_SET_WEIGHT => "set_weight",
         bpf_intf::INF_TR_DISPATCH_EMPTY => "dispatch_empty",
         bpf_intf::INF_TR_EXIT_PASS => "exit_pass",
+        bpf_intf::INF_TR_ENQ_ENTER => "enq_enter",
+        bpf_intf::INF_TR_QUIESCENT => "quiescent",
+        bpf_intf::INF_TR_Q_LEAVE => "q_leave",
+        bpf_intf::INF_TR_STOPPING => "stopping",
+        bpf_intf::INF_TR_RUN_START => "run_start",
+        bpf_intf::INF_TR_PATH_LOST => "path_lost",
         _ => "unknown",
     }
 }
@@ -428,8 +434,33 @@ impl<'a> Scheduler<'a> {
             else {
                 continue;
             };
+            let mut calls = String::new();
+            if let Ok(Some(row)) = self
+                .skel
+                .maps
+                .cpu_ctx_stor
+                .lookup(&key, libbpf_rs::MapFlags::ANY)
+                && row.len() >= std::mem::size_of::<bpf_intf::inf_cpu_ctx>()
+            {
+                /* SAFETY: the map value is inf_cpu_ctx and the length is checked. */
+                let cctx = unsafe {
+                    std::ptr::read_unaligned(row.as_ptr() as *const bpf_intf::inf_cpu_ctx)
+                };
+                calls = format!(
+                    " calls: disp={}/{} enq={} run={} stop={} qui={} deq={} tick={} last_disp_ns={}",
+                    cctx.disp_calls,
+                    cctx.disp_empty,
+                    cctx.enq_calls,
+                    cctx.run_calls,
+                    cctx.stop_calls,
+                    cctx.q_calls,
+                    cctx.deq_calls,
+                    cctx.tick_calls,
+                    cctx.last_disp_ns
+                );
+            }
             info!(
-                "infq: cpu={} depth={} w_sum={} head_pid={} head_state={} head_cpu={} head_gcpu={} head_hold={} head_slice={} head_weight={} head_key={} head_kflags=0x{:x} head_ops_state={} head_runnable_cpu={}",
+                "infq: cpu={} depth={} w_sum={} head_pid={} head_state={} head_cpu={} head_gcpu={} head_hold={} head_slice={} head_weight={} head_key={} head_kflags=0x{:x} head_ops_state={} head_runnable_cpu={} local_nr={}{}",
                 qs.cpu,
                 qs.depth,
                 qs.w_sum,
@@ -443,7 +474,9 @@ impl<'a> Scheduler<'a> {
                 qs.head_key,
                 qs.head_kflags,
                 qs.head_ops_state,
-                qs.head_runnable_cpu
+                qs.head_runnable_cpu,
+                qs.local_nr,
+                calls
             );
         }
 
@@ -456,7 +489,7 @@ impl<'a> Scheduler<'a> {
             };
             tasks += 1;
             info!(
-                "inftask: pid={} state={} queued_cpu={} group_cpu={} hold={} slice={} weight={} joined={} moving={} reweight_pending={} dequeue_pending={} exit_pending={} last_op={} src={} dst={} result={} ts={} prev_op={} prev_state={} prev_src={} prev_dst={} prev_result={} prev_ts={}",
+                "inftask: pid={} state={} queued_cpu={} group_cpu={} hold={} slice={} weight={} joined={} moving={} reweight_pending={} dequeue_pending={} exit_pending={} last_op={} src={} dst={} result={} ts={} prev_op={} prev_state={} prev_src={} prev_dst={} prev_result={} prev_ts={} node_owner={} leaf_idx={} leaf_cpu={} leaf_state={} leaf_count={} chain_broken={} path_depth={}",
                 ts.pid,
                 ts.state,
                 ts.queued_cpu,
@@ -479,7 +512,14 @@ impl<'a> Scheduler<'a> {
                 ts.prev_src,
                 ts.prev_dst,
                 ts.prev_result,
-                ts.prev_ts
+                ts.prev_ts,
+                ts.node_owner,
+                ts.leaf_idx,
+                ts.leaf_cpu,
+                ts.leaf_state,
+                ts.leaf_count,
+                ts.chain_broken,
+                ts.path_depth
             );
 
             let count = usize::min(ts.hist_count as usize, ts.hist.len());
@@ -602,6 +642,17 @@ impl<'a> Scheduler<'a> {
         let mut disp_renew = 0u64;
         let mut disp_total = 0u64;
         let mut disp_q = 0u64;
+        let mut link_lost = 0u64;
+        let mut count_lost = 0u64;
+        let mut admit_unlinked = 0u64;
+        let mut disp_empty_lost = 0u64;
+        let mut run_unowned = 0u64;
+        let mut stop_unowned = 0u64;
+        let mut q_unowned = 0u64;
+        let mut slot_end_stop = 0u64;
+        let mut stop_slice_refused = 0u64;
+        let mut disp_renew_unowned = 0u64;
+        let mut runnable_unlinked = 0u64;
 
         let key = 0u32.to_ne_bytes();
         if let Ok(Some(rows)) = self
@@ -665,6 +716,17 @@ impl<'a> Scheduler<'a> {
                 disp_renew += stats.disp_renew;
                 disp_total += stats.disp_total;
                 disp_q += stats.disp_q;
+                link_lost += stats.link_lost;
+                count_lost += stats.count_lost;
+                admit_unlinked += stats.admit_unlinked;
+                disp_empty_lost += stats.disp_empty_lost;
+                run_unowned += stats.run_unowned;
+                stop_unowned += stats.stop_unowned;
+                q_unowned += stats.q_unowned;
+                slot_end_stop += stats.slot_end_stop;
+                stop_slice_refused += stats.stop_slice_refused;
+                disp_renew_unowned += stats.disp_renew_unowned;
+                runnable_unlinked += stats.runnable_unlinked;
             }
         }
 
@@ -751,7 +813,12 @@ impl<'a> Scheduler<'a> {
              no_ctx={enq_no_ctx} no_cctx={enq_no_cctx} \
              stale_requeues={stale_requeues} stale_skips={stale_skips} \
              disp: pop={disp_pop} renew={disp_renew} \
-             total={disp_total} q={disp_q}"
+             total={disp_total} q={disp_q} path: link_lost={link_lost} \
+             count_lost={count_lost} admit_unlinked={admit_unlinked} \
+             empty_lost={disp_empty_lost} unowned: run={run_unowned} \
+             stop={stop_unowned} qui={q_unowned} slot_end_stop={slot_end_stop} \
+             stop_slice_refused={stop_slice_refused} \
+             renew_unowned={disp_renew_unowned} runnable_unlinked={runnable_unlinked}"
         );
 
         if self.trace
