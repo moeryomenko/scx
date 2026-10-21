@@ -409,6 +409,19 @@ struct inf_dispatch_snap {
 	u64 depth; /* the advisory tree depth at the failure */
 	u64 generation; /* live configuration generation */
 	u64 attempts; /* selection attempts of the last failure */
+	/*
+	 * What the core holds for this CPU at the failure. nr_running is
+	 * every task the core counts as queued on this runqueue, in this
+	 * scheduler's tree, in its local DSQ or in no queue at all. The
+	 * tree and the local DSQ are visible to this scheduler, so
+	 * `missing` = nr_running - depth - local_nr is the number of tasks
+	 * that are queued on this CPU and that no scheduler structure
+	 * holds. A nonzero value is a task in core custody with no
+	 * scheduler reference.
+	 */
+	u64 core_nr_running;
+	u64 core_local_nr;
+	u64 core_missing;
 	u64 band_full; /* band scans that reached INF_BAND_SCAN_MAX */
 	u64 band_tail_node; /* of those, the first uninspected child */
 	u64 band_tail_null; /* of those, the queue ended at the bound */
@@ -417,6 +430,70 @@ struct inf_dispatch_snap {
 	u32 nr_levels; /* levels recorded */
 	u32 pad;
 	struct inf_sel_level lvl[INF_SEL_DEPTH_MAX];
+};
+
+/*
+ * The callbacks of this scheduler, for the callback history of a CPU. A
+ * record names the callback and not its arguments, so a reader can tell a
+ * CPU that stops dispatching from a CPU that dispatches and finds nothing.
+ */
+#define INF_CB_NONE 0
+#define INF_CB_SELECT_CPU 1
+#define INF_CB_ENQUEUE 2
+#define INF_CB_RUNNING 3
+#define INF_CB_TICK 4
+#define INF_CB_STOPPING 5
+#define INF_CB_DEQUEUE 6
+#define INF_CB_QUIESCENT 7
+#define INF_CB_DISPATCH 8
+#define INF_CB_YIELD 9
+#define INF_CB_SET_WEIGHT 10
+#define INF_CB_CGROUP_MOVE 11
+#define INF_CB_EXIT_TASK 12
+#define INF_CB_NAMES 13
+
+/* The number of callback names kept per CPU. A power of two, so the ring
+ * index is a mask and the verifier can bound the array access. */
+#define INF_CB_HISTORY 4
+
+/*
+ * One tick-side or dispatch-side record of a CPU.
+ *
+ * The dispatch snapshot of inf_dispatch_snap records a failed selection.
+ * This record is wider: it also carries what the core holds for the CPU,
+ * so a stall is named as one of two states. Either the tree holds the task
+ * and the selection cannot reach it, or the core counts a queued task that
+ * the tree does not hold, which means the task is in core custody with no
+ * scheduler reference. The second state is invisible to the selection and
+ * is what the tick-side record is for.
+ *
+ * nr_running and local_nr are read from the core's own runqueue. A queued
+ * task of this scheduler is on that runqueue's runnable list whether it
+ * sits in the tree or in no queue at all, so nr_running above the tree
+ * depth is the signature of the second state.
+ */
+struct inf_core_entry {
+	u64 ts; /* scx_bpf_now() at the record */
+	u64 depth; /* advisory tree depth of this CPU */
+	u64 nr_running; /* the core's queued tasks on this runqueue */
+	u64 local_nr; /* tasks in the core's local DSQ */
+	u64 last_disp_ns; /* scx_bpf_now() of the last dispatch */
+	u64 resv_pid; /* reservation owner, 0 when closed */
+	s32 curr_pid; /* pid of the core's current task */
+	u32 curr_idle; /* the current task is the idle task */
+	u32 curr_slice; /* slice of the current task */
+	u32 tag; /* INF_CB_* of the callback that wrote the record */
+	u32 stranded; /* depth is zero while the core counts queued tasks */
+	u32 cb[INF_CB_HISTORY]; /* last callbacks of this CPU, newest last */
+	u32 pad;
+};
+
+/* One per-CPU ring of inf_core_entry, pinned for a post-run read. */
+#define INF_CORE_SNAP_SLOTS 8
+
+struct inf_core_snap {
+	u64 next; /* records written, index of the next slot */
+	struct inf_core_entry slot[INF_CORE_SNAP_SLOTS];
 };
 
 struct inf_cpu_ctx {
@@ -447,6 +524,9 @@ struct inf_cpu_ctx {
 	u64 deq_calls; /* ops.dequeue invocations */
 	u64 tick_calls; /* ops.tick invocations */
 	u64 last_disp_ns; /* scx_bpf_now() of the last dispatch */
+	/* The last callbacks of this CPU, newest at index cb_next - 1. */
+	u32 cb[INF_CB_HISTORY];
+	u32 cb_next;
 	u32 pad[2];
 };
 

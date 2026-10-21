@@ -32,6 +32,36 @@
 #include "intf.h"
 #include "queue.h"
 
+/*
+ * Feature bisection switch of the stall diagnosis.
+ *
+ * The variant is a compile-time choice, not a rodata or map field: the
+ * dispatch program sits close to the verifier instruction budget, and one
+ * extra branch inside the selection costs more than the variant is worth.
+ * Each variant is a build in which the named mechanism is absent from the
+ * binary, which is also what makes the result interesting: the variant
+ * that removes the stall names the mechanism that causes it.
+ *
+ *   0  every mechanism on, which is the shipped policy
+ *   1  preemption off: no SCX_KICK_PREEMPT path
+ *   2  steal off: the local tree only
+ *   3  reservations off: charge at the stop, no epoch deferral
+ *   4  flat hierarchy: every task is a direct child of the root entity
+ *   5  fixed 5 ms slice: the core slice expires, the tick never ends a slot
+ */
+#define INF_BISECT_NONE 0
+#define INF_BISECT_NO_PREEMPT 1
+#define INF_BISECT_NO_STEAL 2
+#define INF_BISECT_INLINE_CHARGE 3
+#define INF_BISECT_FLAT_TREE 4
+#define INF_BISECT_FIXED_SLICE 5
+
+#ifndef INF_BISECT_VARIANT
+#define INF_BISECT_VARIANT 0
+#endif
+
+#define INF_FIXED_SLICE_NS 5000000ULL
+
 char _license[] SEC("license") = "GPL";
 
 UEI_DEFINE(uei);
@@ -123,6 +153,28 @@ struct {
 	__type(key, u32);
 	__type(value, struct inf_dispatch_snap);
 } dsnap_stor SEC(".maps");
+
+/*
+ * The tick-side and dispatch-side core snapshot, one ring per CPU, pinned
+ * like the dispatch snapshot.
+ *
+ * A stalled CPU is idle: the core's current task is the idle task, so
+ * ops.tick() does not run there and the runnable tasks that the watchdog
+ * names are not visible through any per-task callback. The record is taken
+ * from the callbacks that do run on that CPU, which are the dispatch and
+ * the tick, and it carries the core's own count of queued tasks. A CPU
+ * whose record shows the core counting queued tasks while the tree counts
+ * none is a CPU whose tasks are in core custody with no scheduler
+ * reference; a CPU whose record shows the tree holding tasks while the
+ * selection hands out none is a tree the selection cannot reach.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, INF_MAX_CPUS);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+	__type(key, u32);
+	__type(value, struct inf_core_snap);
+} csnap_stor SEC(".maps");
 
 /*
  * One group entity of the tree.
@@ -453,12 +505,17 @@ static __always_inline u64 inf_cpu_slot_ns(s32 cpu)
 	struct inf_cpu_ctx *cctx = inf_cpu_ctx(cpu);
 	u64		    slot;
 
+#if INF_BISECT_VARIANT == 5
+	/* Variant 5: one fixed 5 ms slice, ended by the core, not the tick. */
+	return INF_FIXED_SLICE_NS;
+#else
 	if (!cctx)
 		return INF_SLOT_NS;
 	slot = READ_ONCE(cctx->slot_ns);
 	if (slot < INF_SLOT_MIN_NS || slot > INF_SLOT_MAX_NS)
 		return INF_SLOT_NS;
 	return slot;
+#endif
 }
 
 /*
@@ -1067,6 +1124,30 @@ static __always_inline u32 inf_nr_cpu_ids(void)
 }
 
 /*
+ * Record the callback that is starting on this CPU. The history names the
+ * last three callbacks of the CPU, so a record that shows an idle core can
+ * still say whether that CPU dispatched, and a CPU that never asked for
+ * work is told apart from a CPU that asked and received nothing.
+ */
+static __always_inline void inf_cb_note(u32 tag)
+{
+	s32		    cpu = bpf_get_smp_processor_id();
+	struct inf_cpu_ctx *cctx;
+	u32		    slot;
+
+	if (cpu < 0 || (u32)cpu >= inf_nr_cpu_ids())
+		return;
+
+	cctx = inf_cpu_ctx(cpu);
+	if (!cctx)
+		return;
+
+	slot	       = cctx->cb_next & (INF_CB_HISTORY - 1);
+	cctx->cb[slot] = tag;
+	cctx->cb_next++;
+}
+
+/*
  * The live control state of one cgroup, or NULL when the cgroup has no
  * entry. The entry is the proof that the cgroup is alive: the cgroup
  * callbacks create it and remove it.
@@ -1650,19 +1731,33 @@ static __always_inline void inf_gate_commit(inf_group_entity_t *parent,
 }
 
 /* Insert a group entity into the queue of its parent. */
-static __always_inline void inf_link_entity(inf_cpu_block_t    *blk,
-					    inf_group_entity_t *e, u32 mode)
+static __always_inline int inf_link_entity(inf_cpu_block_t	  *blk,
+					   inf_group_entity_t *e, u32 mode)
 {
 	inf_group_entity_t *par = inf_entity(blk, e->parent_idx);
+	int		    ret;
 
 	if (!par)
-		return;
+		return -ENOENT;
 
 	e->v_q16 = inf_service_max(e->v_q16, par->frontier_q16);
 	e->class = inf_gate_class(par, mode);
 	e->tie	 = par->tie_seq++;
-	inf_q_insert(&par->children, &e->qnode, e->v_q16);
+	ret	 = inf_q_insert(&par->children, &e->qnode, e->v_q16);
+	if (ret) {
+		/*
+		 * The entity is not in its parent queue, so nothing below
+		 * it is reachable from the root. Marking it RUNNABLE here
+		 * would hide every descendant from the selection and move
+		 * no counter, so the failure is recorded and the entity
+		 * stays INACTIVE. Its children are still in its own child
+		 * queue; the caller repairs the path.
+		 */
+		INF_STAT_INC(link_lost);
+		return ret;
+	}
 	e->state = INF_ENTITY_RUNNABLE;
+	return 0;
 }
 
 /*
@@ -1692,7 +1787,8 @@ static __noinline void inf_count_up(inf_cpu_block_t *blk, u32 idx, u32 mode)
 				INF_STAT_INC(link_lost);
 			return;
 		}
-		inf_link_entity(blk, e, mode);
+		if (inf_link_entity(blk, e, mode))
+			return;
 		idx = e->parent_idx;
 	}
 }
@@ -2050,7 +2146,7 @@ static __always_inline void inf_sel_note(inf_cpu_block_t *blk,
 		inf_child_identity(blk, &scratch->win.task->node, &id,
 				   &is_group);
 		if (is_group) {
-			lvl->child  = (u32)id;
+			lvl->child = (u32)id;
 			lvl->flags |= INF_SEL_F_WIN_GROUP;
 		} else {
 			lvl->pid = id;
@@ -2103,10 +2199,10 @@ inf_select_leaf(inf_cpu_block_t *blk, inf_cpu_block_t *scratch, task_ctx **leaf)
 			break;
 		scratch->counter[INF_COUNTER_RETRY] = attempt + 1;
 
-		restart		      = false;
-		parent		      = 0;
-		scratch->sel_levels   = 0;
-		scratch->sel_attempts = attempt + 1;
+		restart				    = false;
+		parent				    = 0;
+		scratch->sel_levels		    = 0;
+		scratch->sel_attempts		    = attempt + 1;
 		scratch->counter[INF_COUNTER_DEPTH] = 0;
 
 		/*
@@ -2640,6 +2736,33 @@ static __noinline void inf_settle_slot(struct task_struct *p, task_ctx *tctx,
 	if (!cctx)
 		return;
 
+#if INF_BISECT_VARIANT == 3
+	/*
+	 * Variant 3: no reservation. The runtime is read from the cursor of
+	 * the last ops.running() and charged here, so the slot is settled
+	 * where the task stops and there is no deferred settlement.
+	 */
+	{
+		u64 actual = 0;
+
+		if (local && tctx->last_running_ns) {
+			u64 now = scx_bpf_now();
+
+			if (now > tctx->last_running_ns)
+				actual = now - tctx->last_running_ns;
+		}
+		if (actual > INF_SETTLE_MAX_NS) {
+			actual = INF_SETTLE_MAX_NS;
+			INF_STAT_INC(settle_clamps);
+		}
+		inf_charge_path(tctx, NULL, actual);
+		inf_apply_epoch(tctx);
+		if (actual && p && inf_cpu_bw_enabled())
+			scx_cgroup_ctl_consume(p, (u64)tctx, actual);
+		return;
+	}
+#endif
+
 	r = &cctx->resv;
 	if (!r->task_idx) {
 		/* The slot was already settled. */
@@ -2896,6 +3019,11 @@ static __always_inline void inf_maybe_preempt(struct task_struct *p, s32 cpu,
 		return;
 	}
 
+#if INF_BISECT_VARIANT == 1
+	/* Variant 1: no preemption kick at all. */
+	return;
+#endif
+
 	INF_STAT_INC(preempt_checks);
 
 	if (p->policy != INF_SCHED_NORMAL && p->policy != INF_SCHED_EXT) {
@@ -3097,6 +3225,7 @@ static __noinline bool inf_capacity_better(const struct inf_pick_score *a,
 s32 BPF_STRUCT_OPS(infinity_select_cpu, struct task_struct *p, s32 prev_cpu,
 		   u64 wake_flags)
 {
+	inf_cb_note(INF_CB_SELECT_CPU);
 	const struct cpumask *idle_mask, *core_mask;
 	struct inf_cpu_topo  *lt;
 	struct inf_cfg	     *cfg;
@@ -3295,10 +3424,19 @@ static __noinline int inf_admit_on_cpu(struct task_struct *p, task_ctx *tctx,
 	if (!blk)
 		return -EINVAL;
 
-	cgrp	    = inf_task_cgroup(p);
+	cgrp = inf_task_cgroup(p);
+#if INF_BISECT_VARIANT == 4
+	/*
+	 * Variant 4: every task is a direct child of the root entity, so the
+	 * tree has one queue and no group level.
+	 */
+	cgrp_id	    = inf_cgroup_id(cgrp);
+	leaf_parent = 0;
+#else
 	leaf_parent = inf_resolve_leaf(blk, cgrp, &cgrp_id);
+#endif
 
-	leaf	    = inf_entity(blk, leaf_parent);
+	leaf = inf_entity(blk, leaf_parent);
 	if (!leaf)
 		return -EINVAL;
 
@@ -3570,6 +3708,7 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 
 void BPF_STRUCT_OPS(infinity_enqueue, struct task_struct *p, u64 enq_flags)
 {
+	inf_cb_note(INF_CB_ENQUEUE);
 	inf_enqueue_common(p, enq_flags, false);
 }
 
@@ -3643,6 +3782,124 @@ static __noinline bool inf_steal_one(s32 cpu, struct inf_cpu_ctx *cctx,
  * clean run shows that the depth, retry, zero-count and scan reasons never
  * happened at all.
  */
+/*
+ * Write one core record of @cpu into the per-CPU ring.
+ *
+ * The record carries what the core holds for the CPU, so a stall is named
+ * as one of two states. A tree that counts tasks while the selection hands
+ * out none is a tree the selection cannot reach. An empty tree while the
+ * core counts queued tasks is a task in core custody with no scheduler
+ * reference: nothing in this scheduler can select it, and no per-task
+ * callback will run for it again.
+ *
+ * `stranded` is that second state. A record with `stranded` set is the
+ * proof that the task the watchdog names is in neither the tree nor a
+ * dispatch queue, so the record is worth keeping from the callbacks that
+ * still run on an otherwise idle CPU.
+ */
+static __noinline void inf_snap_core(s32 cpu, u32 tag, bool running_self)
+{
+	struct inf_core_snap  *snap;
+	struct inf_core_entry *e;
+	struct inf_cpu_ctx    *cctx;
+	struct rq	      *rq;
+	u32		       key = (u32)cpu;
+	u64		       idx, nr_running = 0, local_nr = 0;
+	u32		       i;
+
+	snap = bpf_map_lookup_elem(&csnap_stor, &key);
+	if (!snap)
+		return;
+
+	cctx = inf_cpu_ctx(cpu);
+	if (!cctx)
+		return;
+
+	rq = scx_bpf_locked_rq();
+	if (rq) {
+		nr_running = rq->scx.nr_running;
+		local_nr   = rq->scx.local_dsq.nr;
+	}
+
+	idx		= snap->next;
+	snap->next	= idx + 1;
+	e		= &snap->slot[idx & (INF_CORE_SNAP_SLOTS - 1)];
+
+	e->ts		= scx_bpf_now();
+	e->depth	= (u64)(cctx->depth > 0 ? cctx->depth : 0);
+	e->nr_running	= nr_running;
+	e->local_nr	= local_nr;
+	e->last_disp_ns = cctx->last_disp_ns;
+	e->resv_pid	= cctx->resv.task_idx;
+	e->tag		= tag;
+	/*
+	 * The tasks the core counts on this runqueue that neither the tree
+	 * nor the local DSQ holds, less the task that is running here. A
+	 * nonzero value is a task in core custody with no scheduler
+	 * reference: nothing in this scheduler can select it again.
+	 */
+	{
+		s64 missing = (s64)nr_running - (s64)e->depth -
+			      (s64)local_nr - (running_self ? 1 : 0);
+
+		e->stranded = missing > 0 ? (u32)missing : 0;
+	}
+	e->curr_idle	= 0;
+	e->curr_pid	= -1;
+	e->curr_slice	= 0;
+	if (rq && rq->curr) {
+		e->curr_pid   = rq->curr->pid;
+		e->curr_slice = READ_ONCE(rq->curr->scx.slice);
+		if (rq->curr == rq->idle)
+			e->curr_idle = 1;
+	}
+
+	for (i = 0; i < INF_CB_HISTORY && can_loop; i++)
+		e->cb[i] = cctx->cb[i];
+	e->pad = cctx->cb_next;
+}
+
+/*
+ * The core record of a CPU whose tick is worth keeping: the tree holds
+ * tasks while the last dispatch handed out nothing for a while, or the
+ * core counts queued tasks that the tree does not hold. A clean CPU writes
+ * nothing, so an empty ring is a result and not a missing instrument.
+ */
+static __noinline void inf_snap_core_tick(s32 cpu, struct inf_cpu_ctx *cctx)
+{
+	struct rq *rq;
+	u64	   nr_running = 0, local_nr = 0, depth, now;
+	s64	   missing;
+
+	if (!cctx)
+		return;
+
+	rq = scx_bpf_locked_rq();
+	if (rq) {
+		nr_running = rq->scx.nr_running;
+		local_nr   = rq->scx.local_dsq.nr;
+	}
+
+	depth = cctx->depth > 0 ? (u64)cctx->depth : 0;
+	/* This tick runs for the task the core is running here. */
+	missing = (s64)nr_running - (s64)depth - (s64)local_nr - 1;
+
+	/*
+	 * The anomalous state only. A task the core counts but no
+	 * scheduler structure holds is recorded; a CPU whose tree and local
+	 * DSQ account for every queued task is not, so an empty ring is a
+	 * result.
+	 */
+	if (missing > 0) {
+		inf_snap_core(cpu, INF_CB_TICK, true);
+		return;
+	}
+
+	now = cctx->last_disp_ns;
+	if (depth > 0 && now && scx_bpf_now() - now > 5000000ULL)
+		inf_snap_core(cpu, INF_CB_TICK, true);
+}
+
 static __noinline void inf_snap_selection(s32 cpu, inf_cpu_block_t *blk)
 {
 	struct inf_dispatch_snap *snap;
@@ -3680,6 +3937,27 @@ static __noinline void inf_snap_selection(s32 cpu, inf_cpu_block_t *blk)
 	if (cctx && cctx->depth > 0)
 		snap->depth = (u64)cctx->depth;
 
+	/*
+	 * What the core counts for this CPU. A dispatch runs on an idle
+	 * CPU that has queued tasks, so the task that is running here
+	 * contributes nothing: the idle task is not one of ours.
+	 */
+	{
+		struct rq *rq  = scx_bpf_locked_rq();
+		u64	   nr  = 0;
+		u64	   loc = 0;
+		s64	   missing;
+
+		if (rq) {
+			nr  = rq->scx.nr_running;
+			loc = rq->scx.local_dsq.nr;
+		}
+		snap->core_nr_running = nr;
+		snap->core_local_nr   = loc;
+		missing = (s64)nr - (s64)snap->depth - (s64)loc;
+		snap->core_missing = missing > 0 ? (u64)missing : 0;
+	}
+
 	snap->band_full	     = blk->band_full;
 	snap->band_tail_node = blk->band_tail_node;
 	snap->band_tail_null = blk->band_tail_null;
@@ -3702,7 +3980,7 @@ static __noinline void inf_snap_selection(s32 cpu, inf_cpu_block_t *blk)
 
 		if (i >= n)
 			break;
-		src = &blk->sel[i];
+		src		    = &blk->sel[i];
 
 		snap->lvl[i].depth  = src->depth;
 		snap->lvl[i].parent = src->parent;
@@ -3720,7 +3998,7 @@ static __noinline void inf_snap_selection(s32 cpu, inf_cpu_block_t *blk)
 		 */
 		pe = inf_entity(blk, src->parent);
 		if (pe) {
-			snap->lvl[i].nr	     = inf_queue_nr(&pe->children);
+			snap->lvl[i].nr	      = inf_queue_nr(&pe->children);
 			snap->lvl[i].frontier = pe->frontier_q16;
 			inf_child_identity(blk, pe->children.first, &id,
 					   &is_group);
@@ -3741,11 +4019,11 @@ static __noinline void inf_snap_selection(s32 cpu, inf_cpu_block_t *blk)
 			inf_group_entity_t *e = inf_entity(blk, src->child);
 
 			if (e) {
-				snap->lvl[i].v	   = e->v_q16;
-				snap->lvl[i].class = e->class;
-				snap->lvl[i].count = e->count;
-				snap->lvl[i].state = e->state;
-				snap->lvl[i].refs  = e->refs;
+				snap->lvl[i].v		= e->v_q16;
+				snap->lvl[i].class	= e->class;
+				snap->lvl[i].count	= e->count;
+				snap->lvl[i].state	= e->state;
+				snap->lvl[i].refs	= e->refs;
 				snap->lvl[i].generation = e->generation;
 			}
 		}
@@ -3799,6 +4077,11 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 		 * it: a stall on this CPU is an idle CPU with tasks in core
 		 * custody and no other record, because the exit snapshots run
 		 * after the disable pass.
+		 */
+		/*
+		 * The dispatch program is close to the verifier instruction
+		 * budget, so the wider core record is taken from the tick and
+		 * the selection record alone is written here.
 		 */
 		inf_snap_selection(cpu, blk);
 
@@ -4209,7 +4492,10 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 	}
 
 	leaf_parent = inf_resolve_leaf(dblk, inf_task_cgroup(p), &cgrp_id);
-	dleaf	    = inf_entity(dblk, leaf_parent);
+#if INF_BISECT_VARIANT == 4
+	leaf_parent = 0;
+#endif
+	dleaf = inf_entity(dblk, leaf_parent);
 	if (!dleaf) {
 		INF_STAT_INC(steal_revalidate_refusals);
 		goto restore;
@@ -4399,6 +4685,10 @@ static __noinline bool inf_steal_one(s32 cpu, struct inf_cpu_ctx *cctx,
 {
 	struct inf_cpu_topo *lt = inf_cpu_topo(cpu);
 
+#if INF_BISECT_VARIANT == 2
+	/* Variant 2: the local tree only. */
+	return false;
+#endif
 	if (!lt || !lt->online)
 		return false;
 	if (inf_steal_tier(cpu, lt->llc_id, lt->node_id, INF_STEAL_LLC,
@@ -4494,6 +4784,7 @@ void BPF_STRUCT_OPS(infinity_dequeue, struct task_struct *p, u64 deq_flags)
 	bool	  core_exec, ended;
 
 	TOUCH_ARENA();
+	inf_cb_note(INF_CB_DEQUEUE);
 
 	tctx = inf_task_ctx(p);
 	if (!tctx)
@@ -4580,6 +4871,7 @@ void BPF_STRUCT_OPS(infinity_quiescent, struct task_struct *p, u64 deq_flags)
 	task_ctx *tctx;
 
 	TOUCH_ARENA();
+	inf_cb_note(INF_CB_QUIESCENT);
 
 	tctx = inf_task_ctx(p);
 	if (!tctx)
@@ -4934,6 +5226,7 @@ bool BPF_STRUCT_OPS(infinity_yield, struct task_struct *from,
 	bool		      moved = false;
 
 	TOUCH_ARENA();
+	inf_cb_note(INF_CB_YIELD);
 
 	if (!from)
 		return false;
@@ -4982,6 +5275,7 @@ void BPF_STRUCT_OPS(infinity_running, struct task_struct *p)
 	struct inf_cpu_ctx *cctx;
 
 	TOUCH_ARENA();
+	inf_cb_note(INF_CB_RUNNING);
 
 	tctx = inf_task_ctx(p);
 	if (!tctx)
@@ -5054,6 +5348,7 @@ void BPF_STRUCT_OPS(infinity_tick, struct task_struct *p)
 	bool		    local;
 
 	TOUCH_ARENA();
+	inf_cb_note(INF_CB_TICK);
 
 	tctx = inf_task_ctx(p);
 	if (!tctx)
@@ -5063,8 +5358,10 @@ void BPF_STRUCT_OPS(infinity_tick, struct task_struct *p)
 		struct inf_cpu_ctx *cc =
 			inf_cpu_ctx(bpf_get_smp_processor_id());
 
-		if (cc)
+		if (cc) {
 			cc->tick_calls++;
+			inf_snap_core_tick(bpf_get_smp_processor_id(), cc);
+		}
 	}
 
 	if (tctx->state != INF_ENTITY_RUNNING &&
@@ -5096,11 +5393,18 @@ void BPF_STRUCT_OPS(infinity_tick, struct task_struct *p)
 	/*
 	 * The settle charges the service of the path and the actual runtime
 	 * of the slot. A remote tick counts the reserved slot.
+	 *
+	 * Bisection variant 3 has no reservation: the charge is taken at the
+	 * stop, so the tick only ends the slot.
 	 */
+#if INF_BISECT_VARIANT != 3
 	inf_settle_slot(p, tctx, event, local);
+#endif
 
-	/* The slot ends here. The core reschedules the task. */
+#if INF_BISECT_VARIANT != 5
+	/* The slot ends here. Variant 5 lets the core slice expire instead. */
 	scx_bpf_task_set_slice(p, 0);
+#endif
 }
 
 /*
@@ -5114,6 +5418,7 @@ void BPF_STRUCT_OPS(infinity_stopping, struct task_struct *p, bool runnable)
 	task_ctx *tctx;
 
 	TOUCH_ARENA();
+	inf_cb_note(INF_CB_STOPPING);
 
 	tctx = inf_task_ctx(p);
 	if (!tctx)
