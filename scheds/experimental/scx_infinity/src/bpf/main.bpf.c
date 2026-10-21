@@ -604,6 +604,48 @@ done:
 }
 
 /*
+ * The service of the leaf group at the head of this CPU's tree.
+ *
+ * The walk follows the head of every queue, which is the child with the
+ * lowest service, until a task names its parent group. That group is the
+ * one the next dispatch would run, and its service is the value the
+ * running slot must not pass. Nothing is removed, locked or changed.
+ */
+static __noinline bool inf_peek_leaf_v(inf_cpu_block_t *blk, u64 *v)
+{
+	u32 idx = 0;
+	int level;
+
+	if (!blk)
+		return false;
+
+	for (level = 0; level < INF_MAX_LEVELS && can_loop; level++) {
+		inf_group_entity_t *e = inf_entity(blk, idx);
+		scx_edq_node_t	   *n;
+		u64		    node;
+		u32		    next;
+
+		if (!e)
+			return false;
+		n = READ_ONCE(e->children.first);
+		if (!n)
+			return false;
+		node = (u64)inf_queue_node_task(n);
+		if (!inf_node_is_group(blk, node)) {
+			/* The head task of this group: the group is the leaf. */
+			*v = e->v_q16;
+			return true;
+		}
+		next = inf_entity_index(blk, (inf_group_entity_t *)node);
+		if (next == idx)
+			return false;
+		idx = next;
+	}
+
+	return false;
+}
+
+/*
  * The reservation that belongs to @tctx, or NULL.
  *
  * One CPU runs one task at a time and one slot is open per CPU. A task with
@@ -2572,7 +2614,17 @@ static __always_inline int inf_link_entity(inf_cpu_block_t    *blk,
 	if (!par)
 		return -ENOENT;
 
-	e->v_q16 = inf_service_max(e->v_q16, par->frontier_q16);
+	/*
+	 * A child that fell behind the queue by more than one full slot
+	 * budget was not runnable in between and is stale: raise it to the
+	 * frontier so a wakes-up group cannot claim a backlog. A child that
+	 * was running is at most one budget behind and keeps its service,
+	 * which is what weights the shares.
+	 */
+	if (par->frontier_q16 > e->v_q16 &&
+	    par->frontier_q16 - e->v_q16 >
+		    INF_BAND_Q16 * INF_SLICE_WEIGHT_MAX)
+		e->v_q16 = par->frontier_q16;
 	e->class = inf_gate_class(par, mode);
 	e->tie	 = par->tie_seq++;
 	ret	 = inf_q_insert(&par->children, &e->qnode, e->v_q16);
@@ -5681,7 +5733,13 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 	 * The slot the task will get. The reservation itself opens in
 	 * ops.running(), after the predecessor settled its own slot.
 	 */
-	tctx->slice_ns = inf_cpu_slot_ns(cpu);
+	/*
+	 * The core slice is the longest a slot may run. The tick ends the
+	 * slot as soon as the group it charges is no longer behind the
+	 * service of the queued leaf, so the budget bounds the latency and
+	 * the service comparison sets the share.
+	 */
+	tctx->slice_ns = inf_cpu_slot_ns(cpu) * INF_SLICE_WEIGHT_MAX;
 	tctx->state    = INF_ENTITY_SELECTED;
 
 	INF_STAT_INC(disp_pop);
@@ -6252,7 +6310,9 @@ void BPF_STRUCT_OPS(infinity_dispatch, s32 cpu, struct task_struct *prev)
 			     tctx->state == INF_ENTITY_RUNNING)) {
 			u64 renew_now = scx_bpf_now();
 
-			scx_bpf_task_set_slice(prev, INF_SLOT_NS);
+			scx_bpf_task_set_slice(prev,
+					       inf_cpu_slot_ns(cpu) *
+						       INF_SLICE_WEIGHT_MAX);
 			INF_STAT_INC(disp_renew);
 
 			/*
@@ -6999,8 +7059,41 @@ void BPF_STRUCT_OPS(infinity_tick, struct task_struct *p)
 #endif
 
 #if INF_BISECT_VARIANT != 5
-	/* The slot ends here. Variant 5 lets the core slice expire instead. */
-	scx_bpf_task_set_slice(p, 0);
+	/*
+	 * The slot ends on service and not on the clock.
+	 *
+	 * A task whose leaf group has received less service than the leaf
+	 * group at the head of the tree keeps the CPU, one tick at a time.
+	 * Every tick settles the runtime it measured and opens the
+	 * reservation of the next one, so each tick reaches the policy
+	 * ledger and cpu.max exactly once. A task that is not behind, a CPU
+	 * with nothing queued behind it, and a remote tick all end the slot
+	 * here, and the core picks the next task.
+	 */
+	if (local && event == INF_EV_POST_SLOT && READ_ONCE(p->scx.slice)) {
+		inf_cpu_block_t	  *blk = inf_block(tctx->path_cpu);
+		inf_group_entity_t *leaf;
+		u64		   head_v = 0;
+		bool		   cont = false;
+
+		leaf = blk ? inf_entity(blk, (u32)tctx->parent_idx) : NULL;
+		if (leaf && inf_peek_leaf_v(blk, &head_v))
+			cont = inf_service_less(leaf->v_q16, head_v);
+
+		if (cont) {
+			u64 now = scx_bpf_now();
+
+			inf_resv_reclaim(cctx, tctx);
+			inf_resv_open(cctx, tctx, bpf_get_smp_processor_id());
+			cctx->resv.start_now = now;
+			cctx->resv.flags |= INF_RESV_RUNNING;
+			tctx->last_running_ns = now;
+		} else {
+			scx_bpf_task_set_slice(p, 0);
+		}
+	} else {
+		scx_bpf_task_set_slice(p, 0);
+	}
 #endif
 }
 

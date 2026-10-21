@@ -45,6 +45,13 @@ typedef signed long    s64;
  * the dispatch slice. It is not a wall-clock promise.
  */
 #define INF_SLOT_NS 1000000ULL
+/*
+ * The longest one service slot may run, in measured ticks. The tick ends
+ * a slot as soon as its group is no longer behind the queued leaf, so a
+ * weighted share normally ends in one or two ticks; the cap bounds the
+ * latency of a very heavy group and the overshoot of a cpu.max period.
+ */
+#define INF_SLICE_WEIGHT_MAX 8U
 
 /*
  * The largest charge one settlement can add. A slot that runs longer is
