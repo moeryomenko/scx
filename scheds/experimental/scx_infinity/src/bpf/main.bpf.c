@@ -131,23 +131,25 @@ struct {
  */
 struct inf_group_entity {
 	struct scx_edq_task qnode;
-	struct scx_edq children;
-	u64 v_q16;
-	u64 rem;
-	u64 frontier_q16;
-	u64 cgrp_id;
-	u64 count;
-	u64 tie;
-	u64 tie_seq;
-	u64 epoch;
-	u32 parent_idx;
-	u32 weight;
-	u32 gate_seq;
-	u32 class;
-	u16 nr_children;
-	u16 flags;
-	u32 state;
-	u32 pad;
+	struct scx_edq	    children;
+	u64		    v_q16;
+	u64		    rem;
+	u64		    frontier_q16;
+	u64		    cgrp_id;
+	u64		    count;
+	u64		    tie;
+	u64		    tie_seq;
+	u64		    epoch;
+	u64		    generation;
+	u32		    parent_idx;
+	u32		    weight;
+	u32		    gate_seq;
+	u32		    class;
+	u16		    nr_children;
+	u16		    flags;
+	u32		    refs;
+	u32		    state;
+	u32		    pad;
 };
 
 typedef struct inf_group_entity __arena inf_group_entity_t;
@@ -158,10 +160,10 @@ typedef struct inf_group_entity __arena inf_group_entity_t;
  */
 struct inf_cand {
 	scx_edq_task_t *task;
-	u64		 v;
-	u64		 tie;
-	u32		 cls;
-	bool		 valid;
+	u64		v;
+	u64		tie;
+	u32		cls;
+	bool		valid;
 };
 
 /*
@@ -176,7 +178,7 @@ struct inf_index_slot {
 };
 
 typedef struct inf_index_slot __arena inf_index_slot_t;
-typedef u8 __arena inf_byte_t;
+typedef u8 __arena		      inf_byte_t;
 
 /*
  * The entity store of one CPU: the group entities, the cgroup index and
@@ -185,7 +187,7 @@ typedef u8 __arena inf_byte_t;
  */
 struct inf_cpu_block {
 	struct inf_group_entity ents[INF_GROUPS_PER_CPU];
-	struct inf_index_slot index[INF_INDEX_SLOTS];
+	struct inf_index_slot	index[INF_INDEX_SLOTS];
 	/*
 	 * The scan cursor of the band scan. It lives in the arena because
 	 * the queue API takes an arena pointer, and a BPF stack slot
@@ -223,6 +225,36 @@ typedef struct inf_cpu_block __arena inf_cpu_block_t;
 #define INF_IDX_NONE 0xffffffffU
 
 /*
+ * The queue entry points.
+ *
+ * The verifier validates a subprogram once per distinct entry state, and
+ * the queue calls of the tree differ at every call site: each one holds a
+ * different arena pointer, because a group entity, a task and the child
+ * queue of a parent are different objects. Taking the two pointers as
+ * `void __arena *` keeps the entry state of the callee equal across the
+ * call sites, so the EDQ insert and remove are validated once instead of
+ * once per site. Without this the dispatch program exceeds the verifier
+ * instruction limit.
+ */
+static __noinline int inf_q_insert(void __arena *queue, void __arena *node,
+				   u64 v)
+{
+	return scx_edq_insert((scx_edq_t *)queue, (scx_edq_task_t *)node, v, 0,
+			      0);
+}
+
+static __noinline int inf_q_remove(void __arena *queue, void __arena *node)
+{
+	int ret = scx_edq_try_remove((scx_edq_t *)queue,
+				     (scx_edq_task_t *)node);
+
+	if (ret == -EBUSY)
+		ret = scx_edq_remove((scx_edq_t *)queue, (scx_edq_task_t *)node);
+	return ret;
+}
+
+
+/*
  * Per-task context, allocated in the arena by scx_task_alloc(). The
  * bandwidth context must stay first: REGISTER_SCX_CGROUP_BW_ENQUEUE_CB()
  * and the scx_cgroup_bw_* API cast the context to scx_task_common at offset
@@ -231,46 +263,52 @@ typedef struct inf_cpu_block __arena inf_cpu_block_t;
  */
 struct task_ctx {
 	struct scx_task_cgroup_bw cg_bw; /* MUST be first */
-	struct scx_edq_task qnode;	 /* link in the parent group queue */
-	u64 v_q16;			 /* service on the parent scale */
-	u64 rem;			 /* retained division remainder */
-	u64 tie;			 /* insertion counter in the parent */
-	u64 latched_weight;		 /* weight of the next charge */
-	u64 epoch;			 /* epoch of the latched weight */
-	u64 parent_idx;		 /* the leaf parent entity */
-	u64 cgrp_id;			 /* the cgroup of the leaf parent */
-	u64 slice_ns;			 /* the last assigned slice */
-	u64 last_running_ns;		 /* clock at the last ops.running() */
-	u64 base_weight;			 /* p->scx.weight at the last change */
-	u32 path_ent[INF_MAX_LEVELS];	 /* the held path, leaf parent first */
-	s32 queued_cpu;			 /* the CPU whose tree holds the task */
-	s32 path_cpu;			 /* the CPU whose tree holds the path */
-	u32 path_depth;			 /* the number of group levels */
-	u32 state;				 /* enum inf_entity_state */
-	u32 class;				 /* the insertion class */
-	u32 moving;				 /* one writer owns a queue move */
-	u32 dequeue_pending;			 /* a dequeue arrived during a move */
-	u32 exit_pending;			 /* an exit arrived during a move */
-	u32 reweight_pending;			 /* apply the new weight at the next step */
-	u32 joined;				 /* the cgroup counts this task */
-	u32 yielded;				 /* the task asked to yield */
-	u32 preempted;			 /* the task lost its slice to a preemption */
-	u32 wake_fork;			 /* the wakeup carried SCX_WAKE_FORK */
-	u32 idle;				 /* the task sits under an idle group */
+	struct scx_edq_task	  qnode; /* link in the parent group queue */
+	u64			  v_q16; /* service on the parent scale */
+	u64			  rem; /* retained division remainder */
+	u64			  tie; /* insertion counter in the parent */
+	u64 latched_weight; /* weight of the next charge */
+	u64 epoch; /* epoch of the latched weight */
+	u64 parent_idx; /* the leaf parent entity */
+	u64 cgrp_id; /* the cgroup of the leaf parent */
+	u64 slice_ns; /* the last assigned slice */
+	u64 last_running_ns; /* clock at the last ops.running() */
+	u64 base_weight;
+	u64 pending_weight; /* p->scx.weight at the last change */
+	u32 path_ent[INF_MAX_LEVELS]; /* the held path, leaf parent first */
+	s32 queued_cpu; /* the CPU whose tree holds the task */
+	s32 path_cpu;
+	s32 cgrp_cpu; /* the CPU whose tree holds the path */
+	u32 path_depth; /* the number of group levels */
+	u32 state; /* enum inf_entity_state */
+	u32 class; /* the insertion class */
+	u32 moving; /* one writer owns a queue move */
+	u32 dequeue_pending; /* a dequeue arrived during a move */
+	u32 exit_pending; /* an exit arrived during a move */
+	u32 reweight_pending; /* apply the new weight at the next step */
+	u32 joined; /* the cgroup counts this task */
+	u32 yielded; /* the task asked to yield */
+	u32 preempted; /* the task lost its slice to a preemption */
+	u32 wake_fork; /* the wakeup carried SCX_WAKE_FORK */
+	u32 idle; /* the task sits under an idle group */
 	u32 pid;
-	u32 pending_event;			 /* the event of the ending slot */
+	u32 pending_event; /* the event of the ending slot */
 	u32 hist_idx;
 	struct inf_hist hist[8];
 };
 
 typedef struct task_ctx __arena task_ctx;
 
-/* The reservation flags. */
-#define INF_RESV_RUNNING 1U
-
 /* The entity store. One block per possible CPU, never resized. */
 static inf_cpu_block_t *inf_blocks;
 static u32		inf_nr_blocks;
+
+/*
+ * The scheduler-private cgroup generation. A cgroup id can be reused
+ * after an exit, so a new control entry takes a new value and an entity
+ * compares it before it trusts its history.
+ */
+static u64 inf_gen_counter;
 
 /*
  * Set from ops.disable(), which runs for every task while the scheduler is
@@ -310,7 +348,7 @@ static __noinline void inf_resolve_pending(task_ctx *tctx);
 static __always_inline bool inf_node_is_group(inf_cpu_block_t *blk, u64 node)
 {
 	u64 base = (u64)&blk->ents[0];
-	u64 end  = base + (u64)sizeof(blk->ents);
+	u64 end	 = base + (u64)sizeof(blk->ents);
 
 	return node >= base && node < end;
 }
@@ -329,8 +367,7 @@ static __always_inline task_ctx *inf_task_ctx_alloc(struct task_struct *p)
  * offsetof(struct task_ctx, qnode), and every caller that receives a node
  * from a queue must subtract that offset before it reads a task field.
  */
-static __always_inline task_ctx *
-inf_task_from_qnode(scx_edq_task_t *node)
+static __always_inline task_ctx *inf_task_from_qnode(scx_edq_task_t *node)
 {
 	return (task_ctx *)(void __arena *)((u64)node -
 					    offsetof(struct task_ctx, qnode));
@@ -346,7 +383,7 @@ static __always_inline inf_cpu_block_t *inf_block(s32 cpu)
 
 /* The group entity at @idx. */
 static __always_inline inf_group_entity_t *inf_entity(inf_cpu_block_t *blk,
-						      u32 idx)
+						      u32	       idx)
 {
 	if (idx >= INF_GROUPS_PER_CPU)
 		return NULL;
@@ -354,8 +391,8 @@ static __always_inline inf_group_entity_t *inf_entity(inf_cpu_block_t *blk,
 }
 
 /* The index of an entity inside its block. */
-static __always_inline u32 inf_entity_index(inf_cpu_block_t *blk,
-					     inf_group_entity_t *e)
+static __always_inline u32 inf_entity_index(inf_cpu_block_t    *blk,
+					    inf_group_entity_t *e)
 {
 	return (u32)(e - &blk->ents[0]);
 }
@@ -383,6 +420,93 @@ static struct inf_stats *inf_stats(void)
 		if (__stats)                                      \
 			__sync_fetch_and_add(&__stats->field, 1); \
 	} while (0)
+
+/*
+ * The measured service slot of a CPU.
+ *
+ * The tick probe seeds the slot from the measured scx_bpf_now() delta of
+ * a local reservation. Until the seed exists, and after any out-of-range
+ * update, the nominal slot is used. A slot is never promised as a fixed
+ * wall-clock interval.
+ */
+static __always_inline u64 inf_cpu_slot_ns(s32 cpu)
+{
+	struct inf_cpu_ctx *cctx = inf_cpu_ctx(cpu);
+	u64		    slot;
+
+	if (!cctx)
+		return INF_SLOT_NS;
+	slot = READ_ONCE(cctx->slot_ns);
+	if (slot < INF_SLOT_MIN_NS || slot > INF_SLOT_MAX_NS)
+		return INF_SLOT_NS;
+	return slot;
+}
+
+/*
+ * Open the reservation of one running slot.
+ *
+ * It records the CPU, the ancestry from the leaf parent to the root, the
+ * latched weight of every level, the reserved slot and the actual-runtime
+ * cursor. The cursor stays zero until ops.running() sets it, which is the
+ * same call that opens the reservation.
+ */
+static __noinline void inf_resv_open(struct inf_cpu_ctx *cctx, task_ctx *tctx,
+				     s32 cpu)
+{
+	struct inf_reservation *r   = &cctx->resv;
+	inf_cpu_block_t	       *blk = inf_block(cpu);
+	u32			i;
+
+	r->task_idx  = tctx->pid;
+	r->start_now = 0;
+	r->policy_ns = 0;
+	r->slot_ns   = inf_cpu_slot_ns(cpu);
+	r->cpu	     = (u32)cpu;
+	r->depth     = 0;
+	r->flags     = 0;
+
+	if (!blk)
+		goto done;
+
+	r->depth = tctx->path_depth;
+	if (r->depth > INF_MAX_LEVELS)
+		r->depth = INF_MAX_LEVELS;
+
+	for (i = 0; i < INF_MAX_LEVELS && can_loop; i++) {
+		inf_group_entity_t *e;
+
+		if (i >= r->depth)
+			break;
+		r->ancestry[i] = tctx->path_ent[i];
+		e	       = inf_entity(blk, r->ancestry[i]);
+		r->latched[i]  = e ? e->weight : INF_WEIGHT_DEFAULT;
+	}
+done:
+	INF_STAT_INC(resv_open);
+}
+
+/* True when the reservation of @cctx belongs to @tctx. */
+static __always_inline bool inf_resv_matches(struct inf_cpu_ctx *cctx,
+					     task_ctx		*tctx)
+{
+	return cctx && cctx->resv.task_idx && cctx->resv.task_idx == tctx->pid;
+}
+
+/* True when this callback runs on the CPU that owns the reservation. */
+static __always_inline bool inf_resv_local(struct inf_cpu_ctx *cctx)
+{
+	return cctx && bpf_get_smp_processor_id() == (s32)cctx->resv.cpu;
+}
+
+/*
+ * Attach a task to the group entity that holds it. The entity keeps one
+ * reference for the task, so it cannot be reclaimed while the task is
+ * queued, running or parked. A task that moves to another CPU or cgroup
+ * drops the old reference first.
+ */
+static __noinline void inf_task_attach(task_ctx *tctx, inf_cpu_block_t *blk,
+				       s32 cpu, u32 leaf);
+static __noinline void inf_task_detach(task_ctx *tctx);
 
 /*
  * Diagnostic trace, disabled unless the loader sets it before load. It is
@@ -500,7 +624,7 @@ static __noinline void inf_trace(u32 op, task_ctx *tctx, u64 where, s64 result)
 	pid = (s32)tctx->pid;
 
 	{
-		u32 slot = tctx->hist_idx & 7;
+		u32 slot		= tctx->hist_idx & 7;
 
 		tctx->hist[slot].op	= op;
 		tctx->hist[slot].src	= src;
@@ -604,7 +728,7 @@ static __noinline void inf_dump_queues(void)
 		struct inf_cpu_ctx    *cctx;
 		inf_cpu_block_t	      *blk;
 		inf_group_entity_t    *root;
-		scx_edq_task_t   *head;
+		scx_edq_task_t	      *head;
 		task_ctx	      *tctx;
 
 		if (cpu >= ncpu)
@@ -614,7 +738,7 @@ static __noinline void inf_dump_queues(void)
 		if (!qs)
 			continue;
 
-		blk = inf_block((s32)cpu);
+		blk  = inf_block((s32)cpu);
 		cctx = inf_cpu_ctx((s32)cpu);
 		if (!blk || !cctx)
 			continue;
@@ -623,7 +747,7 @@ static __noinline void inf_dump_queues(void)
 		qs->cpu	  = (s32)cpu;
 		qs->depth = READ_ONCE(cctx->depth);
 
-		root = inf_entity(blk, 0);
+		root	  = inf_entity(blk, 0);
 		if (!root)
 			continue;
 
@@ -634,11 +758,11 @@ static __noinline void inf_dump_queues(void)
 		if (inf_node_is_group(blk, (u64)head)) {
 			inf_group_entity_t *e = (inf_group_entity_t *)head;
 
-			qs->head_pid	 = 0;
-			qs->head_weight = e->weight;
-			qs->head_key	 = e->v_q16;
-			qs->head_state	 = e->state;
-			qs->head_hold	 = inf_queue_node_hold(head);
+			qs->head_pid	      = 0;
+			qs->head_weight	      = e->weight;
+			qs->head_key	      = e->v_q16;
+			qs->head_state	      = e->state;
+			qs->head_hold	      = inf_queue_node_hold(head);
 			continue;
 		}
 
@@ -720,19 +844,26 @@ static __always_inline struct inf_cgrp_state *inf_cgrp_state(u64 cgrp_id)
 /* The weight of a group entity: its cpu.weight, or 3 when it is idle. */
 static __always_inline u32 inf_cgroup_weight(u64 cgrp_id, bool *idle)
 {
-	struct inf_cgrp_state *st = inf_cgrp_state(cgrp_id);
-	u32		      w  = INF_WEIGHT_DEFAULT;
+	struct inf_cgrp_state *st      = inf_cgrp_state(cgrp_id);
+	u32		       w       = INF_WEIGHT_DEFAULT;
+	bool		       is_idle = false;
 
 	if (st) {
-		w = st->weight;
+		w	= st->weight;
+		is_idle = st->idle != 0;
 		if (idle)
-			*idle = st->idle != 0;
+			*idle = is_idle;
 	}
 	if (w < INF_WEIGHT_MIN)
 		w = INF_WEIGHT_MIN;
 	if (w > INF_WEIGHT_MAX)
 		w = INF_WEIGHT_MAX;
-	if (idle && *idle)
+	/*
+	 * A caller that does not ask for the flag still gets the idle
+	 * weight: the entity is created once, and a wrong weight at creation
+	 * would stand until the next epoch bump.
+	 */
+	if (is_idle)
 		w = INF_WEIGHT_IDLE;
 	return w;
 }
@@ -763,7 +894,7 @@ static __always_inline u64 inf_cgroup_id(struct cgroup *cgrp)
 
 /* The ancestor of @cgrp at @level, or NULL. */
 static __always_inline struct cgroup *inf_cgroup_ancestor(struct cgroup *cgrp,
-							  int		  level)
+							  int		 level)
 {
 	if (level < 0 || level > BPF_CORE_READ(cgrp, level))
 		return NULL;
@@ -818,7 +949,7 @@ static __always_inline u64 inf_charge_service(u64 __arena *v, u64 __arena *rem,
 	scaled = runtime_ns * INF_SERVICE_SCALE + *rem;
 	delta  = scaled / weight;
 	*rem   = scaled % weight;
-	*v	    = *v + delta;
+	*v     = *v + delta;
 	return delta;
 }
 
@@ -839,8 +970,8 @@ static __always_inline u32 inf_index_start(u64 cgrp_id)
  */
 static __noinline u32 inf_index_find(inf_cpu_block_t *blk, u64 cgrp_id)
 {
-	inf_index_slot_t *s = &blk->index[inf_index_start(cgrp_id)];
-	inf_index_slot_t *end = &blk->index[INF_INDEX_SLOTS];
+	inf_index_slot_t *s    = &blk->index[inf_index_start(cgrp_id)];
+	inf_index_slot_t *end  = &blk->index[INF_INDEX_SLOTS];
 	inf_index_slot_t *base = &blk->index[0];
 
 	while (can_loop) {
@@ -858,8 +989,8 @@ static __noinline u32 inf_index_find(inf_cpu_block_t *blk, u64 cgrp_id)
 static __noinline int inf_index_insert(inf_cpu_block_t *blk, u64 cgrp_id,
 				       u32 ent_idx)
 {
-	inf_index_slot_t *s = &blk->index[inf_index_start(cgrp_id)];
-	inf_index_slot_t *end = &blk->index[INF_INDEX_SLOTS];
+	inf_index_slot_t *s    = &blk->index[inf_index_start(cgrp_id)];
+	inf_index_slot_t *end  = &blk->index[INF_INDEX_SLOTS];
 	inf_index_slot_t *base = &blk->index[0];
 	inf_index_slot_t *tomb = NULL;
 
@@ -875,7 +1006,16 @@ static __noinline int inf_index_insert(inf_cpu_block_t *blk, u64 cgrp_id,
 		if (s->state == 2 && !tomb)
 			tomb = s;
 		if (s->state == 1 && s->cgrp_id == cgrp_id) {
-			s->ent_idx = ent_idx;
+			/*
+			 * A stale entity of an exited cgroup still owns
+			 * this slot. It is not overwritten: its tasks and
+			 * children still reference it, so a second entity
+			 * for the same id would split the history. The
+			 * caller falls back to an ancestor until the
+			 * stale entity is reclaimed.
+			 */
+			if (s->ent_idx != ent_idx)
+				return -EEXIST;
 			return 0;
 		}
 		s++;
@@ -893,8 +1033,8 @@ static __noinline int inf_index_insert(inf_cpu_block_t *blk, u64 cgrp_id,
 
 static __noinline void inf_index_remove(inf_cpu_block_t *blk, u64 cgrp_id)
 {
-	inf_index_slot_t *s = &blk->index[inf_index_start(cgrp_id)];
-	inf_index_slot_t *end = &blk->index[INF_INDEX_SLOTS];
+	inf_index_slot_t *s    = &blk->index[inf_index_start(cgrp_id)];
+	inf_index_slot_t *end  = &blk->index[INF_INDEX_SLOTS];
 	inf_index_slot_t *base = &blk->index[0];
 
 	while (can_loop) {
@@ -951,10 +1091,11 @@ static __always_inline void inf_bitmap_free(inf_cpu_block_t *blk, u32 idx)
  * parent's frontier.
  */
 static __noinline u32 inf_entity_create(inf_cpu_block_t *blk, u64 cgrp_id,
-					 u32 parent_idx, u32 weight)
+					u32 parent_idx, u32 weight)
 {
-	inf_group_entity_t *e;
-	u32			idx;
+	inf_group_entity_t    *e;
+	struct inf_cgrp_state *st;
+	u32		       idx;
 
 	if (inf_bitmap_alloc(blk, &idx)) {
 		INF_STAT_INC(entity_alloc_fail);
@@ -967,8 +1108,8 @@ static __noinline u32 inf_entity_create(inf_cpu_block_t *blk, u64 cgrp_id,
 		return INF_IDX_NONE;
 	}
 
-	e->v_q16	= 0;
-	e->rem		= 0;
+	e->v_q16 = 0;
+	e->rem	 = 0;
 	/*
 	 * The children queue of a new entity is empty, so its frontier
 	 * starts at zero. The entity itself takes the frontier of its
@@ -986,66 +1127,176 @@ static __noinline u32 inf_entity_create(inf_cpu_block_t *blk, u64 cgrp_id,
 	e->class	= INF_CLASS_HEAD;
 	e->nr_children	= 0;
 	e->flags	= 0;
+	e->refs		= 0;
 	e->state	= INF_ENTITY_INACTIVE;
+	st		= inf_cgrp_state(cgrp_id);
+	e->generation	= st ? st->gen : 0;
 
 	inf_queue_init(&e->children);
 	inf_queue_node_init(&e->qnode);
 
 	if (inf_index_insert(blk, cgrp_id, idx)) {
+		/*
+		 * -EEXIST means a stale entity of an exited cgroup still
+		 * owns the index and has references. The caller falls back
+		 * to an ancestor; the stale slot is reclaimed when its last
+		 * reference drops.
+		 */
 		inf_bitmap_free(blk, idx);
-		INF_STAT_INC(entity_alloc_fail);
+		INF_STAT_INC(entity_reuse_busy);
 		return INF_IDX_NONE;
+	}
+
+	/* The new child keeps one reference on its parent. */
+	{
+		inf_group_entity_t *par = inf_entity(blk, parent_idx);
+
+		if (par && parent_idx != idx)
+			par->refs++;
 	}
 
 	return idx;
 }
 
-/* Release one entity slot. The entity must not hold a running path. */
+/*
+ * Release one entity slot. The entity must have no live reference: no
+ * attached task, no dispatchable descendant and no held path. A reclaim
+ * that finds a reference marks the entity dead and keeps the slot until
+ * the last reference drops.
+ */
 static __noinline void inf_entity_release(inf_cpu_block_t *blk, u32 idx)
+{
+	inf_group_entity_t *e = inf_entity(blk, idx);
+	inf_group_entity_t *par;
+
+	if (!e)
+		return;
+
+	if (e->refs || e->count || e->state == INF_ENTITY_SELECTED ||
+	    e->state == INF_ENTITY_RUNNING || e->state == INF_ENTITY_HANDOFF) {
+		/*
+		 * A task, a child entity or a running path still holds the
+		 * entity. The cgroup is gone, so the entity stays dead and
+		 * is released when the last reference drops.
+		 */
+		e->state = INF_ENTITY_EXITING;
+		INF_STAT_INC(entity_ref_busy);
+		INF_STAT_INC(reclaims_deferred);
+		return;
+	}
+
+	if (e->state == INF_ENTITY_RUNNABLE) {
+		par = inf_entity(blk, e->parent_idx);
+		if (par)
+			inf_q_remove(&par->children, &e->qnode);
+	}
+
+	/* Only the index entry that still points at this slot is removed. */
+	if (inf_index_find(blk, e->cgrp_id) == idx)
+		inf_index_remove(blk, e->cgrp_id);
+
+	par = inf_entity(blk, e->parent_idx);
+	if (par && e->parent_idx != idx && par->refs)
+		par->refs--;
+
+	inf_bitmap_free(blk, idx);
+	e->state   = INF_ENTITY_EXITING;
+	e->count   = 0;
+	e->cgrp_id = 0;
+	INF_STAT_INC(entity_reclaims);
+}
+
+/* Add one reference to the entity at @idx. */
+static __always_inline void inf_ref_inc(inf_cpu_block_t *blk, u32 idx)
+{
+	inf_group_entity_t *e = inf_entity(blk, idx);
+
+	if (e)
+		e->refs++;
+}
+
+/*
+ * Drop one reference. A dead entity that loses its last reference is
+ * reclaimed here. The release never drops another reference itself, so
+ * this is a single call chain and not recursion.
+ */
+static __noinline void inf_ref_dec(inf_cpu_block_t *blk, u32 idx)
 {
 	inf_group_entity_t *e = inf_entity(blk, idx);
 
 	if (!e)
 		return;
+	if (e->refs)
+		e->refs--;
+	if (!e->refs && e->state == INF_ENTITY_EXITING)
+		inf_entity_release(blk, idx);
+}
 
-	if (e->state == INF_ENTITY_SELECTED || e->state == INF_ENTITY_RUNNING) {
-		/*
-		 * A running path holds the entity. The cgroup is gone, so
-		 * the entity stays dead and the path releases it when it
-		 * re-enters the tree.
-		 */
-		e->state = INF_ENTITY_EXITING;
+/*
+ * Attach a task to the group entity that holds it. The entity keeps one
+ * reference for the task, so it cannot be reclaimed while the task is
+ * queued, running or parked. A task that moves to another CPU or cgroup
+ * drops the old reference first.
+ */
+static __noinline void inf_task_attach(task_ctx *tctx, inf_cpu_block_t *blk,
+				       s32 cpu, u32 leaf)
+{
+	if (tctx->joined && tctx->parent_idx == leaf && tctx->cgrp_cpu == cpu)
 		return;
-	}
 
-	if (e->state == INF_ENTITY_RUNNABLE) {
-		inf_group_entity_t *par = inf_entity(blk, e->parent_idx);
+	inf_task_detach(tctx);
 
-		if (par)
-			inf_queue_remove(&par->children, &e->qnode);
-	}
+	tctx->parent_idx = leaf;
+	tctx->cgrp_cpu	 = cpu;
+	tctx->joined	 = 1;
+	inf_ref_inc(blk, leaf);
+}
 
-	inf_index_remove(blk, e->cgrp_id);
-	inf_bitmap_free(blk, idx);
-	e->state	= INF_ENTITY_EXITING;
-	e->count	= 0;
-	e->cgrp_id	= 0;
-	INF_STAT_INC(entity_reclaims);
+/* Drop the reference that a task keeps on its cgroup entity. */
+static __noinline void inf_task_detach(task_ctx *tctx)
+{
+	inf_cpu_block_t *blk;
+	u32		 idx;
+
+	if (!tctx->joined)
+		return;
+
+	blk = inf_block(tctx->cgrp_cpu);
+	idx = (u32)tctx->parent_idx;
+	if (blk)
+		inf_ref_dec(blk, idx);
+
+	tctx->joined   = 0;
+	tctx->cgrp_cpu = -1;
 }
 
 /*
  * The entity of one cgroup on this CPU, or INF_IDX_NONE. A cgroup that
  * has exited has no live entry, so its entity is stale and the slot is
- * reclaimed here.
+ * reclaimed here. A reused cgroup id takes a new generation, so an entity
+ * of the old cgroup never charges the new one.
  */
 static __noinline u32 inf_lookup_entity(inf_cpu_block_t *blk, u64 cgrp_id)
 {
-	u32 idx = inf_index_find(blk, cgrp_id);
+	struct inf_cgrp_state *st;
+	inf_group_entity_t    *e;
+	u32		       idx = inf_index_find(blk, cgrp_id);
 
 	if (idx == INF_IDX_NONE)
 		return INF_IDX_NONE;
 
-	if (!inf_cgrp_state(cgrp_id)) {
+	st = inf_cgrp_state(cgrp_id);
+	if (!st) {
+		inf_entity_release(blk, idx);
+		return INF_IDX_NONE;
+	}
+
+	e = inf_entity(blk, idx);
+	if (!e)
+		return INF_IDX_NONE;
+
+	if (e->generation != st->gen) {
+		INF_STAT_INC(entity_stale_gen);
 		inf_entity_release(blk, idx);
 		return INF_IDX_NONE;
 	}
@@ -1062,12 +1313,12 @@ static __noinline u32 inf_lookup_entity(inf_cpu_block_t *blk, u64 cgrp_id)
  * entity, or to the root entity. The task stays runnable and the overflow
  * is counted.
  */
-static __noinline u32 inf_resolve_leaf(inf_cpu_block_t *blk, struct cgroup *cgrp,
-					u64 *cgrp_id_out)
+static __noinline u32 inf_resolve_leaf(inf_cpu_block_t *blk,
+				       struct cgroup *cgrp, u64 *cgrp_id_out)
 {
-	u32	parent = 0;
-	int	level;
-	int	i;
+	u32 parent = 0;
+	int level;
+	int i;
 
 	*cgrp_id_out = 0;
 	if (!cgrp)
@@ -1079,8 +1330,8 @@ static __noinline u32 inf_resolve_leaf(inf_cpu_block_t *blk, struct cgroup *cgrp
 
 	for (i = 1; i <= INF_CHAIN_MAX && can_loop; i++) {
 		struct cgroup *anc;
-		u64		id;
-		u32		idx;
+		u64	       id;
+		u32	       idx;
 
 		if (i > level)
 			break;
@@ -1088,7 +1339,7 @@ static __noinline u32 inf_resolve_leaf(inf_cpu_block_t *blk, struct cgroup *cgrp
 		if (!anc)
 			break;
 
-		id = inf_cgroup_id(anc);
+		id  = inf_cgroup_id(anc);
 		idx = inf_lookup_entity(blk, id);
 		if (idx == INF_IDX_NONE) {
 			idx = inf_entity_create(blk, id, parent,
@@ -1130,8 +1381,8 @@ static __always_inline u32 inf_gate_class(inf_group_entity_t *parent, u32 mode)
 }
 
 /* Insert a group entity into the queue of its parent. */
-static __always_inline void inf_link_entity(inf_cpu_block_t *blk,
-					     inf_group_entity_t *e, u32 mode)
+static __always_inline void inf_link_entity(inf_cpu_block_t    *blk,
+					    inf_group_entity_t *e, u32 mode)
 {
 	inf_group_entity_t *par = inf_entity(blk, e->parent_idx);
 
@@ -1140,8 +1391,8 @@ static __always_inline void inf_link_entity(inf_cpu_block_t *blk,
 
 	e->v_q16 = inf_service_max(e->v_q16, par->frontier_q16);
 	e->class = inf_gate_class(par, mode);
-	e->tie   = par->tie_seq++;
-	inf_queue_insert(&par->children, &e->qnode, e->v_q16);
+	e->tie	 = par->tie_seq++;
+	inf_q_insert(&par->children, &e->qnode, e->v_q16);
 	e->state = INF_ENTITY_RUNNABLE;
 }
 
@@ -1156,7 +1407,7 @@ static __noinline void inf_count_up(inf_cpu_block_t *blk, u32 idx, u32 mode)
 
 	for (i = 0; i < INF_MAX_LEVELS && idx != 0 && can_loop; i++) {
 		inf_group_entity_t *e = inf_entity(blk, idx);
-		bool			dormant;
+		bool		    dormant;
 
 		if (!e)
 			return;
@@ -1188,10 +1439,11 @@ static __noinline void inf_count_down(inf_cpu_block_t *blk, u32 idx)
 		if (e->count > 0)
 			return;
 		if (e->state == INF_ENTITY_RUNNABLE) {
-			inf_group_entity_t *par = inf_entity(blk, e->parent_idx);
+			inf_group_entity_t *par =
+				inf_entity(blk, e->parent_idx);
 
 			if (par)
-				inf_queue_remove(&par->children, &e->qnode);
+				inf_q_remove(&par->children, &e->qnode);
 			e->state = INF_ENTITY_INACTIVE;
 		}
 		idx = e->parent_idx;
@@ -1207,15 +1459,15 @@ static __always_inline void inf_node_info(inf_cpu_block_t *blk, u64 node,
 	if (inf_node_is_group(blk, node)) {
 		inf_group_entity_t *e = (inf_group_entity_t *)node;
 
-		*v   = e->v_q16;
-		*cls = e->class;
-		*tie = e->tie;
+		*v		      = e->v_q16;
+		*cls		      = e->class;
+		*tie		      = e->tie;
 	} else {
 		task_ctx *t = inf_task_from_qnode((scx_edq_task_t *)node);
 
-		*v   = t->v_q16;
-		*cls = t->class;
-		*tie = t->tie;
+		*v	    = t->v_q16;
+		*cls	    = t->class;
+		*tie	    = t->tie;
 	}
 }
 
@@ -1227,20 +1479,20 @@ static __always_inline void inf_node_info(inf_cpu_block_t *blk, u64 node,
  * comparison is written without a branch, so the verifier does not branch
  * on the data of the queue and the scan costs one exploration.
  */
-static __always_inline u64 inf_band_better(u64 v, u32 cls, u64 tie,
-					    u64 best_v, u32 best_cls, u64 best_tie)
+static __always_inline u64 inf_band_better(u64 v, u32 cls, u64 tie, u64 best_v,
+					   u32 best_cls, u64 best_tie)
 {
-	u64 c = cls;
-	u64 b = best_cls;
-	u64 diff = v - best_v;
-	u64 lt = (diff >> 63) & 1;
-	u64 gt = ((best_v - v) >> 63) & 1;
-	u64 eq = 1 - lt - gt;
-	u64 n_head = 1 - ((c | (0 - c)) >> 63);
-	u64 b_head = 1 - ((b | (0 - b)) >> 63);
-	u64 head_wins = n_head & (1 - b_head);
-	u64 same = 1 - (n_head ^ b_head);
-	u64 tie_newer = ((best_tie - tie) >> 63) & 1;
+	u64 c	       = cls;
+	u64 b	       = best_cls;
+	u64 diff       = v - best_v;
+	u64 lt	       = (diff >> 63) & 1;
+	u64 gt	       = ((best_v - v) >> 63) & 1;
+	u64 eq	       = 1 - lt - gt;
+	u64 n_head     = 1 - ((c | (0 - c)) >> 63);
+	u64 b_head     = 1 - ((b | (0 - b)) >> 63);
+	u64 head_wins  = n_head & (1 - b_head);
+	u64 same       = 1 - (n_head ^ b_head);
+	u64 tie_newer  = ((best_tie - tie) >> 63) & 1;
 	u64 tie_better = same & ((tie_newer & n_head) |
 				 ((1 - tie_newer) & (1 - n_head)));
 
@@ -1267,32 +1519,32 @@ static __always_inline u64 inf_in_band_mask(u64 v, u64 vmin)
  * falls back to the queue head and counts the truncation.
  */
 static __noinline int inf_band_scan(inf_cpu_block_t *blk, scx_edq_t *queue,
-				     inf_cpu_block_t *scratch, u64 frontier,
-				     u64 *vmin_out, bool *truncated)
+				    inf_cpu_block_t *scratch, u64 frontier,
+				    u64 *vmin_out, bool *truncated)
 {
 	struct inf_cand __arena *win = &scratch->win;
-	scx_edq_node_t *n;
-	scx_edq_task_t *best = NULL;
-	u64		 best_v = 0;
-	u64		 best_tie = 0;
-	u32		 best_cls = 0;
-	u64		 vmin = 0;
-	u32		 scanned = 0;
-	bool		 have = false;
-	int		 ret = 0;
+	scx_edq_node_t		*n;
+	scx_edq_task_t		*best	  = NULL;
+	u64			 best_v	  = 0;
+	u64			 best_tie = 0;
+	u32			 best_cls = 0;
+	u64			 vmin	  = 0;
+	u32			 scanned  = 0;
+	bool			 have	  = false;
+	int			 ret	  = 0;
 
-	*truncated = false;
-	win->valid = false;
+	*truncated			  = false;
+	win->valid			  = false;
 
 	if (inf_queue_lock(queue))
 		return -EBUSY;
 
-	n = queue->first;
+	n				   = queue->first;
 	scratch->counter[INF_COUNTER_BAND] = 0;
 	while (n && can_loop) {
 		scx_edq_task_t *task = inf_queue_node_task(n);
-		u64		 v, tie, inb, take, mask, first;
-		u32		 cls;
+		u64		v, tie, inb, take, mask, first;
+		u32		cls;
 
 		/*
 		 * The scan counter lives in the arena, so the verifier sees
@@ -1307,7 +1559,7 @@ static __noinline int inf_band_scan(inf_cpu_block_t *blk, scx_edq_t *queue,
 		first = have ? 0 : 1;
 
 		if (!have) {
-			vmin	 = v;
+			vmin = v;
 			have = true;
 			/*
 			 * The minimum must not sit behind the frontier by
@@ -1319,19 +1571,20 @@ static __noinline int inf_band_scan(inf_cpu_block_t *blk, scx_edq_t *queue,
 				INF_STAT_INC(half_range_faults);
 		}
 
-		inb = inf_in_band_mask(v, vmin);
-		take = (inf_band_better(v, cls, tie, best_v, best_cls, best_tie) |
-			first) &
-		       inb;
-		mask = 0 - take;
+		inb	 = inf_in_band_mask(v, vmin);
+		take	 = (inf_band_better(v, cls, tie, best_v, best_cls,
+					    best_tie) |
+			    first) &
+			   inb;
+		mask	 = 0 - take;
 
-		best_v   = (best_v & ~mask) | (v & mask);
+		best_v	 = (best_v & ~mask) | (v & mask);
 		best_tie = (best_tie & ~mask) | (tie & mask);
 		best_cls = (best_cls & ~mask) | (cls & mask);
-		best	  = (scx_edq_task_t *)(((u64)best & ~mask) |
+		best	 = (scx_edq_task_t *)(((u64)best & ~mask) |
 					      ((u64)task & mask));
 
-		n = inf_queue_next(n);
+		n	 = inf_queue_next(n);
 	}
 
 	if (best) {
@@ -1352,8 +1605,8 @@ static __noinline int inf_band_scan(inf_cpu_block_t *blk, scx_edq_t *queue,
 
 		if (next) {
 			scx_edq_task_t *nt = inf_queue_node_task(next);
-			u64		 nv, ntie;
-			u32		 ncls;
+			u64		nv, ntie;
+			u32		ncls;
 
 			inf_node_info(blk, (u64)nt, &nv, &ncls, &ntie);
 			if (inf_in_band_mask(nv, vmin)) {
@@ -1368,9 +1621,9 @@ static __noinline int inf_band_scan(inf_cpu_block_t *blk, scx_edq_t *queue,
 	if (best) {
 		win->valid = true;
 		win->task  = best;
-		win->v	  = best_v;
-		win->tie  = best_tie;
-		win->cls  = best_cls;
+		win->v	   = best_v;
+		win->tie   = best_tie;
+		win->cls   = best_cls;
 	}
 
 	*vmin_out = vmin;
@@ -1383,21 +1636,20 @@ static __noinline int inf_band_scan(inf_cpu_block_t *blk, scx_edq_t *queue,
  * frontier. The caller applies the frontier when it commits the
  * selection.
  */
-static __noinline bool inf_select_leaf(inf_cpu_block_t *blk,
-				       inf_cpu_block_t *scratch,
-				       task_ctx **leaf)
+static __noinline bool
+inf_select_leaf(inf_cpu_block_t *blk, inf_cpu_block_t *scratch, task_ctx **leaf)
 {
 	struct inf_path __arena *path = &scratch->path;
-	u32	attempt;
-	u32	depth = 0;
-	u32	parent = 0;
-	bool	restart = false;
-	int	ret;
+	u32			 attempt;
+	u32			 depth	 = 0;
+	u32			 parent	 = 0;
+	bool			 restart = false;
+	int			 ret;
 
 	for (attempt = 0; attempt < 4; attempt++) {
 		restart = false;
-		parent  = 0;
-		depth   = 0;
+		parent	= 0;
+		depth	= 0;
 
 		/*
 		 * The depth is the loop counter, so the verifier sees the
@@ -1405,9 +1657,9 @@ static __noinline bool inf_select_leaf(inf_cpu_block_t *blk,
 		 */
 		for (depth = 0; depth < INF_MAX_LEVELS && can_loop; depth++) {
 			inf_group_entity_t *pe = inf_entity(blk, parent);
-			struct inf_cand win;
-			u64		vmin = 0;
-			bool		trunc = false;
+			struct inf_cand	    win;
+			u64		    vmin  = 0;
+			bool		    trunc = false;
 
 			if (!pe)
 				return false;
@@ -1427,7 +1679,7 @@ static __noinline bool inf_select_leaf(inf_cpu_block_t *blk,
 						inf_entity(blk, pe->parent_idx);
 
 					if (par)
-						inf_queue_remove(&par->children,
+						inf_q_remove(&par->children,
 								 &pe->qnode);
 					pe->state = INF_ENTITY_INACTIVE;
 					pe->count = 0;
@@ -1437,7 +1689,7 @@ static __noinline bool inf_select_leaf(inf_cpu_block_t *blk,
 				}
 				return false;
 			}
-			win = scratch->win;
+			win		  = scratch->win;
 
 			path->vmin[depth] = vmin;
 
@@ -1455,7 +1707,7 @@ static __noinline bool inf_select_leaf(inf_cpu_block_t *blk,
 						inf_entity(blk, e->parent_idx);
 
 					if (par)
-						inf_queue_remove(&par->children,
+						inf_q_remove(&par->children,
 								 &e->qnode);
 					e->state = INF_ENTITY_INACTIVE;
 					INF_STAT_INC(state_repairs);
@@ -1465,14 +1717,14 @@ static __noinline bool inf_select_leaf(inf_cpu_block_t *blk,
 				}
 
 				path->ent[depth] = inf_entity_index(blk, e);
-				parent = path->ent[depth];
+				parent		 = path->ent[depth];
 				inf_queue_drop(win.task);
 				continue;
 			}
 
 			/* The winner is a task: the leaf of the path. */
 			path->depth = depth;
-			*leaf	  = inf_task_from_qnode(win.task);
+			*leaf	    = inf_task_from_qnode(win.task);
 			inf_queue_drop(win.task);
 			return true;
 		}
@@ -1488,21 +1740,21 @@ static __noinline bool inf_select_leaf(inf_cpu_block_t *blk,
  * The service minimum of every level of a path becomes the frontier of
  * the queue at that level. The frontier never decreases.
  */
-static __always_inline void inf_apply_frontier(inf_cpu_block_t *blk,
-						struct inf_path __arena *path)
+static __always_inline void inf_apply_frontier(inf_cpu_block_t	       *blk,
+					       struct inf_path __arena *path)
 {
 	u32 i;
 
 	for (i = 0; i < path->depth && i < INF_MAX_LEVELS; i++) {
-		inf_group_entity_t *par =
-			inf_entity(blk, i == 0 ? 0 :
-				   path->ent[(i - 1) & (INF_MAX_LEVELS - 1)]);
+		inf_group_entity_t *par = inf_entity(
+			blk,
+			i == 0 ? 0 : path->ent[(i - 1) & (INF_MAX_LEVELS - 1)]);
 
 		if (!par)
 			continue;
-		par->frontier_q16 = inf_service_max(
-			par->frontier_q16,
-			path->vmin[i & (INF_MAX_LEVELS - 1)]);
+		par->frontier_q16 =
+			inf_service_max(par->frontier_q16,
+					path->vmin[i & (INF_MAX_LEVELS - 1)]);
 	}
 }
 
@@ -1523,18 +1775,26 @@ static __always_inline void inf_depth_add(s32 cpu, s64 delta)
  * Put a task into the tree. The leaf parent is the entity of the task's
  * cgroup on this CPU.
  */
-static __noinline void inf_admit_task(inf_cpu_block_t *blk, task_ctx *tctx,
-				      u32 leaf_parent, u32 mode)
+static __always_inline void inf_refresh_weight(inf_group_entity_t *e);
+
+static __noinline void	    inf_admit_task(inf_cpu_block_t *blk, task_ctx *tctx,
+					   u32 leaf_parent, u32 mode)
 {
 	inf_group_entity_t *parent = inf_entity(blk, leaf_parent);
 
-	if (!parent)
+	if (!parent) {
+		INF_STAT_INC(admit_no_parent);
+		INF_STAT_INC(lost_state_errors);
 		return;
+	}
+
+	/* A dormant or queued group refreshes before the next charge. */
+	inf_refresh_weight(parent);
 
 	tctx->v_q16 = inf_service_max(tctx->v_q16, parent->frontier_q16);
 	tctx->class = inf_gate_class(parent, mode);
 	tctx->tie   = parent->tie_seq++;
-	if (inf_queue_insert(&parent->children, &tctx->qnode, tctx->v_q16)) {
+	if (inf_q_insert(&parent->children, &tctx->qnode, tctx->v_q16)) {
 		/*
 		 * The node is still linked in another queue. A stale
 		 * membership would leave the task invisible to the tree,
@@ -1544,7 +1804,7 @@ static __noinline void inf_admit_task(inf_cpu_block_t *blk, task_ctx *tctx,
 			INF_STAT_INC(lost_state_errors);
 			return;
 		}
-		if (inf_queue_insert(&parent->children, &tctx->qnode,
+		if (inf_q_insert(&parent->children, &tctx->qnode,
 				     tctx->v_q16)) {
 			INF_STAT_INC(lost_state_errors);
 			return;
@@ -1563,11 +1823,11 @@ static __noinline void inf_admit_task(inf_cpu_block_t *blk, task_ctx *tctx,
  * what the event table calls a replaced key.
  */
 static __noinline void inf_rekey_ancestors(task_ctx *tctx, bool new_record,
-					    u32 mode)
+					   u32 mode)
 {
-	inf_cpu_block_t	 *blk = inf_block(tctx->path_cpu);
+	inf_cpu_block_t	   *blk = inf_block(tctx->path_cpu);
 	inf_group_entity_t *e;
-	u32			i;
+	u32		    i;
 
 	if (!blk)
 		return;
@@ -1587,12 +1847,14 @@ static __noinline void inf_rekey_ancestors(task_ctx *tctx, bool new_record,
 		if (!par)
 			continue;
 
-		inf_queue_remove(&par->children, &e->qnode);
+		inf_refresh_weight(e);
+		inf_q_remove(&par->children, &e->qnode);
 		if (new_record) {
 			e->class = inf_gate_class(par, mode);
-			e->tie   = par->tie_seq++;
+			e->tie	 = par->tie_seq++;
 		}
-		inf_queue_insert(&par->children, &e->qnode, e->v_q16);
+		if (inf_q_insert(&par->children, &e->qnode, e->v_q16))
+			INF_STAT_INC(rekey_fail);
 	}
 }
 
@@ -1602,27 +1864,33 @@ static __noinline void inf_rekey_ancestors(task_ctx *tctx, bool new_record,
  */
 static __noinline void inf_requeue_path(task_ctx *tctx, u32 mode)
 {
-	inf_cpu_block_t	 *blk = inf_block(tctx->path_cpu);
+	inf_cpu_block_t	   *blk = inf_block(tctx->path_cpu);
 	inf_group_entity_t *leaf;
 
-	if (!blk)
+	if (!blk) {
+		INF_STAT_INC(requeue_no_block);
+		INF_STAT_INC(lost_state_errors);
 		return;
+	}
 
 	leaf = inf_entity(blk, (u32)tctx->parent_idx);
-	if (!leaf)
+	if (!leaf) {
+		INF_STAT_INC(requeue_no_leaf);
+		INF_STAT_INC(lost_state_errors);
 		return;
+	}
 
 	inf_rekey_ancestors(tctx, true, mode);
 
 	tctx->v_q16 = inf_service_max(tctx->v_q16, leaf->frontier_q16);
 	tctx->class = inf_gate_class(leaf, mode);
 	tctx->tie   = leaf->tie_seq++;
-	if (inf_queue_insert(&leaf->children, &tctx->qnode, tctx->v_q16)) {
+	if (inf_q_insert(&leaf->children, &tctx->qnode, tctx->v_q16)) {
 		if (inf_queue_unlink(&tctx->qnode)) {
 			INF_STAT_INC(lost_state_errors);
 			return;
 		}
-		if (inf_queue_insert(&leaf->children, &tctx->qnode,
+		if (inf_q_insert(&leaf->children, &tctx->qnode,
 				     tctx->v_q16)) {
 			INF_STAT_INC(lost_state_errors);
 			return;
@@ -1643,7 +1911,7 @@ static __noinline void inf_requeue_path(task_ctx *tctx, u32 mode)
 /* Remove a task from the tree and release the counts below it. */
 static __noinline void inf_task_leave_tree(task_ctx *tctx)
 {
-	inf_cpu_block_t	 *blk = inf_block(tctx->queued_cpu);
+	inf_cpu_block_t	   *blk = inf_block(tctx->queued_cpu);
 	inf_group_entity_t *leaf;
 
 	if (!blk)
@@ -1653,7 +1921,7 @@ static __noinline void inf_task_leave_tree(task_ctx *tctx)
 	if (!leaf)
 		return;
 
-	if (inf_queue_remove(&leaf->children, &tctx->qnode)) {
+	if (inf_q_remove(&leaf->children, &tctx->qnode)) {
 		/*
 		 * The node is not in the queue the task belongs to. The
 		 * membership is stale, so the node is unlinked from the
@@ -1688,9 +1956,9 @@ static __noinline void inf_task_leave(task_ctx *tctx)
 		 * the deadlines of the ancestors need a refresh.
 		 */
 		inf_rekey_ancestors(tctx, false, INF_INS_NORMAL);
-		tctx->state      = INF_ENTITY_INACTIVE;
+		tctx->state	 = INF_ENTITY_INACTIVE;
 		tctx->path_depth = 0;
-		tctx->path_cpu   = -1;
+		tctx->path_cpu	 = -1;
 	}
 }
 
@@ -1722,8 +1990,8 @@ static __always_inline u32 inf_event_mode(u32 event)
 static __always_inline void inf_refresh_weight(inf_group_entity_t *e)
 {
 	struct inf_cgrp_state *st;
-	u64			epoch = scx_cgroup_ctl_epoch();
-	u32			w;
+	u64		       epoch = scx_cgroup_ctl_epoch();
+	u32		       w;
 
 	if (e->epoch == epoch)
 		return;
@@ -1741,17 +2009,20 @@ static __always_inline void inf_refresh_weight(inf_group_entity_t *e)
 		w = INF_WEIGHT_IDLE;
 
 	e->weight = w;
-	e->rem	= 0;
-	e->epoch = epoch;
+	e->rem	  = 0;
+	e->epoch  = epoch;
 }
 
 /*
  * Charge the service of a slot to the task and to every ancestor of its
- * path. Every entity uses its own weight. The ancestors learn their new
- * weight after the charge, so a running entity settles with the weight it
- * was latched with.
+ * path. The leaf uses its latched weight. A group level uses the weight
+ * the reservation latched at the dispatch when the reservation covers the
+ * path, and the live weight otherwise. The entity refreshes its weight
+ * only after the charge, so a running entity settles with the old weight
+ * and observes a change at its next slot.
  */
-static __noinline void inf_charge_path(task_ctx *tctx, u64 policy_ns)
+static __noinline void inf_charge_path(task_ctx		      *tctx,
+				       struct inf_reservation *r, u64 policy_ns)
 {
 	inf_cpu_block_t *blk;
 	u32		 i;
@@ -1768,47 +2039,93 @@ static __noinline void inf_charge_path(task_ctx *tctx, u64 policy_ns)
 
 	for (i = 0; i < INF_MAX_LEVELS && can_loop; i++) {
 		inf_group_entity_t *e;
+		u32		    weight;
 
 		if (i >= tctx->path_depth)
 			break;
 		e = inf_entity(blk, tctx->path_ent[i]);
 		if (!e)
 			continue;
-		inf_charge_service(&e->v_q16, &e->rem, policy_ns, e->weight);
+		weight = e->weight;
+		if (r && i < r->depth && r->ancestry[i] == tctx->path_ent[i])
+			weight = (u32)r->latched[i];
+		inf_charge_service(&e->v_q16, &e->rem, policy_ns, weight);
 		inf_refresh_weight(e);
 	}
 }
 
 /*
- * Settle the reservation of the running task. The settle closes the
- * reservation, so a second settle charges nothing. It charges the service
- * of the path and the actual runtime of the slot.
+ * Apply a task weight that arrived while the task held a slot. The old
+ * weight settled the slot; the new weight takes effect here and the
+ * residue is flushed.
+ */
+static __always_inline void inf_apply_epoch(task_ctx *tctx)
+{
+	if (!tctx->reweight_pending)
+		return;
+
+	tctx->rem = 0;
+	if (tctx->pending_weight)
+		tctx->latched_weight = tctx->pending_weight;
+	tctx->pending_weight   = 0;
+	tctx->reweight_pending = 0;
+	INF_STAT_INC(epoch_applied);
+}
+
+/*
+ * Settle the open reservation of @tctx exactly once.
+ *
+ * The actual runtime is measured from the cursor that ops.running() set,
+ * and only that value reaches cpu.max. The policy ledger receives the
+ * actual runtime, except that an explicit yield raises the total to
+ * max(actual, slot_ns) and debits only the difference.
+ *
+ * The settle closes the reservation, so a later callback charges nothing.
  */
 static __noinline void inf_settle_slot(struct task_struct *p, task_ctx *tctx,
 				       u32 event, bool local)
 {
-	struct inf_cpu_ctx    *cctx = inf_cpu_ctx(tctx->path_cpu);
+	struct inf_stats       *stats;
+	struct inf_cpu_ctx     *cctx;
 	struct inf_reservation *r;
 	u64			actual = 0;
 	u64			policy;
+	u64			extra = 0;
+	bool			yield;
 
+	if (!tctx)
+		return;
+
+	cctx = inf_cpu_ctx(tctx->path_cpu);
 	if (!cctx)
 		return;
 
 	r = &cctx->resv;
-	if (!r->pid || r->pid != tctx->pid)
+	if (!r->task_idx) {
+		/* The slot was already settled. */
+		INF_STAT_INC(resv_closed);
 		return;
+	}
+	if (r->task_idx != tctx->pid) {
+		INF_STAT_INC(resv_mismatch);
+		return;
+	}
 
 	if (local) {
-		if (r->flags & INF_RESV_RUNNING)
-			actual = scx_bpf_now() - r->start_now;
+		if ((r->flags & INF_RESV_RUNNING) && r->start_now) {
+			u64 now = scx_bpf_now();
+
+			if (now > r->start_now)
+				actual = now - r->start_now;
+		}
 	} else {
 		/*
-		 * A remote tick cannot read the clock of the CPU that runs
-		 * the task. It counts one nominal slot instead.
+		 * A remote callback cannot read the clock of the CPU that
+		 * runs the task. It counts the reserved slot instead.
 		 */
-		actual = INF_SLOT_NS;
+		actual = r->slot_ns;
 		INF_STAT_INC(remote_slots);
+		INF_STAT_INC(resv_remote);
 	}
 
 	if (actual > INF_SETTLE_MAX_NS) {
@@ -1816,20 +2133,41 @@ static __noinline void inf_settle_slot(struct task_struct *p, task_ctx *tctx,
 		INF_STAT_INC(settle_clamps);
 	}
 
+	yield  = (event == INF_EV_YIELD) || (r->flags & INF_RESV_YIELD);
 	policy = actual;
-	if (event == INF_EV_YIELD && policy < r->slot_ns)
+	if (yield && policy < r->slot_ns) {
+		extra  = r->slot_ns - policy;
 		policy = r->slot_ns;
+		INF_STAT_INC(resv_yield);
+	}
 
-	r->actual_ns = actual;
+	/*
+	 * The policy ledger. The actual runtime is charged first, then the
+	 * yield difference. cpu.max sees only the actual runtime.
+	 */
+	inf_charge_path(tctx, r, actual);
+	if (extra)
+		inf_charge_path(tctx, r, extra);
+	inf_apply_epoch(tctx);
+
 	r->policy_ns = policy;
-	r->pid	  = 0;
-	r->flags	  = 0;
+	r->task_idx  = 0;
+	r->start_now = 0;
+	r->depth     = 0;
+	r->flags     = 0;
 
-	/* The service of the path advances by the policy charge. */
-	inf_charge_path(tctx, policy);
+	stats	     = inf_stats();
+	if (stats) {
+		__sync_fetch_and_add(&stats->resv_settled, 1);
+		__sync_fetch_and_add(&stats->resv_actual_ns, actual);
+		__sync_fetch_and_add(&stats->resv_policy_ns, policy);
+		if (extra)
+			__sync_fetch_and_add(&stats->resv_yield_extra_ns,
+					     extra);
+	}
 
 	/* The actual runtime is the only input to cpu.max. */
-	if (actual && inf_cpu_bw_enabled())
+	if (actual && p && inf_cpu_bw_enabled())
 		scx_cgroup_ctl_consume(p, (u64)tctx, actual);
 }
 
@@ -1849,6 +2187,98 @@ static __always_inline u32 inf_slot_event(task_ctx *tctx)
 }
 
 /*
+ * Measure one local kernel tick.
+ *
+ * One ops.tick() call is one service slot, so the slot of a CPU is the
+ * interval between two of its own ticks. The interval is the
+ * scx_bpf_now() delta from the previous local tick of this CPU, and the
+ * clock is only read on the CPU that owns it: a remote tick under
+ * NOHZ_FULL carries no comparable clock and counts a slot instead.
+ *
+ * The first local tick of a CPU has no previous tick and only seeds the
+ * clock. A zero or reversed delta means the tick cannot be measured on
+ * this CPU; the count rises and a sustained failure blocks the run
+ * instead of charging a fabricated slot. A gap longer than one settlement
+ * is a CPU that did not tick for a while, so it is counted but kept out
+ * of the slot average.
+ */
+static __noinline u64 inf_tick_measure(struct inf_cpu_ctx *cctx, u64 now,
+				       bool local)
+{
+	struct inf_stats *stats;
+	u64		  delta, slot;
+	u32		  probe;
+
+	if (!local)
+		return 0;
+
+	if (!cctx->tick_last) {
+		cctx->tick_last = now;
+		return 0;
+	}
+
+	if (now <= cctx->tick_last) {
+		INF_STAT_INC(tick_unmeasurable);
+		cctx->tick_bad++;
+		if (cctx->tick_bad >= INF_TICK_UNMEASURABLE_MAX)
+			scx_bpf_error(
+				"infinity: the kernel tick cannot be measured on CPU %u",
+				cctx->resv.cpu);
+		return 0;
+	}
+
+	cctx->tick_bad	= 0;
+	delta		= now - cctx->tick_last;
+	cctx->tick_last = now;
+	cctx->tick_deltas++;
+	cctx->tick_sum_ns += delta;
+	if (!cctx->tick_min_ns || delta < cctx->tick_min_ns)
+		cctx->tick_min_ns = delta;
+	if (delta > cctx->tick_max_ns)
+		cctx->tick_max_ns = delta;
+
+	/*
+	 * A CPU that ran no task of this class for a while delivers its
+	 * next tick late. The gap is a real interval, so it is counted, but
+	 * folding it into the slot would widen the band and the slice for
+	 * the following slots.
+	 */
+	if (delta > INF_SETTLE_MAX_NS) {
+		INF_STAT_INC(tick_measured);
+		return delta;
+	}
+
+	/* The measured slot is a decaying average of the real tick. */
+	slot = cctx->slot_ns ? cctx->slot_ns : INF_SLOT_NS;
+	slot = (slot * 7 + delta) / 8;
+	if (slot < INF_SLOT_MIN_NS)
+		slot = INF_SLOT_MIN_NS;
+	if (slot > INF_SLOT_MAX_NS)
+		slot = INF_SLOT_MAX_NS;
+	cctx->slot_ns = slot;
+
+	probe	      = cctx->tick_probe;
+	if (probe < INF_TICK_PROBE_SLOTS) {
+		cctx->tick_probe = probe + 1;
+		if (cctx->tick_probe >= INF_TICK_PROBE_SLOTS) {
+			stats = inf_stats();
+			if (stats) {
+				__sync_fetch_and_add(&stats->tick_probe_done,
+						     1);
+				WRITE_ONCE(stats->slot_ns_measured, slot);
+				WRITE_ONCE(stats->slot_ns_min,
+					   cctx->tick_min_ns);
+				WRITE_ONCE(stats->slot_ns_max,
+					   cctx->tick_max_ns);
+			}
+		}
+	}
+
+	INF_STAT_INC(tick_measured);
+	return delta;
+}
+
+/*
  * True when the task wins its own queue and the queue of every ancestor.
  *
  * The check reads the head of every queue on the path. The head carries
@@ -1863,16 +2293,16 @@ static __always_inline u32 inf_slot_event(task_ctx *tctx)
 static __noinline bool inf_wakee_wins(inf_cpu_block_t *blk, task_ctx *tctx)
 {
 	scx_edq_task_t *cand = (scx_edq_task_t *)&tctx->qnode;
-	u32		 idx = (u32)tctx->parent_idx;
-	u32		 level;
+	u32		idx  = (u32)tctx->parent_idx;
+	u32		level;
 
 	for (level = 0; level < INF_MAX_LEVELS && can_loop; level++) {
 		inf_group_entity_t *pe = inf_entity(blk, idx);
-		scx_edq_node_t	 *hn;
-		scx_edq_task_t	 *head;
-		u64		  head_v, cand_v;
-		u32		  head_cls, cand_cls;
-		u64		  tie;
+		scx_edq_node_t	   *hn;
+		scx_edq_task_t	   *head;
+		u64		    head_v, cand_v;
+		u32		    head_cls, cand_cls;
+		u64		    tie;
 
 		if (!pe)
 			return false;
@@ -1895,7 +2325,7 @@ static __noinline bool inf_wakee_wins(inf_cpu_block_t *blk, task_ctx *tctx)
 		if (idx == 0)
 			return true;
 		cand = (scx_edq_task_t *)pe;
-		idx = pe->parent_idx;
+		idx  = pe->parent_idx;
 	}
 	return false;
 }
@@ -1908,7 +2338,7 @@ static __noinline bool inf_wakee_wins(inf_cpu_block_t *blk, task_ctx *tctx)
 static __always_inline void inf_maybe_preempt(struct task_struct *p, s32 cpu,
 					      u64 enq_flags)
 {
-	inf_cpu_block_t	 *blk;
+	inf_cpu_block_t	   *blk;
 	struct task_struct *victim;
 	struct inf_stats   *stats;
 	u64		    reserve;
@@ -2277,9 +2707,9 @@ s32 BPF_STRUCT_OPS(infinity_select_cpu, struct task_struct *p, s32 prev_cpu,
  * task's cgroup on that CPU, and the entity is created on the first join.
  */
 static __noinline int inf_admit_on_cpu(struct task_struct *p, task_ctx *tctx,
-				       s32 cpu, u32 mode)
+				       s32 cpu, u32 mode, bool fresh_coord)
 {
-	inf_cpu_block_t	 *blk = inf_block(cpu);
+	inf_cpu_block_t	   *blk = inf_block(cpu);
 	inf_group_entity_t *leaf;
 	struct cgroup	   *cgrp;
 	u64		    cgrp_id;
@@ -2288,19 +2718,39 @@ static __noinline int inf_admit_on_cpu(struct task_struct *p, task_ctx *tctx,
 	if (!blk)
 		return -EINVAL;
 
-	cgrp = inf_task_cgroup(p);
+	cgrp	    = inf_task_cgroup(p);
 	leaf_parent = inf_resolve_leaf(blk, cgrp, &cgrp_id);
 
-	leaf = inf_entity(blk, leaf_parent);
+	leaf	    = inf_entity(blk, leaf_parent);
 	if (!leaf)
 		return -EINVAL;
 
-	tctx->parent_idx	= leaf_parent;
-	tctx->cgrp_id		= cgrp_id;
-	tctx->queued_cpu	= cpu;
-	tctx->path_cpu		= cpu;
-	tctx->latched_weight	= inf_task_weight(p);
-	tctx->epoch		= scx_cgroup_ctl_epoch();
+	/* The task references the entity that holds it. */
+	inf_task_attach(tctx, blk, cpu, leaf_parent);
+
+	tctx->parent_idx = leaf_parent;
+	tctx->cgrp_id	 = cgrp_id;
+	tctx->queued_cpu = cpu;
+	tctx->path_cpu	 = cpu;
+
+	/*
+	 * A new CPU or cgroup coordinate starts at the destination
+	 * frontier. No source virtual time crosses the boundary.
+	 */
+	if (fresh_coord) {
+		tctx->v_q16 = leaf->frontier_q16;
+		tctx->rem   = 0;
+	}
+
+	/*
+	 * A non-running entity refreshes its weight before the next
+	 * charge. A deferred reweight keeps the value the settle will
+	 * apply.
+	 */
+	if (!tctx->reweight_pending) {
+		tctx->latched_weight = inf_task_weight(p);
+		tctx->epoch	     = scx_cgroup_ctl_epoch();
+	}
 
 	inf_admit_task(blk, tctx, leaf_parent, mode);
 	return 0;
@@ -2313,11 +2763,13 @@ static __noinline int inf_admit_on_cpu(struct task_struct *p, task_ctx *tctx,
 static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 					 bool reenq)
 {
-	inf_cpu_block_t	 *blk;
-	task_ctx	   *tctx;
-	u32		    mode;
-	s32		    cpu;
-	int		    ret;
+	inf_cpu_block_t *blk;
+	task_ctx	*tctx;
+	u32		 mode;
+	s32		 cpu;
+	int		 ret;
+	bool		 was_parked = false;
+	bool		 fresh	    = false;
 
 	if (!p)
 		return -EINVAL;
@@ -2351,6 +2803,14 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 	 * to the local DSQ now, while the task pointer is valid.
 	 */
 	if ((p->flags & PF_EXITING) || tctx->state == INF_ENTITY_EXITING) {
+		/*
+		 * The slot is settled and the queue membership is dropped
+		 * before the task is handed to the local DSQ, so a dead
+		 * task never waits in the tree for a dispatch.
+		 */
+		inf_settle_slot(p, tctx, inf_slot_event(tctx),
+				inf_resv_local(inf_cpu_ctx(tctx->path_cpu)));
+		inf_task_leave(tctx);
 		tctx->queued_cpu = -1;
 		tctx->state	 = INF_ENTITY_EXITING;
 		inf_trace(INF_TR_EXIT_PASS, tctx, INF_TR_WHERE(cpu, cpu), 3);
@@ -2363,15 +2823,21 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 
 	/*
 	 * A task in a throttled cgroup is parked in the bandwidth backlog and
-	 * is not on any of our trees.
+	 * is not on any of our trees. The reservation is settled before the
+	 * task leaves, so a parked task keeps its state and history but no
+	 * open slot.
 	 */
 	if (inf_cpu_bw_enabled() && !reenq) {
 		ret = scx_cgroup_ctl_throttled(p, (u64)tctx);
 		if (ret == -EAGAIN) {
 			if (!scx_cgroup_ctl_put_aside(p, (u64)tctx, 0)) {
+				inf_settle_slot(p, tctx, inf_slot_event(tctx),
+						bpf_get_smp_processor_id() ==
+							tctx->path_cpu);
 				inf_task_leave(tctx);
 				tctx->state = INF_ENTITY_PARKED;
 				INF_STAT_INC(cgrp_throttled);
+				INF_STAT_INC(park_settled);
 				inf_trace(INF_TR_ENQ_PARK, tctx,
 					  INF_TR_WHERE(cpu, -1), ret);
 				return 0;
@@ -2380,8 +2846,11 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 			 * A failed put-aside must not lose the task: fall
 			 * through and enqueue it normally.
 			 */
+			INF_STAT_INC(park_failed);
 		}
 	}
+
+	was_parked = tctx->state == INF_ENTITY_PARKED;
 
 	/*
 	 * The task holds a path: the slot ended and the path re-enters the
@@ -2389,9 +2858,10 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 	 * preemption.
 	 */
 	if ((tctx->state == INF_ENTITY_SELECTED ||
-	     tctx->state == INF_ENTITY_RUNNING) && tctx->path_cpu == cpu) {
-		u32 event = inf_slot_event(tctx);
-		u32 mode  = inf_event_mode(event);
+	     tctx->state == INF_ENTITY_RUNNING) &&
+	    tctx->path_cpu == cpu) {
+		u32  event = inf_slot_event(tctx);
+		u32  mode  = inf_event_mode(event);
 		bool local = bpf_get_smp_processor_id() == cpu;
 
 		/*
@@ -2402,25 +2872,32 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 
 		inf_requeue_path(tctx, mode);
 		tctx->pending_event = INF_EV_NONE;
-		tctx->yielded	  = 0;
-		tctx->preempted	  = 0;
+		tctx->yielded	    = 0;
+		tctx->preempted	    = 0;
 		if (mode == INF_INS_TAIL)
 			INF_STAT_INC(requeue_tail);
 		else
 			INF_STAT_INC(requeue_normal);
-		inf_trace(INF_TR_REQUEUE, tctx, INF_TR_WHERE(tctx->path_cpu, cpu),
-			  (s64)event);
+		inf_trace(INF_TR_REQUEUE, tctx,
+			  INF_TR_WHERE(tctx->path_cpu, cpu), (s64)event);
 		inf_resolve_pending(tctx);
 		return 0;
 	}
 
 	/*
-	 * The task holds a path on another CPU. The old path is released
-	 * and the task enters the tree of this CPU.
+	 * The task holds a path on another CPU. The old path is settled
+	 * against the old CPU and released, and the task enters the tree of
+	 * this CPU at the destination frontier. No source virtual time
+	 * crosses the CPU boundary.
 	 */
 	if (tctx->state == INF_ENTITY_SELECTED ||
-	    tctx->state == INF_ENTITY_RUNNING)
+	    tctx->state == INF_ENTITY_RUNNING) {
+		inf_settle_slot(p, tctx, inf_slot_event(tctx),
+				inf_resv_local(inf_cpu_ctx(tctx->path_cpu)));
 		inf_task_leave(tctx);
+		fresh = true;
+		INF_STAT_INC(resv_migrate);
+	}
 
 	/*
 	 * A stale membership means a previous move did not finish. Remove
@@ -2442,12 +2919,15 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 
 	mode = (enq_flags & SCX_ENQ_HEAD) ? INF_INS_HEAD : INF_INS_NORMAL;
 
-	if (inf_admit_on_cpu(p, tctx, cpu, mode)) {
+	if (inf_admit_on_cpu(p, tctx, cpu, mode, fresh)) {
 		INF_STAT_INC(lost_state_errors);
 		INF_STAT_INC(enq_admit_fail);
 		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
 		return 0;
 	}
+
+	if (was_parked)
+		INF_STAT_INC(unpark_admits);
 
 	if (mode == INF_INS_HEAD)
 		INF_STAT_INC(exempt_inserts);
@@ -2531,14 +3011,14 @@ static __always_inline s32 inf_task_allowed_cpu(struct task_struct *p,
  */
 static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 {
-	inf_cpu_block_t	 *blk = inf_block(cpu);
-	inf_group_entity_t *leaf;
+	inf_cpu_block_t		*blk = inf_block(cpu);
+	inf_group_entity_t	*leaf;
 	struct inf_path __arena *path;
-	struct task_struct *p;
-	task_ctx	   *tctx = NULL;
-	u32		    i;
-	u32		    leaf_idx;
-	int		    ret;
+	struct task_struct	*p;
+	task_ctx		*tctx = NULL;
+	u32			 i;
+	u32			 leaf_idx;
+	int			 ret;
 
 	if (!blk)
 		return false;
@@ -2556,8 +3036,9 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 	 * root entity holds it.
 	 */
 	leaf_idx = path->depth > 0 ?
-		   path->ent[(path->depth - 1) & (INF_MAX_LEVELS - 1)] : 0;
-	leaf = inf_entity(blk, leaf_idx);
+			   path->ent[(path->depth - 1) & (INF_MAX_LEVELS - 1)] :
+			   0;
+	leaf	 = inf_entity(blk, leaf_idx);
 	if (!leaf)
 		return false;
 
@@ -2593,7 +3074,7 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 
 	/* The leaf task leaves the queue of its parent. */
 	inf_queue_hold(&tctx->qnode);
-	ret = inf_queue_remove(&leaf->children, &tctx->qnode);
+	ret = inf_q_remove(&leaf->children, &tctx->qnode);
 	if (ret) {
 		/*
 		 * The node is not in the queue the selection found it in.
@@ -2619,7 +3100,7 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 		}
 		inf_queue_unlink(&tctx->qnode);
 		INF_STAT_INC(state_repairs);
-		if (inf_admit_on_cpu(p, tctx, cpu, INF_INS_NORMAL))
+		if (inf_admit_on_cpu(p, tctx, cpu, INF_INS_NORMAL, false))
 			INF_STAT_INC(lost_state_errors);
 		bpf_task_release(p);
 		return false;
@@ -2634,7 +3115,7 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 
 	/* The path of the task is held by the task. */
 	tctx->path_depth = path->depth;
-	tctx->path_cpu   = cpu;
+	tctx->path_cpu	 = cpu;
 	if (tctx->path_depth > INF_MAX_LEVELS)
 		tctx->path_depth = INF_MAX_LEVELS;
 	for (i = 0; i < INF_MAX_LEVELS && can_loop; i++) {
@@ -2652,7 +3133,7 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 		 * DSQ. The core clears custody and the CPU runs the final
 		 * exit.
 		 */
-		tctx->state	 = INF_ENTITY_EXITING;
+		tctx->state	   = INF_ENTITY_EXITING;
 		tctx->exit_pending = 0;
 		tctx->queued_cpu   = -1;
 		tctx->path_depth   = 0;
@@ -2661,7 +3142,8 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 			INF_STAT_INC(lost_state_errors);
 		} else {
 			tctx->slice_ns = INF_SLOT_NS;
-			if (scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, INF_SLOT_NS, 0))
+			if (scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, INF_SLOT_NS,
+					       0))
 				INF_STAT_INC(exit_passes);
 			else
 				INF_STAT_INC(lost_state_errors);
@@ -2689,8 +3171,9 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 		 * the tree of a CPU its mask allows.
 		 */
 		inf_task_leave(tctx);
-		if (target >= 0 && !inf_admit_on_cpu(p, tctx, target,
-						    INF_INS_NORMAL)) {
+		if (target >= 0 &&
+		    !inf_admit_on_cpu(p, tctx, target, INF_INS_NORMAL, true)) {
+			INF_STAT_INC(migrate_admits);
 			scx_bpf_kick_cpu(target, SCX_KICK_IDLE);
 		} else {
 			INF_STAT_INC(lost_state_errors);
@@ -2703,14 +3186,11 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 		return false;
 	}
 
-	/* The reservation of the slot. */
-	cctx->resv.pid	    = tctx->pid;
-	cctx->resv.cpu	    = (u32)cpu;
-	cctx->resv.slot_ns  = INF_SLOT_NS;
-	cctx->resv.start_now = 0;
-	cctx->resv.flags    = 0;
-
-	tctx->slice_ns = INF_SLOT_NS;
+	/*
+	 * The slot the task will get. The reservation itself opens in
+	 * ops.running(), after the predecessor settled its own slot.
+	 */
+	tctx->slice_ns = inf_cpu_slot_ns(cpu);
 	tctx->state    = INF_ENTITY_SELECTED;
 
 	INF_STAT_INC(disp_pop);
@@ -2726,7 +3206,6 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 			inf_trace(INF_TR_DSQ_REFUSED, tctx,
 				  INF_TR_WHERE(cpu, cpu), 1);
 			/* Put the path back with its saved records. */
-			cctx->resv.pid = 0;
 			inf_requeue_path(tctx, INF_INS_TAIL);
 			bpf_task_release(p);
 			inf_queue_drop(&tctx->qnode);
@@ -2734,14 +3213,13 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 		}
 	}
 
-	if (!scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, INF_SLOT_NS, 0)) {
+	if (!scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, tctx->slice_ns, 0)) {
 		/*
 		 * The core refused the local insert. Put the path back
 		 * instead of dropping a runnable task.
 		 */
 		inf_trace(INF_TR_DSQ_REFUSED, tctx, INF_TR_WHERE(cpu, cpu), 0);
 		INF_STAT_INC(disp_dsq_fail);
-		cctx->resv.pid = 0;
 		inf_requeue_path(tctx, INF_INS_TAIL);
 		bpf_task_release(p);
 		inf_queue_drop(&tctx->qnode);
@@ -2765,9 +3243,9 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 static __noinline bool inf_steal_peek(inf_cpu_block_t *pblk,
 				      inf_cpu_block_t *dblk, task_ctx **leaf)
 {
-	struct inf_path __arena *path = &dblk->path;
-	u32	idx = 0;
-	u32	level = 0;
+	struct inf_path __arena *path  = &dblk->path;
+	u32			 idx   = 0;
+	u32			 level = 0;
 
 	/*
 	 * The counter of the peek lives in the arena, so the verifier sees
@@ -2776,8 +3254,8 @@ static __noinline bool inf_steal_peek(inf_cpu_block_t *pblk,
 	dblk->counter[INF_COUNTER_PEEK] = 0;
 	while (can_loop) {
 		inf_group_entity_t *e = inf_entity(pblk, idx);
-		scx_edq_node_t	 *hn;
-		scx_edq_task_t	 *head;
+		scx_edq_node_t	   *hn;
+		scx_edq_task_t	   *head;
 
 		if (!e)
 			return false;
@@ -2788,15 +3266,15 @@ static __noinline bool inf_steal_peek(inf_cpu_block_t *pblk,
 
 		if (!inf_node_is_group(pblk, (u64)head)) {
 			path->depth = level;
-			*leaf	  = inf_task_from_qnode(head);
+			*leaf	    = inf_task_from_qnode(head);
 			return true;
 		}
 
 		if (dblk->counter[INF_COUNTER_PEEK] >= INF_MAX_LEVELS)
 			return false;
 		dblk->counter[INF_COUNTER_PEEK]++;
-		path->ent[level & (INF_MAX_LEVELS - 1)] = inf_entity_index(
-			pblk, (inf_group_entity_t *)head);
+		path->ent[level & (INF_MAX_LEVELS - 1)] =
+			inf_entity_index(pblk, (inf_group_entity_t *)head);
 		idx = path->ent[level & (INF_MAX_LEVELS - 1)];
 		level++;
 	}
@@ -2812,22 +3290,21 @@ static __noinline bool inf_steal_peek(inf_cpu_block_t *pblk,
 static __noinline bool inf_steal_from(s32 peer, s32 dst,
 				      struct inf_cpu_ctx *dcctx)
 {
-	inf_cpu_block_t	 *pblk = inf_block(peer);
-	inf_cpu_block_t	 *dblk = inf_block(dst);
-	inf_group_entity_t *sleaf;
-	inf_group_entity_t *dleaf;
+	inf_cpu_block_t		*pblk = inf_block(peer);
+	inf_cpu_block_t		*dblk = inf_block(dst);
+	inf_group_entity_t	*sleaf;
+	inf_group_entity_t	*dleaf;
 	struct inf_path __arena *spath = &dblk->path;
-	struct task_struct *p;
-	task_ctx	   *tctx = NULL;
-	u64		    saved_v;
-	u32		    saved_cls;
-	u64		    saved_tie;
-	u64		    saved_parent;
-	u64		    saved_cgrp;
-	u32		    leaf_parent;
-	u32		    sleaf_idx;
-	u64		    cgrp_id;
-	int		    ret;
+	struct task_struct	*p;
+	task_ctx		*tctx = NULL;
+	u64			 saved_v;
+	u32			 saved_cls;
+	u64			 saved_tie;
+	u64			 saved_cgrp;
+	u32			 leaf_parent;
+	u32			 sleaf_idx;
+	u64			 cgrp_id;
+	int			 ret;
 
 	if (!pblk || !dblk)
 		return false;
@@ -2882,9 +3359,11 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 	 * tree whose path has no group level holds the task in the root
 	 * entity, so the index is 0.
 	 */
-	sleaf_idx = spath->depth > 0 ?
-		    spath->ent[(spath->depth - 1) & (INF_MAX_LEVELS - 1)] : 0;
-	sleaf	  = inf_entity(pblk, sleaf_idx);
+	sleaf_idx =
+		spath->depth > 0 ?
+			spath->ent[(spath->depth - 1) & (INF_MAX_LEVELS - 1)] :
+			0;
+	sleaf = inf_entity(pblk, sleaf_idx);
 	if (!sleaf) {
 		tctx->moving = 0;
 		inf_queue_drop(&tctx->qnode);
@@ -2894,14 +3373,13 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 	}
 
 	/* The source record is saved before the task leaves the source. */
-	saved_v		 = tctx->v_q16;
-	saved_cls	 = tctx->class;
-	saved_tie	 = tctx->tie;
-	saved_parent = tctx->parent_idx;
-	saved_cgrp	 = tctx->cgrp_id;
+	saved_v	     = tctx->v_q16;
+	saved_cls    = tctx->class;
+	saved_tie    = tctx->tie;
+	saved_cgrp   = tctx->cgrp_id;
 
 	/* The task leaves the source queue. */
-	ret = inf_queue_remove(&sleaf->children, &tctx->qnode);
+	ret = inf_q_remove(&sleaf->children, &tctx->qnode);
 	if (ret) {
 		tctx->moving = 0;
 		inf_queue_drop(&tctx->qnode);
@@ -2915,18 +3393,30 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 
 	/* The destination leaf parent. */
 	leaf_parent = inf_resolve_leaf(dblk, inf_task_cgroup(p), &cgrp_id);
-	dleaf	 = inf_entity(dblk, leaf_parent);
-	if (!dleaf) {
+	dleaf	    = inf_entity(dblk, leaf_parent);
+	if (!dleaf)
+		goto restore;
+
+	/*
+	 * The destination record and the insert. The node is fully formed
+	 * before it becomes visible in the destination queue, and the
+	 * reference and the path follow the commit, so a refused insert
+	 * only has to put the saved record back.
+	 */
+	tctx->v_q16 = dleaf->frontier_q16;
+	tctx->rem   = 0;
+	tctx->class = inf_gate_class(dleaf, INF_INS_NORMAL);
+	tctx->tie   = dleaf->tie_seq++;
+	if (inf_q_insert(&dleaf->children, &tctx->qnode, tctx->v_q16)) {
+		INF_STAT_INC(state_repairs);
 		goto restore;
 	}
 
-	/* The destination frontier, then the normal gate of the leaf. */
-	tctx->v_q16 = dleaf->frontier_q16;
-	tctx->class = inf_gate_class(dleaf, INF_INS_NORMAL);
-	tctx->tie   = dleaf->tie_seq++;
-	tctx->parent_idx = leaf_parent;
-	tctx->cgrp_id    = cgrp_id;
-	tctx->path_cpu   = dst;
+	/* The steal committed: the task now belongs to the destination. */
+	tctx->state = INF_ENTITY_RUNNABLE;
+	inf_task_attach(tctx, dblk, dst, leaf_parent);
+	tctx->cgrp_id	 = cgrp_id;
+	tctx->path_cpu	 = dst;
 	tctx->queued_cpu = dst;
 
 	/* The path of the task on the destination CPU. */
@@ -2935,7 +3425,8 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 		u32 idx = leaf_parent;
 		u32 level;
 
-		for (level = 0; level < INF_MAX_LEVELS && idx != 0 && can_loop; level++) {
+		for (level = 0; level < INF_MAX_LEVELS && idx != 0 && can_loop;
+		     level++) {
 			inf_group_entity_t *e = inf_entity(dblk, idx);
 
 			if (!e)
@@ -2946,38 +3437,34 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 		}
 	}
 
-	ret = inf_queue_insert(&dleaf->children, &tctx->qnode, tctx->v_q16);
-	if (ret) {
-		INF_STAT_INC(state_repairs);
-		goto restore;
-	}
-	tctx->state = INF_ENTITY_RUNNABLE;
 	inf_count_up(dblk, leaf_parent, INF_INS_NORMAL);
-
-	/* The steal committed. */
-	tctx->moving = 0;
 	INF_STAT_INC(steals);
 	INF_STAT_INC(disp_steal);
 	inf_trace(INF_TR_STEAL, tctx, INF_TR_WHERE(peer, dst), 0);
 	scx_bpf_kick_cpu(dst, SCX_KICK_IDLE);
+	tctx->moving = 0;
 	inf_queue_drop(&tctx->qnode);
 	bpf_task_release(p);
 	return true;
 
 restore:
 	/*
-	 * The destination refused the task. The source record is restored,
-	 * so the task keeps its position in the source queue and no gate
-	 * advanced.
+	 * The destination refused the task. The source record goes back and
+	 * the node re-enters the source queue with its old service and tie.
+	 * The reference and the path of the task still name the source, so
+	 * neither is touched here.
 	 */
-	tctx->v_q16  = saved_v;
-	tctx->class  = saved_cls;
-	tctx->tie    = saved_tie;
-	tctx->parent_idx = saved_parent;
-	tctx->cgrp_id    = saved_cgrp;
-	tctx->state  = INF_ENTITY_RUNNABLE;
+	tctx->v_q16	 = saved_v;
+	tctx->class	 = saved_cls;
+	tctx->tie	 = saved_tie;
+	tctx->cgrp_id	 = saved_cgrp;
+	tctx->state	 = INF_ENTITY_RUNNABLE;
 	tctx->queued_cpu = peer;
-	inf_queue_insert(&sleaf->children, &tctx->qnode, saved_v);
+	if (inf_q_insert(&sleaf->children, &tctx->qnode, saved_v)) {
+		inf_queue_unlink(&tctx->qnode);
+		if (inf_q_insert(&sleaf->children, &tctx->qnode, saved_v))
+			INF_STAT_INC(lost_state_errors);
+	}
 	inf_count_up(pblk, sleaf_idx, INF_INS_NORMAL);
 	tctx->moving = 0;
 	INF_STAT_INC(steal_failures);
@@ -3163,14 +3650,22 @@ void BPF_STRUCT_OPS(infinity_dequeue, struct task_struct *p, u64 deq_flags)
 		if (tctx->moving) {
 			tctx->dequeue_pending = 1;
 			inf_trace(INF_TR_DEQ_PENDING, tctx,
-				  INF_TR_WHERE(tctx->queued_cpu, -1), deq_flags);
+				  INF_TR_WHERE(tctx->queued_cpu, -1),
+				  deq_flags);
 			return;
 		}
+		/*
+		 * The reservation closes before the task leaves, so a sleep
+		 * or a property change cannot leave an open slot behind.
+		 */
+		inf_settle_slot(p, tctx, inf_slot_event(tctx),
+				inf_resv_local(inf_cpu_ctx(tctx->path_cpu)));
 		inf_task_leave(tctx);
 		inf_trace(INF_TR_DEQ_QUEUED, tctx,
 			  INF_TR_WHERE(tctx->queued_cpu, -1), deq_flags);
 	} else {
-		inf_trace(INF_TR_DEQ_END, tctx, INF_TR_WHERE(-1, -1), deq_flags);
+		inf_trace(INF_TR_DEQ_END, tctx, INF_TR_WHERE(-1, -1),
+			  deq_flags);
 	}
 
 	/*
@@ -3214,8 +3709,11 @@ void BPF_STRUCT_OPS(infinity_quiescent, struct task_struct *p, u64 deq_flags)
 
 	if (tctx->state == INF_ENTITY_RUNNABLE ||
 	    tctx->state == INF_ENTITY_SELECTED ||
-	    tctx->state == INF_ENTITY_RUNNING)
+	    tctx->state == INF_ENTITY_RUNNING) {
+		inf_settle_slot(p, tctx, inf_slot_event(tctx),
+				inf_resv_local(inf_cpu_ctx(tctx->path_cpu)));
 		inf_task_leave(tctx);
+	}
 }
 
 /*
@@ -3225,8 +3723,8 @@ void BPF_STRUCT_OPS(infinity_quiescent, struct task_struct *p, u64 deq_flags)
 void BPF_STRUCT_OPS(infinity_set_weight, struct task_struct *p, u32 weight)
 {
 	task_ctx *tctx;
-	s32	    cpu;
-	u32	    new_weight;
+	s32	  cpu;
+	u32	  new_weight;
 
 	TOUCH_ARENA();
 
@@ -3246,10 +3744,26 @@ void BPF_STRUCT_OPS(infinity_set_weight, struct task_struct *p, u32 weight)
 	if (p->policy == INF_SCHED_IDLE)
 		new_weight = INF_WEIGHT_IDLE;
 
+	/*
+	 * A running or dispatched task settles the current slot with the
+	 * old weight and observes the new one at its next slot. The residue
+	 * is flushed only when the new weight takes effect.
+	 */
+	if (tctx->state == INF_ENTITY_SELECTED ||
+	    tctx->state == INF_ENTITY_RUNNING) {
+		tctx->pending_weight   = new_weight;
+		tctx->reweight_pending = 1;
+		tctx->base_weight      = new_weight;
+		INF_STAT_INC(epoch_deferred);
+		return;
+	}
+
 	/* The residue is flushed under the old weight. */
-	tctx->rem = 0;
-	tctx->latched_weight = new_weight;
-	tctx->base_weight	  = new_weight;
+	tctx->rem	       = 0;
+	tctx->pending_weight   = 0;
+	tctx->reweight_pending = 0;
+	tctx->latched_weight   = new_weight;
+	tctx->base_weight      = new_weight;
 
 	if (tctx->state != INF_ENTITY_RUNNABLE)
 		return;
@@ -3267,7 +3781,7 @@ void BPF_STRUCT_OPS(infinity_set_weight, struct task_struct *p, u32 weight)
 	INF_STAT_INC(reweight_queued);
 	INF_STAT_INC(weight_queued_cpu);
 	inf_task_leave_tree(tctx);
-	if (inf_admit_on_cpu(p, tctx, cpu, INF_INS_NORMAL))
+	if (inf_admit_on_cpu(p, tctx, cpu, INF_INS_NORMAL, false))
 		INF_STAT_INC(lost_state_errors);
 	inf_trace(INF_TR_REWEIGHT, tctx, INF_TR_WHERE(cpu, -1), 0);
 }
@@ -3280,7 +3794,7 @@ void BPF_STRUCT_OPS(infinity_set_weight, struct task_struct *p, u32 weight)
 static __noinline bool inf_yield_to(struct task_struct *from,
 				    struct task_struct *to)
 {
-	inf_cpu_block_t	 *blk;
+	inf_cpu_block_t	   *blk;
 	inf_group_entity_t *parent;
 	task_ctx	   *tctx;
 	u64		    saved_v;
@@ -3321,11 +3835,11 @@ static __noinline bool inf_yield_to(struct task_struct *from,
 		return false;
 	}
 
-	saved_v  = tctx->v_q16;
+	saved_v	  = tctx->v_q16;
 	saved_cls = tctx->class;
 	saved_tie = tctx->tie;
 
-	ret = inf_queue_remove(&parent->children, &tctx->qnode);
+	ret	  = inf_q_remove(&parent->children, &tctx->qnode);
 	if (ret) {
 		tctx->moving = 0;
 		inf_queue_drop(&tctx->qnode);
@@ -3340,15 +3854,17 @@ static __noinline bool inf_yield_to(struct task_struct *from,
 	tctx->class = INF_CLASS_HEAD;
 	tctx->tie   = parent->tie_seq++;
 	tctx->v_q16 = inf_service_max(tctx->v_q16, parent->frontier_q16);
-	if (inf_queue_insert(&parent->children, &tctx->qnode, tctx->v_q16)) {
+	if (inf_q_insert(&parent->children, &tctx->qnode, tctx->v_q16)) {
 		/* Put the task back with its saved record. */
-		tctx->v_q16  = saved_v;
-		tctx->class  = saved_cls;
-		tctx->tie    = saved_tie;
-		if (inf_queue_insert(&parent->children, &tctx->qnode, saved_v)) {
-			tctx->state = INF_ENTITY_INACTIVE;
+		tctx->v_q16 = saved_v;
+		tctx->class = saved_cls;
+		tctx->tie   = saved_tie;
+		if (inf_q_insert(&parent->children, &tctx->qnode,
+				     saved_v)) {
+			tctx->state	 = INF_ENTITY_INACTIVE;
 			tctx->queued_cpu = -1;
-			inf_count_up(blk, (u32)tctx->parent_idx, INF_INS_NORMAL);
+			inf_count_up(blk, (u32)tctx->parent_idx,
+				     INF_INS_NORMAL);
 		}
 		tctx->moving = 0;
 		inf_queue_drop(&tctx->qnode);
@@ -3377,8 +3893,18 @@ bool BPF_STRUCT_OPS(infinity_yield, struct task_struct *from,
 	/* Yield forfeits the remaining slice; the core re-enqueues. */
 	scx_bpf_task_set_slice(from, 0);
 	tctx = inf_task_ctx(from);
-	if (tctx)
-		tctx->yielded = 1;
+	if (tctx) {
+		struct inf_cpu_ctx *cctx = inf_cpu_ctx(tctx->path_cpu);
+
+		tctx->yielded		 = 1;
+		/*
+		 * The reservation pays for its slot even when the task stops
+		 * early. The settle debits only the difference to the policy
+		 * ledger, and cpu.max still sees the actual runtime.
+		 */
+		if (inf_resv_matches(cctx, tctx))
+			cctx->resv.flags |= INF_RESV_YIELD;
+	}
 
 	if (to && to != from)
 		moved = inf_yield_to(from, to);
@@ -3404,10 +3930,32 @@ void BPF_STRUCT_OPS(infinity_running, struct task_struct *p)
 		tctx->state = INF_ENTITY_RUNNING;
 
 	cctx = inf_cpu_ctx(tctx->path_cpu);
-	if (cctx && cctx->resv.pid == tctx->pid) {
-		cctx->resv.start_now = tctx->last_running_ns;
-		cctx->resv.flags |= INF_RESV_RUNNING;
-	}
+	if (!cctx)
+		return;
+
+	/*
+	 * The reservation of the slot opens here, not at the dispatch.
+	 *
+	 * The core calls ops.stopping() for the outgoing task after
+	 * ops.dispatch(), so a reservation opened at the dispatch would
+	 * take the per-CPU slot before the predecessor settled its own
+	 * runtime, and that runtime would be lost. Opening the reservation
+	 * when the task actually starts keeps the slot free for the settle
+	 * of the task that is leaving.
+	 *
+	 * The path of the task and the latched weights come from the task
+	 * context, so the dispatch is the only place that has to set them.
+	 */
+	if (tctx->state != INF_ENTITY_RUNNING &&
+	    tctx->state != INF_ENTITY_SELECTED)
+		return;
+
+	if (!inf_resv_matches(cctx, tctx) && cctx->resv.task_idx)
+		INF_STAT_INC(resv_mismatch);
+	inf_resv_open(cctx, tctx, tctx->path_cpu);
+
+	cctx->resv.start_now = tctx->last_running_ns;
+	cctx->resv.flags |= INF_RESV_RUNNING;
 }
 
 /*
@@ -3433,7 +3981,7 @@ void BPF_STRUCT_OPS(infinity_tick, struct task_struct *p)
 		return;
 
 	cctx = inf_cpu_ctx(tctx->path_cpu);
-	if (!cctx || cctx->resv.pid != tctx->pid)
+	if (!inf_resv_matches(cctx, tctx))
 		return;
 
 	/*
@@ -3444,24 +3992,35 @@ void BPF_STRUCT_OPS(infinity_tick, struct task_struct *p)
 	event = READ_ONCE(p->scx.slice) ? INF_EV_POST_SLOT : INF_EV_EXPIRY;
 	tctx->pending_event = event;
 
-	local = bpf_get_smp_processor_id() == (s32)cctx->resv.cpu;
+	local		    = inf_resv_local(cctx);
+
+	/*
+	 * One tick is one service slot. The local interval between two
+	 * ticks of this CPU seeds the measured slot that the next dispatch
+	 * reserves.
+	 */
+	inf_tick_measure(cctx, scx_bpf_now(), local);
+	INF_STAT_INC(tick_slots);
 
 	/*
 	 * The settle charges the service of the path and the actual runtime
-	 * of the slot. A remote tick counts one nominal slot.
+	 * of the slot. A remote tick counts the reserved slot.
 	 */
 	inf_settle_slot(p, tctx, event, local);
-
-	INF_STAT_INC(tick_slots);
 
 	/* The slot ends here. The core reschedules the task. */
 	scx_bpf_task_set_slice(p, 0);
 }
 
+/*
+ * A running task stops being the current task. The open reservation is
+ * settled here so a preemption, a migration or a slice expiry that the
+ * tick did not see still charges the actual runtime exactly once.
+ * cpu.max is charged through the settle only.
+ */
 void BPF_STRUCT_OPS(infinity_stopping, struct task_struct *p, bool runnable)
 {
 	task_ctx *tctx;
-	u64	  now, delta;
 
 	(void)runnable;
 
@@ -3471,12 +4030,9 @@ void BPF_STRUCT_OPS(infinity_stopping, struct task_struct *p, bool runnable)
 	if (!tctx)
 		return;
 
-	now		      = scx_bpf_now();
-	delta		      = now - tctx->last_running_ns;
-	tctx->last_running_ns = now;
-
-	if (delta && inf_cpu_bw_enabled())
-		scx_cgroup_ctl_consume(p, (u64)tctx, delta);
+	inf_settle_slot(p, tctx, inf_slot_event(tctx),
+			inf_resv_local(inf_cpu_ctx(tctx->path_cpu)));
+	INF_STAT_INC(resv_stop);
 }
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init_task, struct task_struct *p,
@@ -3519,26 +4075,28 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init_task, struct task_struct *p,
 		return -EINVAL;
 	}
 
-	tctx->base_weight	= p->scx.weight ? p->scx.weight : 1;
-	tctx->latched_weight	= inf_task_weight(p);
-	tctx->slice_ns		= 0;
-	tctx->last_running_ns	= scx_bpf_now();
-	tctx->epoch		= scx_cgroup_ctl_epoch();
-	tctx->queued_cpu	= -1;
-	tctx->path_cpu		= -1;
-	tctx->path_depth	= 0;
-	tctx->state		= INF_ENTITY_INACTIVE;
-	tctx->moving		= 0;
-	tctx->reweight_pending	= 0;
-	tctx->dequeue_pending	= 0;
-	tctx->exit_pending	= 0;
-	tctx->joined		= 0;
-	tctx->yielded		= 0;
-	tctx->preempted		= 0;
-	tctx->wake_fork		= 0;
-	tctx->idle		= 0;
-	tctx->pending_event	= INF_EV_NONE;
-	tctx->pid		= p->pid;
+	tctx->base_weight      = p->scx.weight ? p->scx.weight : 1;
+	tctx->latched_weight   = inf_task_weight(p);
+	tctx->pending_weight   = 0;
+	tctx->slice_ns	       = 0;
+	tctx->last_running_ns  = scx_bpf_now();
+	tctx->epoch	       = scx_cgroup_ctl_epoch();
+	tctx->queued_cpu       = -1;
+	tctx->path_cpu	       = -1;
+	tctx->cgrp_cpu	       = -1;
+	tctx->path_depth       = 0;
+	tctx->state	       = INF_ENTITY_INACTIVE;
+	tctx->moving	       = 0;
+	tctx->reweight_pending = 0;
+	tctx->dequeue_pending  = 0;
+	tctx->exit_pending     = 0;
+	tctx->joined	       = 0;
+	tctx->yielded	       = 0;
+	tctx->preempted	       = 0;
+	tctx->wake_fork	       = 0;
+	tctx->idle	       = 0;
+	tctx->pending_event    = INF_EV_NONE;
+	tctx->pid	       = p->pid;
 	return 0;
 }
 
@@ -3560,10 +4118,24 @@ s32 BPF_STRUCT_OPS(infinity_exit_task, struct task_struct *p,
 		return 0;
 	}
 
+	/* Settle the open slot before the path is released. */
+	inf_settle_slot(p, tctx, inf_slot_event(tctx),
+			inf_resv_local(inf_cpu_ctx(tctx->path_cpu)));
+	INF_STAT_INC(resv_exit);
+
+	/*
+	 * The task leaves while it still reports its live state, so a
+	 * queued node is unlinked and a held path is released. Then the
+	 * context is marked exiting.
+	 */
+	inf_task_leave(tctx);
 	tctx->state = INF_ENTITY_EXITING;
 
-	/* The task leaves the tree, and a held path is released. */
-	inf_task_leave(tctx);
+	/*
+	 * The task drops its reference on its cgroup entity. A cgroup that
+	 * already exited is reclaimed when its last reference drops.
+	 */
+	inf_task_detach(tctx);
 
 	/*
 	 * Unlink any remaining node and wait for the last pop or steal
@@ -3608,7 +4180,7 @@ void BPF_STRUCT_OPS(infinity_cgroup_move, struct task_struct *p,
 		    struct cgroup *from, struct cgroup *to)
 {
 	task_ctx	   *tctx;
-	inf_cpu_block_t   *blk;
+	inf_cpu_block_t	   *blk;
 	inf_group_entity_t *leaf;
 	struct cgroup	   *cgrp;
 	u64		    cgrp_id;
@@ -3621,6 +4193,15 @@ void BPF_STRUCT_OPS(infinity_cgroup_move, struct task_struct *p,
 	tctx = inf_task_ctx(p);
 	if (!tctx)
 		return;
+
+	/*
+	 * The move settles the current reservation against the old
+	 * ancestry before any queue change. The source value is not carried
+	 * across the parent coordinate.
+	 */
+	inf_settle_slot(p, tctx, inf_slot_event(tctx),
+			inf_resv_local(inf_cpu_ctx(tctx->path_cpu)));
+	INF_STAT_INC(resv_move);
 
 	/* The bandwidth library follows the task to the new cgroup. */
 	ret = scx_cgroup_ctl_move(p, (u64)tctx, from, to, tctx->path_cpu,
@@ -3651,26 +4232,36 @@ void BPF_STRUCT_OPS(infinity_cgroup_move, struct task_struct *p,
 	}
 
 	/* The destination parent. */
-	cgrp = to ? to : inf_task_cgroup(p);
+	cgrp	    = to ? to : inf_task_cgroup(p);
 	leaf_parent = inf_resolve_leaf(blk, cgrp, &cgrp_id);
-	leaf	 = inf_entity(blk, leaf_parent);
+	leaf	    = inf_entity(blk, leaf_parent);
 	if (!leaf)
 		return;
 
-	tctx->parent_idx = leaf_parent;
-	tctx->cgrp_id    = cgrp_id;
+	/* The task now references the destination entity. */
+	inf_task_attach(tctx, blk, cpu, leaf_parent);
+	tctx->cgrp_id = cgrp_id;
 
 	/*
 	 * The task starts at the frontier of the destination parent. The
-	 * source value is not carried across the parent coordinate.
+	 * source value and the source residue are dropped.
 	 */
-	tctx->v_q16 = leaf->frontier_q16;
+	tctx->v_q16	 = leaf->frontier_q16;
+	tctx->rem	 = 0;
 	tctx->queued_cpu = cpu;
-	tctx->path_cpu   = cpu;
-	tctx->state = INF_ENTITY_INACTIVE;
+	tctx->path_cpu	 = cpu;
 
+	/*
+	 * A parked task keeps its parked state and history. It rejoins
+	 * through the bandwidth release path, not from this callback.
+	 */
+	if (tctx->state == INF_ENTITY_PARKED)
+		return;
+
+	tctx->state = INF_ENTITY_INACTIVE;
 	inf_admit_task(blk, tctx, leaf_parent, INF_INS_NORMAL);
 	INF_STAT_INC(cgrp_cpu_moves);
+	INF_STAT_INC(move_admits);
 }
 
 /*
@@ -3682,7 +4273,7 @@ static __noinline int inf_cgroup_state_put(struct cgroup *cgrp, u32 weight,
 					   bool idle)
 {
 	struct inf_cgrp_state st = {};
-	u64			id;
+	u64		      id;
 
 	if (!cgrp)
 		return -EINVAL;
@@ -3693,9 +4284,15 @@ static __noinline int inf_cgroup_state_put(struct cgroup *cgrp, u32 weight,
 
 	st.cgrp_id = id;
 	st.weight  = weight;
-	st.idle    = idle ? 1 : 0;
+	st.idle	   = idle ? 1 : 0;
 	st.present = 1;
 	st.epoch   = scx_cgroup_ctl_epoch();
+	/*
+	 * A cgroup id can be reused. The generation names this control
+	 * entry, so an entity of an earlier cgroup at the same id is known
+	 * to be stale.
+	 */
+	st.gen = __sync_fetch_and_add(&inf_gen_counter, 1) + 1;
 
 	if (bpf_map_update_elem(&cgrp_state_stor, &id, &st, BPF_ANY))
 		INF_STAT_INC(ctl_map_overflow);
@@ -3713,13 +4310,16 @@ s32 BPF_STRUCT_OPS(infinity_cgroup_init, struct cgroup *cgrp,
 	if (ret)
 		return ret;
 
-	return inf_cgroup_state_put(cgrp, args ? args->weight : INF_WEIGHT_DEFAULT,
+	return inf_cgroup_state_put(cgrp,
+				    args ? args->weight : INF_WEIGHT_DEFAULT,
 				    args ? args->sched_idle : false);
 }
 
 void BPF_STRUCT_OPS(infinity_cgroup_exit, struct cgroup *cgrp)
 {
-	u64 id;
+	inf_cpu_block_t *blk;
+	u64		 id;
+	u32		 idx;
 
 	TOUCH_ARENA();
 
@@ -3729,8 +4329,21 @@ void BPF_STRUCT_OPS(infinity_cgroup_exit, struct cgroup *cgrp)
 		return;
 
 	id = inf_cgroup_id(cgrp);
-	if (id)
-		bpf_map_delete_elem(&cgrp_state_stor, &id);
+	if (!id)
+		return;
+
+	bpf_map_delete_elem(&cgrp_state_stor, &id);
+
+	/*
+	 * The exit is the only place that starts a reclaim. The entity of
+	 * this CPU is reclaimed now when it has no reference; the entities
+	 * of other CPUs are reclaimed at their next lookup. A busy entity
+	 * stays dead and is reclaimed when its last reference drops.
+	 */
+	blk = inf_block(bpf_get_smp_processor_id());
+	idx = blk ? inf_index_find(blk, id) : INF_IDX_NONE;
+	if (idx != INF_IDX_NONE)
+		inf_entity_release(blk, idx);
 }
 
 void BPF_STRUCT_OPS(infinity_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
@@ -3803,7 +4416,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init)
 	u32 ncpu = inf_nr_cpu_ids();
 	u32 key, pages;
 	s32 cpu;
-	int ret;
+	int i, ret;
+	u64 t0, t1;
 
 	TOUCH_ARENA();
 
@@ -3811,6 +4425,26 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init)
 		ncpu = INF_MAX_CPUS;
 	if (!ncpu) {
 		scx_bpf_error("infinity: no possible CPUs");
+		return -EINVAL;
+	}
+
+	/*
+	 * The service slot is measured from the scheduler clock. A clock
+	 * that does not advance cannot measure a tick, so the load is
+	 * blocked here instead of scheduling with a fabricated slot. The
+	 * per-CPU tick probe seeds the real slot once tasks run.
+	 */
+	t0 = scx_bpf_now();
+	t1 = t0;
+	bpf_for(i, 0, INF_TICK_PROBE_INIT)
+	{
+		t1 = scx_bpf_now();
+		if (t1 != t0)
+			break;
+	}
+	if (t1 == t0) {
+		scx_bpf_error(
+			"infinity: the scheduler clock does not advance, so the service tick cannot be measured");
 		return -EINVAL;
 	}
 
@@ -3831,7 +4465,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init)
 	 * arena and is never resized; a CPU index selects an entry.
 	 */
 	pages = (ncpu * (u32)sizeof(*inf_blocks) + PAGE_SIZE - 1) / PAGE_SIZE;
-	inf_blocks = bpf_arena_alloc_pages(&arena, NULL, pages, NUMA_NO_NODE, 0);
+	inf_blocks =
+		bpf_arena_alloc_pages(&arena, NULL, pages, NUMA_NO_NODE, 0);
 	if (!inf_blocks) {
 		scx_bpf_error("infinity: failed to allocate %u entity pages",
 			      pages);
@@ -3842,7 +4477,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init)
 	/* The root entity of every CPU is slot 0 and always exists. */
 	bpf_for(cpu, 0, INF_MAX_CPUS)
 	{
-		inf_cpu_block_t	  *blk;
+		inf_cpu_block_t	   *blk;
 		inf_group_entity_t *root;
 
 		if ((u32)cpu >= ncpu)
@@ -3854,8 +4489,8 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init)
 
 		root = inf_entity(blk, 0);
 		__builtin_memset(root, 0, sizeof(*root));
-		root->cgrp_id = 0;
-		root->weight  = INF_WEIGHT_DEFAULT;
+		root->cgrp_id	 = 0;
+		root->weight	 = INF_WEIGHT_DEFAULT;
 		root->parent_idx = 0;
 		root->state	 = INF_ENTITY_RUNNABLE;
 		inf_queue_init(&root->children);
@@ -3875,9 +4510,21 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init)
 			cctx->root_idx		= 0;
 			cctx->depth		= 0;
 			cctx->seq		= 0;
+			cctx->slot_ns		= INF_SLOT_NS;
+			cctx->tick_last		= 0;
+			cctx->tick_deltas	= 0;
+			cctx->tick_min_ns	= 0;
+			cctx->tick_max_ns	= 0;
+			cctx->tick_bad		= 0;
+			cctx->tick_probe	= 0;
 			cctx->steal_llc_cursor	= 0;
 			cctx->steal_node_cursor = 0;
-			cctx->resv.pid		= 0;
+			cctx->resv.task_idx	= 0;
+			cctx->resv.start_now	= 0;
+			cctx->resv.policy_ns	= 0;
+			cctx->resv.slot_ns	= INF_SLOT_NS;
+			cctx->resv.cpu		= 0;
+			cctx->resv.depth	= 0;
 			cctx->resv.flags	= 0;
 		}
 	}

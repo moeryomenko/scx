@@ -52,6 +52,20 @@ typedef signed long    s64;
  */
 #define INF_SETTLE_MAX_NS 4000000ULL
 
+/*
+ * The service slot is measured, not assumed. A local tick records the
+ * scx_bpf_now() delta of the reservation. The first INF_TICK_PROBE_SLOTS
+ * deltas seed the per-CPU slot, and the slot stays inside the bounds
+ * below. A tick that delivers no delta is counted; enough of them block
+ * the run instead of charging a fabricated slot.
+ */
+#define INF_TICK_PROBE_SLOTS 16
+#define INF_TICK_UNMEASURABLE_MAX 32
+#define INF_SLOT_MIN_NS 100000ULL
+#define INF_SLOT_MAX_NS INF_SETTLE_MAX_NS
+/* Bounded probe of the scheduler clock at load time. */
+#define INF_TICK_PROBE_INIT 4096
+
 /* Q16 fixed point service units. */
 #define INF_Q16_SHIFT 16
 
@@ -113,10 +127,15 @@ typedef signed long    s64;
  * scheduler reads it when it latches a group weight and when it refreshes
  * one at an epoch boundary. A cgroup without an entry has the default
  * weight.
+ *
+ * gen is a scheduler-private generation. A cgroup id can be reused after
+ * an exit, so an entity compares gen against the live entry before it
+ * trusts its history.
  */
 struct inf_cgrp_state {
 	u64 cgrp_id;
 	u64 epoch;
+	u64 gen;
 	u32 weight;
 	u32 idle;
 	u32 present;
@@ -248,22 +267,35 @@ struct inf_cfg {
 };
 
 /*
- * The reservation of one running task. One CPU runs one task at a time,
- * so the reservation lives in the per-CPU context. It holds the timing and
- * the two ledgers of the slot. The path the task holds lives in the task
- * context, because a task can change CPU between the settle and the
- * requeue.
+ * The reservation of one running slot. One CPU runs one task at a time,
+ * so the reservation lives in the per-CPU context. It opens in
+ * ops.running() and a settle closes it, so the actual runtime of a slot
+ * is charged exactly once. It cannot open at the dispatch: the core calls
+ * ops.stopping() for the outgoing task after ops.dispatch(), so a
+ * dispatch-time reservation would take the CPU slot before the
+ * predecessor settled its own runtime.
+ *
+ * task_idx is the pid of the reserved task. start_now is the
+ * actual-runtime cursor, set by ops.running(). policy_ns is the policy
+ * service already charged to the path. latched[] is the weight of each
+ * group level at the start of the slot, and ancestry[] is the entity
+ * index of that level, leaf parent first. slot_ns is the reserved slot.
  */
 struct inf_reservation {
+	u64 task_idx;
 	u64 start_now;
-	u64 actual_ns;
 	u64 policy_ns;
 	u64 slot_ns;
-	u32 pid;
+	u64 latched[INF_MAX_LEVELS];
+	u32 ancestry[INF_MAX_LEVELS];
 	u32 cpu;
+	u32 depth;
 	u32 flags;
-	u32 pad;
 };
+
+/* The reservation flags. */
+#define INF_RESV_RUNNING 1U /* start_now holds a valid cursor */
+#define INF_RESV_YIELD 2U /* explicit yield: the policy floor is slot_ns */
 
 /*
  * The path of a selection: the group entities from the leaf parent to the
@@ -279,10 +311,19 @@ struct inf_path {
 
 struct inf_cpu_ctx {
 	struct inf_reservation resv;
-	u64 root_idx;
+	u64		       root_idx;
+	/* The measured service slot of this CPU. */
+	u64 slot_ns;
+	u64 tick_last; /* scx_bpf_now() of the previous local tick */
+	u64 tick_deltas; /* measured local tick deltas */
+	u64 tick_sum_ns;
+	u64 tick_min_ns;
+	u64 tick_max_ns;
+	u64 tick_bad; /* local ticks without a measurable delta */
 	/* The number of dispatchable entities in the tree, advisory. */
 	s64 depth;
 	u32 seq;
+	u32 tick_probe; /* local ticks counted for the slot seed */
 	u32 steal_llc_cursor;
 	u32 steal_node_cursor;
 	u32 online;
@@ -345,24 +386,26 @@ struct inf_task_ctx_layout {
 	u64 slice_ns;
 	u64 last_running_ns;
 	u64 base_weight;
+	u64 pending_weight;
 	u32 path_ent[INF_MAX_LEVELS];
 	s32 queued_cpu;
 	s32 path_cpu;
+	s32 cgrp_cpu;
 	u32 path_depth;
 	u32 state;
 	u32 class;
-	u32 moving;
-	u32 dequeue_pending;
-	u32 exit_pending;
-	u32 reweight_pending;
-	u32 joined;
-	u32 yielded;
-	u32 preempted;
-	u32 wake_fork;
-	u32 idle;
-	u32 pid;
-	u32 pending_event;
-	u32 hist_idx;
+	u32		moving;
+	u32		dequeue_pending;
+	u32		exit_pending;
+	u32		reweight_pending;
+	u32		joined;
+	u32		yielded;
+	u32		preempted;
+	u32		wake_fork;
+	u32		idle;
+	u32		pid;
+	u32		pending_event;
+	u32		hist_idx;
 	struct inf_hist hist[8];
 };
 
@@ -438,6 +481,44 @@ struct inf_stats {
 	u64 disp_affinity_fail;
 	u64 enq_admit_fail;
 	u64 pid_sample;
+	/*
+	 * Reservation, tick, epoch, parking and reclamation counters. Every
+	 * refused, clamped, repaired and failed path has one of these.
+	 */
+	u64 resv_open;
+	u64 resv_settled;
+	u64 resv_closed; /* a settle found the reservation closed */
+	u64 resv_mismatch; /* the reservation belongs to another task */
+	u64 resv_stop;
+	u64 resv_migrate;
+	u64 resv_move;
+	u64 resv_exit;
+	u64 resv_remote;
+	u64 resv_yield; /* explicit yield raised the policy total */
+	u64 resv_yield_extra_ns; /* the difference debited to V */
+	u64 resv_actual_ns; /* total actual runtime of closed slots */
+	u64 resv_policy_ns; /* total policy service of closed slots */
+	u64 tick_measured; /* local ticks with a usable delta */
+	u64 tick_unmeasurable; /* local ticks with no usable delta */
+	u64 tick_probe_done; /* CPUs whose slot seed completed */
+	u64 slot_ns_measured; /* the last seeded slot */
+	u64 slot_ns_min;
+	u64 slot_ns_max;
+	u64 epoch_deferred; /* running task defers a new weight */
+	u64 epoch_applied; /* the deferred weight took effect */
+	u64 park_settled; /* the reservation closed before parking */
+	u64 park_failed; /* put-aside refused, the task stayed queued */
+	u64 unpark_admits; /* a parked task rejoined the tree */
+	u64 entity_ref_busy; /* a reclaim found live references */
+	u64 entity_stale_gen; /* a cgroup id was reused */
+	u64 entity_reuse_busy; /* a stale entity still owns the index */
+	u64 move_admits; /* a cgroup move inserted a task */
+	u64 migrate_admits; /* a CPU migration inserted a task */
+	u64 reclaims_deferred; /* the reclaim waits for the last reference */
+	u64 admit_no_parent; /* an admission found no leaf entity */
+	u64 requeue_no_block; /* a requeue found no entity block */
+	u64 requeue_no_leaf; /* a requeue found no leaf entity */
+	u64 rekey_fail; /* an ancestor re-key could not re-enter its queue */
 };
 
 /*
@@ -530,32 +611,32 @@ struct inf_queue_snap {
 
 /* Exit-time task snapshot, keyed by pid. The last transition is kept. */
 struct inf_task_snap {
-	u64 ts;
-	u64 slice;
-	u64 weight;
-	s32 pid;
-	s32 queued_cpu;
-	s32 group_cpu;
-	u32 state;
-	u32 hold;
-	u32 joined;
-	u32 moving;
-	u32 reweight_pending;
-	u32 dequeue_pending;
-	u32 exit_pending;
-	u32 last_op;
-	s32 last_src;
-	s32 last_dst;
-	s64 last_result;
-	u64 prev_ts;
-	u32 prev_op;
-	u32 prev_state;
-	s32 prev_src;
-	s32 prev_dst;
-	s64 prev_result;
+	u64		ts;
+	u64		slice;
+	u64		weight;
+	s32		pid;
+	s32		queued_cpu;
+	s32		group_cpu;
+	u32		state;
+	u32		hold;
+	u32		joined;
+	u32		moving;
+	u32		reweight_pending;
+	u32		dequeue_pending;
+	u32		exit_pending;
+	u32		last_op;
+	s32		last_src;
+	s32		last_dst;
+	s64		last_result;
+	u64		prev_ts;
+	u32		prev_op;
+	u32		prev_state;
+	s32		prev_src;
+	s32		prev_dst;
+	s64		prev_result;
 	struct inf_hist hist[8];
-	u32 hist_count;
-	u32 pad;
+	u32		hist_count;
+	u32		pad;
 };
 
 /* Controlled-refusal counter for the local DSQ insert regression test. */
