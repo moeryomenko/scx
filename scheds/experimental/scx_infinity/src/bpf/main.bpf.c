@@ -320,7 +320,15 @@ static __always_inline task_ctx *inf_task_ctx_alloc(struct task_struct *p)
 	return (task_ctx *)scx_task_alloc(p);
 }
 
-/* Recover the task context from the queue node embedded in it. */
+/*
+ * Recover the task context from the queue node embedded in it.
+ *
+ * A queue returns the node, not the object that owns it. For a group entity
+ * the node is at offset 0, so the two pointers are equal and the entity
+ * pointer is already the answer. For a task the node sits at
+ * offsetof(struct task_ctx, qnode), and every caller that receives a node
+ * from a queue must subtract that offset before it reads a task field.
+ */
 static __always_inline task_ctx *
 inf_task_from_qnode(scx_edq_task_t *node)
 {
@@ -1384,6 +1392,7 @@ static __noinline bool inf_select_leaf(inf_cpu_block_t *blk,
 	u32	depth = 0;
 	u32	parent = 0;
 	bool	restart = false;
+	int	ret;
 
 	for (attempt = 0; attempt < 4; attempt++) {
 		restart = false;
@@ -1403,9 +1412,31 @@ static __noinline bool inf_select_leaf(inf_cpu_block_t *blk,
 			if (!pe)
 				return false;
 
-			if (inf_band_scan(blk, &pe->children, scratch,
-					  pe->frontier_q16, &vmin, &trunc))
+			ret = inf_band_scan(blk, &pe->children, scratch,
+					    pe->frontier_q16, &vmin, &trunc);
+			if (ret) {
+				/*
+				 * A group entity that sits in its parent queue
+				 * with no dispatchable child is stale. It cannot
+				 * hold the selection, so it leaves the queue and
+				 * the selection starts again. The root is never
+				 * stale: an empty root is an empty tree.
+				 */
+				if (ret == -ENOENT && depth > 0) {
+					inf_group_entity_t *par =
+						inf_entity(blk, pe->parent_idx);
+
+					if (par)
+						inf_queue_remove(&par->children,
+								 &pe->qnode);
+					pe->state = INF_ENTITY_INACTIVE;
+					pe->count = 0;
+					INF_STAT_INC(state_repairs);
+					restart = true;
+					break;
+				}
 				return false;
+			}
 			win = scratch->win;
 
 			path->vmin[depth] = vmin;
@@ -1441,7 +1472,7 @@ static __noinline bool inf_select_leaf(inf_cpu_block_t *blk,
 
 			/* The winner is a task: the leaf of the path. */
 			path->depth = depth;
-			*leaf	  = (task_ctx *)win.task;
+			*leaf	  = inf_task_from_qnode(win.task);
 			inf_queue_drop(win.task);
 			return true;
 		}
@@ -1509,7 +1540,10 @@ static __noinline void inf_admit_task(inf_cpu_block_t *blk, task_ctx *tctx,
 		 * membership would leave the task invisible to the tree,
 		 * so the node is unlinked and the insert is retried.
 		 */
-		inf_queue_node_detach(&tctx->qnode);
+		if (inf_queue_unlink(&tctx->qnode)) {
+			INF_STAT_INC(lost_state_errors);
+			return;
+		}
 		if (inf_queue_insert(&parent->children, &tctx->qnode,
 				     tctx->v_q16)) {
 			INF_STAT_INC(lost_state_errors);
@@ -1584,7 +1618,10 @@ static __noinline void inf_requeue_path(task_ctx *tctx, u32 mode)
 	tctx->class = inf_gate_class(leaf, mode);
 	tctx->tie   = leaf->tie_seq++;
 	if (inf_queue_insert(&leaf->children, &tctx->qnode, tctx->v_q16)) {
-		inf_queue_node_detach(&tctx->qnode);
+		if (inf_queue_unlink(&tctx->qnode)) {
+			INF_STAT_INC(lost_state_errors);
+			return;
+		}
 		if (inf_queue_insert(&leaf->children, &tctx->qnode,
 				     tctx->v_q16)) {
 			INF_STAT_INC(lost_state_errors);
@@ -1596,6 +1633,11 @@ static __noinline void inf_requeue_path(task_ctx *tctx, u32 mode)
 	tctx->queued_cpu = tctx->path_cpu;
 
 	inf_count_up(blk, (u32)tctx->parent_idx, mode);
+	/*
+	 * A dispatch removed the task from the tree and decremented the
+	 * depth. The requeue puts it back, so the depth has to follow.
+	 */
+	inf_depth_add(tctx->queued_cpu, 1);
 }
 
 /* Remove a task from the tree and release the counts below it. */
@@ -1619,7 +1661,7 @@ static __noinline void inf_task_leave_tree(task_ctx *tctx)
 		 * found by the selection with a task that is no longer in
 		 * the tree.
 		 */
-		inf_queue_node_detach(&tctx->qnode);
+		inf_queue_unlink(&tctx->qnode);
 		INF_STAT_INC(state_repairs);
 	}
 	inf_depth_add(tctx->queued_cpu, -1);
@@ -1820,7 +1862,7 @@ static __always_inline u32 inf_slot_event(task_ctx *tctx)
  */
 static __noinline bool inf_wakee_wins(inf_cpu_block_t *blk, task_ctx *tctx)
 {
-	scx_edq_task_t *cand = (scx_edq_task_t *)tctx;
+	scx_edq_task_t *cand = (scx_edq_task_t *)&tctx->qnode;
 	u32		 idx = (u32)tctx->parent_idx;
 	u32		 level;
 
@@ -2495,6 +2537,7 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 	struct task_struct *p;
 	task_ctx	   *tctx = NULL;
 	u32		    i;
+	u32		    leaf_idx;
 	int		    ret;
 
 	if (!blk)
@@ -2506,10 +2549,15 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 		return false;
 
 	/*
-	 * A task that is a direct child of the root cgroup has no group
-	 * level on its path, and the root entity holds it.
+	 * The parent of the selected task is the deepest entity on the
+	 * path, not the first one: a task two cgroup levels below the root
+	 * sits in the child queue of path->ent[1]. A task that is a direct
+	 * child of the root cgroup has no group level on its path, and the
+	 * root entity holds it.
 	 */
-	leaf = inf_entity(blk, path->depth > 0 ? path->ent[0] : 0);
+	leaf_idx = path->depth > 0 ?
+		   path->ent[(path->depth - 1) & (INF_MAX_LEVELS - 1)] : 0;
+	leaf = inf_entity(blk, leaf_idx);
 	if (!leaf)
 		return false;
 
@@ -2554,13 +2602,23 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 		 * task stays runnable either way.
 		 */
 		inf_queue_drop(&tctx->qnode);
-		inf_queue_node_detach(&tctx->qnode);
-		INF_STAT_INC(lost_state_errors);
 		INF_STAT_INC(disp_remove_fail);
-		INF_STAT_INC(state_repairs);
 		if (ret == -EINVAL)
 			INF_STAT_INC(disp_remove_einval);
 		inf_trace(INF_TR_REMOVE_FAIL, tctx, INF_TR_WHERE(cpu, -1), ret);
+		/*
+		 * The node left this queue between the scan and the remove. A
+		 * steal, a yield-to or an enqueue on another CPU owns it now,
+		 * and the owner keeps the task runnable. The selection is
+		 * dropped without touching the node. Only a node with no
+		 * membership is repaired here.
+		 */
+		if (inf_queue_node_owner(&tctx->qnode)) {
+			bpf_task_release(p);
+			return false;
+		}
+		inf_queue_unlink(&tctx->qnode);
+		INF_STAT_INC(state_repairs);
 		if (inf_admit_on_cpu(p, tctx, cpu, INF_INS_NORMAL))
 			INF_STAT_INC(lost_state_errors);
 		bpf_task_release(p);
@@ -2572,7 +2630,7 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 	inf_depth_add(cpu, -1);
 
 	/* The counts below the leaf follow the task. */
-	inf_count_down(blk, path->depth > 0 ? path->ent[0] : 0);
+	inf_count_down(blk, leaf_idx);
 
 	/* The path of the task is held by the task. */
 	tctx->path_depth = path->depth;
@@ -2730,7 +2788,7 @@ static __noinline bool inf_steal_peek(inf_cpu_block_t *pblk,
 
 		if (!inf_node_is_group(pblk, (u64)head)) {
 			path->depth = level;
-			*leaf	  = (task_ctx *)head;
+			*leaf	  = inf_task_from_qnode(head);
 			return true;
 		}
 
@@ -2764,7 +2822,10 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 	u64		    saved_v;
 	u32		    saved_cls;
 	u64		    saved_tie;
+	u64		    saved_parent;
+	u64		    saved_cgrp;
 	u32		    leaf_parent;
+	u32		    sleaf_idx;
 	u64		    cgrp_id;
 	int		    ret;
 
@@ -2815,11 +2876,29 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 		return false;
 	}
 
+	/*
+	 * The source leaf. It is the deepest entity on the peer path: the
+	 * node sits in the child queue of spath->ent[depth - 1]. A peer
+	 * tree whose path has no group level holds the task in the root
+	 * entity, so the index is 0.
+	 */
+	sleaf_idx = spath->depth > 0 ?
+		    spath->ent[(spath->depth - 1) & (INF_MAX_LEVELS - 1)] : 0;
+	sleaf	  = inf_entity(pblk, sleaf_idx);
+	if (!sleaf) {
+		tctx->moving = 0;
+		inf_queue_drop(&tctx->qnode);
+		bpf_task_release(p);
+		INF_STAT_INC(steal_failures);
+		return false;
+	}
+
 	/* The source record is saved before the task leaves the source. */
-	sleaf	 = inf_entity(pblk, spath->ent[0]);
-	saved_v	 = tctx->v_q16;
-	saved_cls = tctx->class;
-	saved_tie = tctx->tie;
+	saved_v		 = tctx->v_q16;
+	saved_cls	 = tctx->class;
+	saved_tie	 = tctx->tie;
+	saved_parent = tctx->parent_idx;
+	saved_cgrp	 = tctx->cgrp_id;
 
 	/* The task leaves the source queue. */
 	ret = inf_queue_remove(&sleaf->children, &tctx->qnode);
@@ -2832,7 +2911,7 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 	}
 	tctx->state	 = INF_ENTITY_HANDOFF;
 	tctx->queued_cpu = -1;
-	inf_count_down(pblk, spath->ent[0]);
+	inf_count_down(pblk, sleaf_idx);
 
 	/* The destination leaf parent. */
 	leaf_parent = inf_resolve_leaf(dblk, inf_task_cgroup(p), &cgrp_id);
@@ -2894,10 +2973,12 @@ restore:
 	tctx->v_q16  = saved_v;
 	tctx->class  = saved_cls;
 	tctx->tie    = saved_tie;
+	tctx->parent_idx = saved_parent;
+	tctx->cgrp_id    = saved_cgrp;
 	tctx->state  = INF_ENTITY_RUNNABLE;
 	tctx->queued_cpu = peer;
 	inf_queue_insert(&sleaf->children, &tctx->qnode, saved_v);
-	inf_count_up(pblk, spath->ent[0], INF_INS_NORMAL);
+	inf_count_up(pblk, sleaf_idx, INF_INS_NORMAL);
 	tctx->moving = 0;
 	INF_STAT_INC(steal_failures);
 	inf_trace(INF_TR_STEAL_SKIP, tctx, INF_TR_WHERE(peer, dst), -1);
@@ -3144,6 +3225,7 @@ void BPF_STRUCT_OPS(infinity_quiescent, struct task_struct *p, u64 deq_flags)
 void BPF_STRUCT_OPS(infinity_set_weight, struct task_struct *p, u32 weight)
 {
 	task_ctx *tctx;
+	s32	    cpu;
 	u32	    new_weight;
 
 	TOUCH_ARENA();
@@ -3172,13 +3254,22 @@ void BPF_STRUCT_OPS(infinity_set_weight, struct task_struct *p, u32 weight)
 	if (tctx->state != INF_ENTITY_RUNNABLE)
 		return;
 
-	/* A queued task re-enters through the normal gate. */
+	/*
+	 * A queued task re-enters through the normal gate. The CPU is read
+	 * before the task leaves the tree: the leave clears queued_cpu, and
+	 * an admission on CPU -1 has no entity block, so the task would be
+	 * dropped from the tree while the core still counts it runnable.
+	 */
+	cpu = tctx->queued_cpu;
+	if (cpu < 0)
+		return;
+
 	INF_STAT_INC(reweight_queued);
 	INF_STAT_INC(weight_queued_cpu);
 	inf_task_leave_tree(tctx);
-	inf_admit_task(inf_block(tctx->queued_cpu), tctx,
-		       (u32)tctx->parent_idx, INF_INS_NORMAL);
-	inf_trace(INF_TR_REWEIGHT, tctx, INF_TR_WHERE(tctx->queued_cpu, -1), 0);
+	if (inf_admit_on_cpu(p, tctx, cpu, INF_INS_NORMAL))
+		INF_STAT_INC(lost_state_errors);
+	inf_trace(INF_TR_REWEIGHT, tctx, INF_TR_WHERE(cpu, -1), 0);
 }
 
 /*

@@ -151,3 +151,27 @@ static __always_inline u32 inf_queue_node_hold(scx_edq_task_t __arg_arena *node)
 		return 0;
 	return (u32)node->holdcnt;
 }
+
+/*
+ * Unlink a child from whatever queue holds it, without marking the node
+ * dead.
+ *
+ * inf_queue_node_detach() is the teardown primitive: it marks the node dead
+ * and no later insert can claim it, because scx_edq_insert() refuses a dead
+ * membership with -ECANCELED. A repair of a live node therefore needs the
+ * plain removal of the queue that owns it.
+ *
+ * A node that a teardown already detached carries the dead membership and
+ * holds no queue. Its links are rebuilt so that the node can be inserted
+ * again.
+ */
+static __always_inline int inf_queue_unlink(scx_edq_task_t __arg_arena *node)
+{
+	scx_edq_t *owner = inf_queue_node_owner(node);
+
+	if (owner == (scx_edq_t *)SCX_EDQ_DEAD)
+		return inf_queue_node_init(node);
+	if (!owner)
+		return 0;
+	return inf_queue_remove(owner, node);
+}
