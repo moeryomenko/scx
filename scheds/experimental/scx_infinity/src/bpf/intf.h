@@ -413,15 +413,22 @@ struct inf_dispatch_snap {
 	 * What the core holds for this CPU at the failure. nr_running is
 	 * every task the core counts as queued on this runqueue, in this
 	 * scheduler's tree, in its local DSQ or in no queue at all. The
-	 * tree and the local DSQ are visible to this scheduler, so
-	 * `missing` = nr_running - depth - local_nr is the number of tasks
-	 * that are queued on this CPU and that no scheduler structure
-	 * holds. A nonzero value is a task in core custody with no
-	 * scheduler reference.
+	 * tree and the local DSQ are visible to this scheduler.
+	 *
+	 * A runnable @prev is the third place a counted task can be. The
+	 * core enqueues it after ops.dispatch() returns, so it is outside
+	 * both structures at the failure. The corrected formula is
+	 *
+	 *   missing = nr_running - depth - local_nr - prev_runnable
+	 *
+	 * and a nonzero value is a task in core custody that no scheduler
+	 * structure holds. Without the subtraction the record counts the
+	 * outgoing task as lost and proves nothing.
 	 */
 	u64 core_nr_running;
 	u64 core_local_nr;
 	u64 core_missing;
+	u64 core_prev_runnable; /* @prev was runnable and not yet enqueued */
 	u64 band_full; /* band scans that reached INF_BAND_SCAN_MAX */
 	u64 band_tail_node; /* of those, the first uninspected child */
 	u64 band_tail_null; /* of those, the queue ended at the bound */
@@ -495,6 +502,52 @@ struct inf_core_snap {
 	u64 next; /* records written, index of the next slot */
 	struct inf_core_entry slot[INF_CORE_SNAP_SLOTS];
 };
+
+/*
+ * The last enqueue and the last dispatch submission of one task.
+ *
+ * A task that strands in the core's custody is in no queue of this
+ * scheduler, so no structure of the policy can name it. This record is
+ * written at the enqueue that can strand it, and the watchdog names the
+ * pid, so the two together attribute the loss. The entry is indexed by the
+ * low bits of the pid and carries the whole pid, so a reader rejects an
+ * entry that a colliding task overwrote. The fields separate the ways a
+ * runnable task can be lost:
+ *
+ * - enq_flags and admit_ret: the enqueue. SCX_ENQ_LAST means the core
+ *   re-enqueued the outgoing task after an empty dispatch and needs a
+ *   follow-up scheduling event, and admit_ret is the tree admission
+ *   result of that enqueue.
+ * - dsq_ret: the last local DSQ submission for the task. A refused
+ *   submission leaves the task in this scheduler's hand, not in the
+ *   core's.
+ * - kick: whether the enqueue issued the follow-up event. A LAST enqueue
+ *   with a successful admission and a kick names the event, not the
+ *   enqueue.
+ *
+ * enq_gen counts every enqueue of the task, so a reader can tell whether
+ * the record describes the enqueue that stranded it. A pid with no record
+ * was never enqueued with SCX_ENQ_LAST and never failed an enqueue or a
+ * submission: it lost its ownership some other way.
+ */
+struct inf_enq_rec {
+	u64 ts; /* scx_bpf_now() of the record */
+	u64 enq_flags; /* enq_flags of the recorded enqueue */
+	u64 enq_gen; /* enqueue generation of the task */
+	s64 admit_ret; /* tree admission result, 0 when it entered */
+	s64 dsq_ret; /* last local DSQ submission, 0 on success */
+	s32 pid;
+	u32 state; /* task state at the record */
+	s32 queued_cpu; /* the CPU whose tree holds the task */
+	s32 path_cpu; /* the CPU that owns the held path */
+	u32 kick; /* the enqueue issued the follow-up kick */
+	u32 path_depth; /* group levels of the held path */
+};
+
+/* Task records kept in the pinned map. A power of two, so the pid index
+ * is a mask. A campaign has a few thousand tasks and only the enqueues
+ * that can strand one take a record. */
+#define INF_ENQ_SNAP_MAX 2048
 
 struct inf_cpu_ctx {
 	struct inf_reservation resv;
@@ -607,6 +660,16 @@ struct inf_task_ctx_layout {
 	u32		pending_event;
 	u32		hist_idx;
 	struct inf_hist hist[8];
+	/*
+	 * The enqueue and submission record of this task. enq_gen counts
+	 * every enqueue, so a published record of inf_enq_rec can be told
+	 * apart from a later enqueue. last_dsq_ret is the result of the last
+	 * local DSQ submission for the task: a nonzero value means the core
+	 * refused it, so the task never entered a core queue.
+	 */
+	u64 enq_gen;
+	u64 last_enq_flags;
+	s64 last_dsq_ret;
 };
 
 struct inf_stats {
@@ -646,6 +709,21 @@ struct inf_stats {
 	u64 exit_passes;
 	u64 enq_no_ctx;
 	u64 enq_no_cctx;
+	/*
+	 * The follow-up event of an SCX_ENQ_LAST admission. The core
+	 * re-enqueues the outgoing runnable task with that flag after an
+	 * empty dispatch and keeps the CPU only if the scheduler asks for
+	 * another dispatch, so an admission without the kick ends the
+	 * dispatch loop and the task waits for the watchdog. enq_last counts
+	 * the flag, enq_last_kicks counts the deferred kicks issued for it,
+	 * and enq_records counts the records published to enq_stor.
+	 */
+	u64 enq_last;
+	u64 enq_last_kicks;
+	u64 enq_records;
+	/* The SCX_ENQ_LAST enqueues that left by the exit and park paths. */
+	u64 enq_last_exit;
+	u64 enq_last_park;
 	u64 stale_requeues;
 	u64 stale_skips;
 	/* Dispatch outcome and normalizer, for the share diagnosis. */

@@ -177,6 +177,31 @@ struct {
 } csnap_stor SEC(".maps");
 
 /*
+ * The last enqueue and the last dispatch submission of one task, indexed
+ * by the low bits of the pid and pinned like the core snapshot.
+ *
+ * A task that strands in the core's custody is in no queue of this
+ * scheduler, and an idle CPU runs no per-task callback, so the policy
+ * structures cannot name it. This record is written at the enqueue that
+ * can strand it and the watchdog names the pid, so the two together
+ * attribute the loss to the enqueue, to the dispatch submission, or to a
+ * missing follow-up event.
+ *
+ * The key is the pid with the low bits of the map size, and the record
+ * carries the full pid, so a reader can reject an entry that a colliding
+ * task overwrote. The record is written for an SCX_ENQ_LAST enqueue and
+ * for an enqueue or hand-back that failed. A pid with no record was
+ * enqueued normally and lost its ownership some other way.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, INF_ENQ_SNAP_MAX);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+	__type(key, u32);
+	__type(value, struct inf_enq_rec);
+} enq_stor SEC(".maps");
+
+/*
  * One group entity of the tree.
  *
  * The node is at offset 0, so a queue that holds group entities returns
@@ -374,6 +399,15 @@ struct task_ctx {
 	u32 pending_event; /* the event of the ending slot */
 	u32 hist_idx;
 	struct inf_hist hist[8];
+	/*
+	 * The enqueue and submission record. enq_gen counts every enqueue so
+	 * a published inf_enq_rec can be told apart from a later one, and
+	 * last_dsq_ret keeps the result of the last local DSQ submission for
+	 * this task.
+	 */
+	u64 enq_gen;
+	u64 last_enq_flags;
+	s64 last_dsq_ret;
 };
 
 typedef struct task_ctx __arena task_ctx;
@@ -1731,7 +1765,7 @@ static __always_inline void inf_gate_commit(inf_group_entity_t *parent,
 }
 
 /* Insert a group entity into the queue of its parent. */
-static __always_inline int inf_link_entity(inf_cpu_block_t	  *blk,
+static __always_inline int inf_link_entity(inf_cpu_block_t    *blk,
 					   inf_group_entity_t *e, u32 mode)
 {
 	inf_group_entity_t *par = inf_entity(blk, e->parent_idx);
@@ -2397,7 +2431,7 @@ static __always_inline void inf_depth_add(s32 cpu, s64 delta)
  */
 static __always_inline void inf_refresh_weight(inf_group_entity_t *e);
 
-static __noinline void	    inf_admit_task(inf_cpu_block_t *blk, task_ctx *tctx,
+static __noinline int	    inf_admit_task(inf_cpu_block_t *blk, task_ctx *tctx,
 					   u32 leaf_parent, u32 mode)
 {
 	inf_group_entity_t *parent = inf_entity(blk, leaf_parent);
@@ -2405,7 +2439,7 @@ static __noinline void	    inf_admit_task(inf_cpu_block_t *blk, task_ctx *tctx,
 	if (!parent) {
 		INF_STAT_INC(admit_no_parent);
 		INF_STAT_INC(lost_state_errors);
-		return;
+		return -EINVAL;
 	}
 
 	/* A dormant or queued group refreshes before the next charge. */
@@ -2422,12 +2456,12 @@ static __noinline void	    inf_admit_task(inf_cpu_block_t *blk, task_ctx *tctx,
 		 */
 		if (inf_queue_unlink(&tctx->qnode)) {
 			INF_STAT_INC(lost_state_errors);
-			return;
+			return -EINVAL;
 		}
 		if (inf_q_insert(&parent->children, &tctx->qnode,
 				 tctx->v_q16)) {
 			INF_STAT_INC(lost_state_errors);
-			return;
+			return -EINVAL;
 		}
 		INF_STAT_INC(state_repairs);
 	}
@@ -2450,6 +2484,7 @@ static __noinline void	    inf_admit_task(inf_cpu_block_t *blk, task_ctx *tctx,
 		     inf_queue_node_owner(&parent->qnode) != &par->children))
 			INF_STAT_INC(admit_unlinked);
 	}
+	return 0;
 }
 
 /*
@@ -2498,7 +2533,7 @@ static __noinline void inf_rekey_ancestors(task_ctx *tctx, bool new_record,
  * The path of a task re-enters the tree. The leaf task and every ancestor
  * on the path take their own insertion class in their own parent queue.
  */
-static __noinline void inf_requeue_path(task_ctx *tctx, u32 mode)
+static __noinline int inf_requeue_path(task_ctx *tctx, u32 mode)
 {
 	inf_cpu_block_t	   *blk = inf_block(tctx->path_cpu);
 	inf_group_entity_t *leaf;
@@ -2506,14 +2541,14 @@ static __noinline void inf_requeue_path(task_ctx *tctx, u32 mode)
 	if (!blk) {
 		INF_STAT_INC(requeue_no_block);
 		INF_STAT_INC(lost_state_errors);
-		return;
+		return -EINVAL;
 	}
 
 	leaf = inf_entity(blk, (u32)tctx->parent_idx);
 	if (!leaf) {
 		INF_STAT_INC(requeue_no_leaf);
 		INF_STAT_INC(lost_state_errors);
-		return;
+		return -EINVAL;
 	}
 
 	inf_rekey_ancestors(tctx, true, mode);
@@ -2524,11 +2559,11 @@ static __noinline void inf_requeue_path(task_ctx *tctx, u32 mode)
 	if (inf_q_insert(&leaf->children, &tctx->qnode, tctx->v_q16)) {
 		if (inf_queue_unlink(&tctx->qnode)) {
 			INF_STAT_INC(lost_state_errors);
-			return;
+			return -EINVAL;
 		}
 		if (inf_q_insert(&leaf->children, &tctx->qnode, tctx->v_q16)) {
 			INF_STAT_INC(lost_state_errors);
-			return;
+			return -EINVAL;
 		}
 		INF_STAT_INC(state_repairs);
 	}
@@ -2541,6 +2576,7 @@ static __noinline void inf_requeue_path(task_ctx *tctx, u32 mode)
 	 * depth. The requeue puts it back, so the depth has to follow.
 	 */
 	inf_depth_add(tctx->queued_cpu, 1);
+	return 0;
 }
 
 /* Remove a task from the tree and release the counts below it. */
@@ -3491,8 +3527,48 @@ static __noinline int inf_admit_on_cpu(struct task_struct *p, task_ctx *tctx,
 		tctx->epoch	     = scx_cgroup_ctl_epoch();
 	}
 
-	inf_admit_task(blk, tctx, leaf_parent, mode);
-	return 0;
+	return inf_admit_task(blk, tctx, leaf_parent, mode);
+}
+
+/*
+ * Publish the enqueue record of @tctx.
+ *
+ * The record is keyed by the low bits of the pid because the watchdog
+ * names a stranded task by pid and an idle CPU holds no pointer to it; the
+ * record carries the whole pid, so an entry that a colliding task
+ * overwrote is recognisable. It is written for the enqueues that can
+ * strand a task: one that carries SCX_ENQ_LAST, one whose tree admission
+ * failed, and a refused hand-back. A task enqueued normally and lost some
+ * other way keeps no record here, which is itself the attribution.
+ *
+ * The fields are stored through the map value pointer, not through an
+ * update of a stack buffer: the enqueue and the dispatch programs sit
+ * close to the verifier instruction budget, and a stack buffer with an
+ * update call costs far more than the field stores.
+ */
+static __noinline void inf_enq_note(task_ctx *tctx, u64 enq_flags,
+				    s64 admit_ret, u32 kick)
+{
+	struct inf_enq_rec *r;
+	u32		   key = tctx->pid & (INF_ENQ_SNAP_MAX - 1);
+
+	r = bpf_map_lookup_elem(&enq_stor, &key);
+	if (!r)
+		return;
+
+	r->ts		 = scx_bpf_now();
+	r->enq_flags	 = enq_flags;
+	r->enq_gen	 = tctx->enq_gen;
+	r->admit_ret	 = admit_ret;
+	r->dsq_ret	 = tctx->last_dsq_ret;
+	r->pid		 = (s32)tctx->pid;
+	r->state	 = tctx->state;
+	r->queued_cpu	 = tctx->queued_cpu;
+	r->path_cpu	 = tctx->path_cpu;
+	r->kick		 = kick;
+	r->path_depth	 = tctx->path_depth;
+
+	INF_STAT_INC(enq_records);
 }
 
 /*
@@ -3506,6 +3582,7 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 	task_ctx	*tctx;
 	u32		 mode;
 	s32		 cpu;
+	u32		 this_cpu;
 	int		 ret;
 	bool		 was_parked = false;
 	bool		 fresh	    = false;
@@ -3515,9 +3592,10 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 
 	TOUCH_ARENA();
 
-	cpu = scx_bpf_task_cpu(p);
+	this_cpu = bpf_get_smp_processor_id();
+	cpu	 = scx_bpf_task_cpu(p);
 	if (cpu < 0 || (u32)cpu >= inf_nr_cpu_ids())
-		cpu = bpf_get_smp_processor_id();
+		cpu = this_cpu;
 	if (cpu < 0 || (u32)cpu >= inf_nr_cpu_ids())
 		return -EINVAL;
 
@@ -3542,6 +3620,16 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 			cc->enq_calls++;
 	}
 
+	/*
+	 * The enqueue generation. Every enqueue advances it, so a published
+	 * record of inf_enq_rec can be told apart from a later enqueue of
+	 * the same task, and the enqueue that stranded it stays named.
+	 */
+	tctx->enq_gen++;
+	tctx->last_enq_flags = enq_flags;
+	if (enq_flags & SCX_ENQ_LAST)
+		INF_STAT_INC(enq_last);
+
 	inf_trace(INF_TR_ENQ_ENTER, tctx,
 		  INF_TR_WHERE(cpu, bpf_get_smp_processor_id()), enq_flags);
 
@@ -3552,6 +3640,8 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 	 * to the local DSQ now, while the task pointer is valid.
 	 */
 	if ((p->flags & PF_EXITING) || tctx->state == INF_ENTITY_EXITING) {
+		if (enq_flags & SCX_ENQ_LAST)
+			INF_STAT_INC(enq_last_exit);
 		/*
 		 * The slot is settled and the queue membership is dropped
 		 * before the task is handed to the local DSQ, so a dead
@@ -3563,10 +3653,18 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 		tctx->queued_cpu = -1;
 		tctx->state	 = INF_ENTITY_EXITING;
 		inf_trace(INF_TR_EXIT_PASS, tctx, INF_TR_WHERE(cpu, cpu), 3);
-		if (scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0))
+		if (scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0)) {
 			INF_STAT_INC(exit_passes);
-		else
+		} else {
+			/*
+			 * The core refused the hand-back. The task stays in
+			 * this scheduler's hand, so the submission is the
+			 * recorded cause and not a lost task.
+			 */
 			INF_STAT_INC(lost_state_errors);
+			tctx->last_dsq_ret = -EAGAIN;
+			inf_enq_note(tctx, enq_flags, 0, 0);
+		}
 		return 0;
 	}
 
@@ -3580,6 +3678,8 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 		ret = scx_cgroup_ctl_throttled(p, (u64)tctx);
 		if (ret == -EAGAIN) {
 			if (!scx_cgroup_ctl_put_aside(p, (u64)tctx, 0)) {
+				if (enq_flags & SCX_ENQ_LAST)
+					INF_STAT_INC(enq_last_park);
 				inf_settle_slot(p, tctx, inf_slot_event(tctx),
 						bpf_get_smp_processor_id() ==
 							tctx->path_cpu);
@@ -3611,7 +3711,9 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 	    tctx->path_cpu == cpu) {
 		u32  event = inf_slot_event(tctx);
 		u32  mode  = inf_event_mode(event);
-		bool local = bpf_get_smp_processor_id() == cpu;
+		bool local = this_cpu == cpu;
+		s64  admit;
+		u32  kick = 0;
 
 		/*
 		 * The settle closes the reservation. The tick already
@@ -3619,7 +3721,7 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 		 */
 		inf_settle_slot(p, tctx, event, local);
 
-		inf_requeue_path(tctx, mode);
+		admit		    = inf_requeue_path(tctx, mode);
 		tctx->pending_event = INF_EV_NONE;
 		tctx->yielded	    = 0;
 		tctx->preempted	    = 0;
@@ -3631,14 +3733,28 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 			  INF_TR_WHERE(tctx->path_cpu, cpu), (s64)event);
 		inf_resolve_pending(tctx);
 		/*
-		 * The path re-entered the tree of @cpu. When this callback
-		 * runs on another CPU, the owner of that tree can be idle,
-		 * and an idle CPU has nothing to wake it: a task that
-		 * re-enters without a kick waits for the watchdog. The
-		 * admission below kicks for the same reason.
+		 * The path re-entered the tree of @cpu, and nothing of the
+		 * core asks that CPU for another dispatch. Two cases need a
+		 * deferred kick of that CPU:
+		 *
+		 * - The callback ran on another CPU. The owner of the tree
+		 *   can be idle, and an idle CPU has nothing to wake it.
+		 * - The enqueue carries SCX_ENQ_LAST. The core re-enqueues
+		 *   the outgoing runnable task that way after a dispatch
+		 *   that handed out nothing, and it keeps the CPU only if
+		 *   the scheduler triggers another scheduling event. The
+		 *   path here sits in the tree, not on a local DSQ, so
+		 *   without the kick the CPU goes idle with the task
+		 *   queued and the task waits for the watchdog.
 		 */
-		if (cpu != bpf_get_smp_processor_id())
+		if ((enq_flags & SCX_ENQ_LAST) || !local) {
 			scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+			kick = 1;
+			if (enq_flags & SCX_ENQ_LAST)
+				INF_STAT_INC(enq_last_kicks);
+		}
+		if ((enq_flags & SCX_ENQ_LAST) || admit)
+			inf_enq_note(tctx, enq_flags, admit, kick);
 		return 0;
 	}
 
@@ -3671,7 +3787,10 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 	blk = inf_block(cpu);
 	if (!blk) {
 		INF_STAT_INC(enq_no_cctx);
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+		if (!scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0)) {
+			tctx->last_dsq_ret = -EAGAIN;
+			inf_enq_note(tctx, enq_flags, -EINVAL, 0);
+		}
 		return 0;
 	}
 
@@ -3680,7 +3799,14 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 	if (inf_admit_on_cpu(p, tctx, cpu, mode, fresh)) {
 		INF_STAT_INC(lost_state_errors);
 		INF_STAT_INC(enq_admit_fail);
-		scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0);
+		if (!scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, SCX_SLICE_DFL, 0))
+			tctx->last_dsq_ret = -EAGAIN;
+		/*
+		 * The admission failed, so the task is not in the tree. The
+		 * record names the enqueue, and the DSQ result says whether
+		 * the fallback put the task back into core custody.
+		 */
+		inf_enq_note(tctx, enq_flags, -EINVAL, 0);
 		return 0;
 	}
 
@@ -3697,10 +3823,24 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 	inf_trace(INF_TR_INSERT, tctx, INF_TR_WHERE(-1, cpu),
 		  tctx->class == INF_CLASS_TAIL ? 1 : 0);
 
-	if (enq_flags & SCX_ENQ_WAKEUP)
+	/*
+	 * The tree of @cpu now holds the task. A wakeup and a remote
+	 * callback both need the owner of that tree to dispatch again, and
+	 * so does an SCX_ENQ_LAST enqueue: the core hands the outgoing task
+	 * back that way after a dispatch that handed out nothing, and it
+	 * returns the CPU to idle unless the scheduler asks for another
+	 * scheduling event. This task sits in the tree, not on a local DSQ,
+	 * so the kick is the only thing that brings it back.
+	 */
+	if ((enq_flags & SCX_ENQ_WAKEUP) || (enq_flags & SCX_ENQ_LAST) ||
+	    cpu != this_cpu) {
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
-	else if (cpu != bpf_get_smp_processor_id())
-		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);
+		if (enq_flags & SCX_ENQ_LAST)
+			INF_STAT_INC(enq_last_kicks);
+	}
+
+	if (enq_flags & SCX_ENQ_LAST)
+		inf_enq_note(tctx, enq_flags, 0, 1);
 
 	inf_maybe_preempt(p, cpu, enq_flags);
 	return 0;
@@ -3839,14 +3979,14 @@ static __noinline void inf_snap_core(s32 cpu, u32 tag, bool running_self)
 	 * reference: nothing in this scheduler can select it again.
 	 */
 	{
-		s64 missing = (s64)nr_running - (s64)e->depth -
-			      (s64)local_nr - (running_self ? 1 : 0);
+		s64 missing = (s64)nr_running - (s64)e->depth - (s64)local_nr -
+			      (running_self ? 1 : 0);
 
 		e->stranded = missing > 0 ? (u32)missing : 0;
 	}
-	e->curr_idle	= 0;
-	e->curr_pid	= -1;
-	e->curr_slice	= 0;
+	e->curr_idle  = 0;
+	e->curr_pid   = -1;
+	e->curr_slice = 0;
 	if (rq && rq->curr) {
 		e->curr_pid   = rq->curr->pid;
 		e->curr_slice = READ_ONCE(rq->curr->scx.slice);
@@ -3941,20 +4081,40 @@ static __noinline void inf_snap_selection(s32 cpu, inf_cpu_block_t *blk)
 	 * What the core counts for this CPU. A dispatch runs on an idle
 	 * CPU that has queued tasks, so the task that is running here
 	 * contributes nothing: the idle task is not one of ours.
+	 *
+	 * A runnable @prev is the exception. The core keeps it counted on
+	 * this runqueue and enqueues it only after ops.dispatch() returns,
+	 * so it is outside the tree and outside the local DSQ while this
+	 * record is taken. Subtracting it is what makes a nonzero
+	 * core_missing mean a task in core custody: without the
+	 * subtraction, the outgoing task alone fills the count and the
+	 * record proves nothing.
 	 */
 	{
-		struct rq *rq  = scx_bpf_locked_rq();
-		u64	   nr  = 0;
-		u64	   loc = 0;
+		struct rq *rq	    = scx_bpf_locked_rq();
+		u64	   nr	    = 0;
+		u64	   loc	    = 0;
+		u64	   prev_run = 0;
 		s64	   missing;
 
 		if (rq) {
 			nr  = rq->scx.nr_running;
 			loc = rq->scx.local_dsq.nr;
 		}
-		snap->core_nr_running = nr;
-		snap->core_local_nr   = loc;
-		missing = (s64)nr - (s64)snap->depth - (s64)loc;
+		/*
+		 * The task the core switches out is rq->curr here, and it
+		 * is still runnable when SCX_TASK_QUEUED is set: the core
+		 * enqueues it only after this callback returns, so it
+		 * counts on the runqueue while no queue of this scheduler
+		 * holds it.
+		 */
+		if (rq && rq->curr && rq->curr != rq->idle &&
+		    (rq->curr->scx.flags & SCX_TASK_QUEUED))
+			prev_run = 1;
+		snap->core_nr_running	 = nr;
+		snap->core_local_nr	 = loc;
+		snap->core_prev_runnable = prev_run;
+		missing = (s64)nr - (s64)snap->depth - (s64)loc - (s64)prev_run;
 		snap->core_missing = missing > 0 ? (u64)missing : 0;
 	}
 
@@ -4033,6 +4193,10 @@ static __noinline void inf_snap_selection(s32 cpu, inf_cpu_block_t *blk)
 /*
  * Select the leaf task of this CPU's tree and hand it to the local DSQ.
  * The path of the task leaves the tree and is held by the reservation.
+ *
+ * The failure snapshot of the selection subtracts the task the core is
+ * switching out: it is counted on this runqueue but is enqueued only after
+ * this call returns.
  */
 static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 {
@@ -4288,15 +4452,20 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 	if (!scx_bpf_dsq_insert(p, SCX_DSQ_LOCAL, tctx->slice_ns, 0)) {
 		/*
 		 * The core refused the local insert. Put the path back
-		 * instead of dropping a runnable task.
+		 * instead of dropping a runnable task. The refusal is the
+		 * submission result that the task record carries: the task
+		 * is back in the tree, so the record names the submission,
+		 * not the enqueue, as what happened.
 		 */
 		inf_trace(INF_TR_DSQ_REFUSED, tctx, INF_TR_WHERE(cpu, cpu), 0);
 		INF_STAT_INC(disp_dsq_fail);
+		tctx->last_dsq_ret = -EAGAIN;
 		inf_requeue_path(tctx, INF_INS_TAIL);
 		bpf_task_release(p);
 		inf_queue_drop(&tctx->qnode);
 		return false;
 	}
+	tctx->last_dsq_ret = 0;
 	inf_trace(INF_TR_DSQ_OK, tctx, INF_TR_WHERE(cpu, cpu), 0);
 
 	bpf_task_release(p);
