@@ -4,12 +4,12 @@ Experimental sched_ext scheduler for the Infinity fair policy.
 
 **Status: experimental. Not ready for general use.**
 
-The current tree implements revision 2 of
-`.agent/tasks/spec/spec.md`. Revision 4 is the frozen target. It replaces
-the flat per-CPU queue and weighted quantum with a per-CPU hierarchical
-entity tree, per-level normalized service and one kernel tick per service
-slot. The code and the tests below do not implement revision 4 yet. The
-limitations at the end of this file remain current until they do.
+The tree implements revision 4.1 of `.agent/tasks/spec/spec.md`. The
+policy carrier is one hierarchical entity tree per CPU, per-level
+normalized service and one service slot per measured kernel tick. Spec
+section 2.11 records every limit that the BPF verifier and the shared
+code forced. The "Limits" section below repeats those numbers, and a
+reader must not read a larger capability into this binary.
 
 ## Scope
 
@@ -18,26 +18,6 @@ The scheduler replaces the fair class for `SCHED_NORMAL`, `SCHED_BATCH`,
 and `cpu.max` (quota, period and burst) from cgroup v2. Placement is
 locality-first across the previous CPU, the local LLC, the local NUMA
 node and a capacity-ranked remote CPU.
-
-Revision 3 specifies one scheduler-owned queue per CPU. A sched_ext
-local DSQ runs only the task that the scheduler selected. The ready
-queue, its holds and its exact removal stay under scheduler control. The
-default queue is `scx_edq` from `scheds/include/lib/edq.h`. A FIFO
-intrusive list is a second prototype behind the `queue-list` build
-feature. It exists to measure the queue cost. EDQ wins a correctness tie
-because it provides a hold count and exact node removal.
-
-The queue choice was measured. Six ten-minute mixed-load campaigns ran
-on two restored guests, three per build, with the same configuration and
-the same workload. Both builds were correct, with no lost task, no stall
-and no lost trace record. Every measured difference was smaller than the
-run-to-run spread, so EDQ stays the default and the FIFO list stays a
-prototype. The measurement, the selection rule and the rejected
-variants are in `.agent/tasks/queue-selection/evidence.md`.
-
-Dispatch in revision 3 steals from same-LLC peer queues first, then from
-same-NUMA peers, with a rotating cursor and at most eight peers per
-tier. It does not steal across a NUMA node.
 
 Out of scope:
 
@@ -49,62 +29,119 @@ Out of scope:
 - Sub-schedulers, the cid form and `scx_prio`.
 - Live CPU hotplug. A CPU set change needs a scheduler restart.
 
-## Overview
+## Policy
 
-`scx_infinity` is a root scheduler that replaces the fair class for
-`SCHED_NORMAL`, `SCHED_BATCH`, `SCHED_IDLE` and `SCHED_EXT` tasks. The
-scheduler is split into a BPF program in `src/bpf/main.bpf.c` and a Rust
-loader in `src/main.rs`.
+`scx_infinity` is a root scheduler. The scheduler is split into a BPF
+program in `src/bpf/main.bpf.c` and a Rust loader in `src/main.rs`.
 
-The core policy is a bounded last-in-first-out queue:
+### Entity tree
 
-- The current tree uses one vtime-ordered DSQ per CPU. Revision 3 replaces
-  it with a scheduler-owned queue per CPU. The key is a scheduler-owned
-  sequence, not wall time. Head inserts take the next key below
-  `INF_KEY_MID` and tail inserts the next key above it. The queue pops the
-  lowest key, so the newest head insert runs first and a tail insert runs
-  last. A sched_ext local DSQ then runs only the selected task.
-- Eight regular enqueues pass a fixed 7:1 gate. Seven take the head and
+The scheduler owns one entity tree per CPU. Each cgroup level is a node
+in that tree. The direct tasks of a cgroup and its child cgroups are
+weighted siblings in one queue. A task and a child group compete at
+their own level. There is no folded effective weight and no aggregate
+task lane.
+
+Each parent queue is a `scx_edq` from `scheds/include/lib/edq.h`,
+ordered by normalized service. A running task removes its whole path
+from the tree and re-enters that path at the end of each service slot. A
+sched_ext local DSQ runs only the task the scheduler selected, so tree
+membership, holds, removal and ordering stay under scheduler control.
+
+A normal task entity uses `p->scx.weight`. A `SCHED_IDLE` task uses
+weight 3. A group entity uses `cpu.weight`, or weight 3 when the group
+has `cpu.idle=1`. The service charge advances the task entity and every
+ancestor entity, each at its own weight.
+
+### Order and selection
+
+- Eight normal insertions pass a fixed 7:1 gate. Seven take the head and
   one takes the tail, so at most seven normal arrivals move ahead of a
-  queued task between two tail insertions.
-- `SCX_ENQ_HEAD` is the only head-exempt hint. sched_ext has no
-  equivalent of the kernel's `curr == se` exemption. A wakeup passes the
-  same 7:1 gate as any other enqueue and can take the head or the tail
-  slot. An expired slice, a requeue, a forced-progress enqueue and a
-  yield enter at the tail.
-- A service slot ends at the next kernel tick. `ops.tick` settles the
-  running task and re-enters it through the gate, and dispatch sets the
-  slice to one nominal slot as a backstop only. The slot is never derived
-  from a configured quantum. A task under a `cpu.idle` cgroup and a
-  `SCHED_IDLE` task keep the same slot and lose their share through the
-  service order instead.
-- The effective weight folds the cgroup hierarchy in through the shared
-  cgroup control library (`lib/cgroup_ctl.bpf.c`). Every nested
-  `cpu.weight` level scales the task weight by `shares / load`, and any
-  `cpu.idle` group at or above the task uses the `SCHED_IDLE` weight of 3.
-  Revision 3 makes the group load follow runnable tasks, not queue
-  membership, so a running task stays counted. It also refreshes the
-  folded weight at the next enqueue or dispatch after a cgroup change.
-- `cpu.max` quota, period and burst come from the existing bandwidth
-  library (`lib/cgroup_bw.bpf.c`). A task in a throttled group is parked
-  on the library's arena backlog. The library re-enqueues it through the
-  same 7:1 gate when the group gets time again.
-- A fresh wakeup preempts only when the enqueue took a head slot and the
-  victim retains more than the configured preemption margin. The wakeup
-  weight is not a condition, so a lighter wakeup preempts a heavier
-  victim. A wakeup that took a tail slot does not preempt. Yield
-  forfeits the remaining slice and re-enters at the tail. Revision 3 adds
-  a two-argument yield that moves a runnable queued target to the head of
-  its queue and returns true. It refuses a target that is running, in a
-  local DSQ, throttled, exiting or not queued. A task under a `cpu.idle`
-  cgroup never preempts.
-- Revision 3 also moves a queued task on reweight. The task leaves its
-  queue and re-enters through the fixed 7:1 gate, as the reference does.
-  Dispatch pops the local queue, then steals the head of a same-LLC peer
-  queue, then a same-NUMA peer queue, before it renews the previous task.
+  queued entity between two tail insertions.
+- `SCX_ENQ_HEAD` is the only head-exempt hint. A wakeup passes the same
+  gate as any other enqueue. Slice expiry, explicit yield and a partial
+  preemption enter at the tail. A post-slot requeue takes the normal
+  gate at every level.
+- Selection reads the least-service sibling and takes the eligible band
+  of one slot. It prefers the newest head over the oldest tail at the
+  lower service. A head more than one slot ahead is not eligible.
+- A descent removes the selected path and inserts the task into the local
+  DSQ. A refused insert puts the path back instead of dropping the task.
 
-The queue order, the 7:1 gate and the slice-expiry rules are fixed. Only
-the settings below can change at run time.
+### Cgroup controls
+
+`cpu.max` quota, period and burst come from the existing bandwidth
+library (`lib/cgroup_bw.bpf.c`). A task in a throttled group is parked on
+the library's arena backlog and re-enqueued through the same gate when
+the group gets time again. Actual runtime is the only input to `cpu.max`.
+The policy service ledger is separate, so an explicit yield pays for its
+reserved slot in the tree while `cpu.max` sees only real runtime.
+
+`--no-cpu-max` disables the bandwidth library. A kernel without
+`ops.cgroup_set_bandwidth()` clears the same path at load.
+
+## Service slot
+
+One `ops.tick` call is one service slot. The scheduler does not take the
+slot from the configuration. It counts kernel ticks, so the slot is one
+measured kernel tick and there is no quantum to set.
+
+The measurement, one busy task pinned to CPU 0 for 5 s on the
+`CONFIG_HZ=1000` guest:
+
+```
+task_tick_scx n=5001 span_ms=5001.048
+ gap_ms min=0.1760 median=1.0000 p99=1.0250 max=2.8260
+ gaps_gt_1.5ms=3 gaps_gt_2ms=1
+```
+
+The run had function tracing active, which adds overhead. The nominal
+1 ms is the dispatch slice and the band width, not a wall-clock
+promise. A late tick makes the slot longer, and a slice expiry before
+the tick ends it early. `ops.tick` runs only when a task of the
+scheduler's class is the donor of that runqueue, so an idle CPU does not
+deliver it. A `NOHZ_FULL` tick can arrive on another CPU, and that tick
+charges one nominal slot instead of a cross-CPU clock difference.
+
+## Limits
+
+The verifier budget and the shared code set these limits. Spec section
+2.11 gives the reason, the effect and the acceptance criterion of each
+one.
+
+| Object | Limit |
+| --- | --- |
+| cgroup levels per task | 4, not 32 |
+| group entities | 128 per CPU |
+| group index | 256 slots per CPU |
+| task entities | 65536 |
+| band scan | 16 children per queue |
+| steal | 2 peers per LLC or NUMA tier |
+| preemption check | the queue head at each level |
+| `cpu.max` | 2048 cgroups and 32 nesting levels |
+
+A task in a cgroup deeper than four levels joins the deepest ancestor
+that has an entity on that CPU. That ancestor carries its service. When
+the 128 group entities of a CPU are in use, a new group joins the
+nearest ancestor. The scheduler counts `entity_overflow`, and the task
+stays runnable. At 65536 task entities, `ops.init_task()` returns
+`-ENOMEM` and a fork fails. A queue whose service band holds more than
+16 siblings falls back to its head for that selection and counts
+`band_full`.
+
+The arena holds pages on demand. A page request inside the shared
+allocator can fail under fork churn, and the scheduler cannot see that
+request. The failure path calls `scx_bpf_error()` and the scheduler
+aborts. No measured run on the final build reproduced it, and the
+failure is still possible.
+
+A successful `scx_bpf_dsq_insert()` reports that the core accepted the
+request. The core performs the enqueue later, on its own runqueue path.
+It can drop the request if the task or the runqueue changes in the
+window. A dropped request leaves the task in core custody with no
+scheduler reference. The scheduler cannot close that window. It counts
+a refused insert, puts the path back and names the custody state in its
+diagnostic snapshots.
 
 ## Placement
 
@@ -121,16 +158,16 @@ Affinity and cpuset masks limit every step, and an offline CPU is never
 selected. The waker CPU defines the local domain when it is allowed,
 otherwise the previous CPU does.
 
+At dispatch, a CPU whose tree holds no dispatchable task steals the head
+of a same-LLC peer tree, then a same-NUMA peer tree. Each tier probes at
+most two eligible peers from a rotating per-CPU cursor, so a peer outside
+the window is reached on a later dispatch. A peer task that cannot run on
+the stealing CPU is skipped. No steal crosses a NUMA node.
+
 The loader reads `scx_utils::Topology` and fills a scheduler-local BPF
 map with the node, LLC, core, SMT sibling, primary-thread and capacity
 data. The placement policy stays in this scheduler. The shared utilities
 carry none of it.
-
-Revision 3 adds a second placement point at dispatch. When the local
-queue is empty, the CPU steals the head of a same-LLC peer queue, then a
-same-NUMA peer queue. Each tier scans at most eight peers from a rotating
-cursor. A peer head that cannot run on the stealing CPU is skipped, and
-no steal crosses a NUMA node.
 
 ## Build
 
@@ -140,22 +177,14 @@ cargo build -p scx_infinity
 
 The BPF object needs clang 22 or newer and a kernel built with
 `CONFIG_SCHED_CLASS_EXT`. The scheduler uses the BPF arena and the
-shared cgroup libraries. Revision 3 also needs BPF arena support and the
-sched_ext cgroup callbacks. The VM preflight checks both:
+shared cgroup libraries. The VM preflight checks both:
 
 ```
 sudo ./scripts/infinity_vm_preflight.sh
 ```
 
-The default queue is EDQ. The FIFO measurement prototype builds with:
-
-```
-cargo build -p scx_infinity --features queue-list
-```
-
-The FIFO prototype stays a measurement prototype. The measured
-comparison found no gain over the run-to-run noise, so it is not the
-default.
+EDQ is the only queue backend. The tree has no queue build feature and
+no second queue source.
 
 For a release binary:
 
@@ -207,20 +236,18 @@ scx_infinity [--config PATH] [--exit-dump-len N]
   same path automatically.
 - `--verbose`: enable libbpf and loader diagnostics.
 - `--version`: print the scheduler version and exit.
-- `--trace`: diagnostic only. Record queue transitions and the last eight
-  transitions of every task, and print the trace ring, the per-CPU queue
-  snapshot and the task snapshot when the scheduler exits. The trace is
-  off by default. A trace record carries the operation, the task id, the
-  source and destination CPU, the queue state, the node hold count, the
-  group CPU, the slice and the result.
+- `--trace`: diagnostic only. Record the anomalous queue transitions and
+  the last eight transitions of every task. Print the trace ring, the
+  per-CPU snapshot and the task snapshot when the scheduler exits. The
+  trace is off by default.
 - `--test-dsq-refuse N`: diagnostic only, hidden. Refuse the first N
   local DSQ inserts without calling the kernel, so the requeue fallback
-  runs deterministically.
+  runs deterministically. Requires `--trace` for the transition records.
 
 `--quantum-us` was removed in revision 4. The option is hidden, and a
 run that still passes it stops with a message that names the revision-4
-change. The service slot is one kernel tick, so there is no quantum to
-set.
+change. The service slot is one measured kernel tick, so there is no
+quantum to set.
 
 Run it as root. Press Ctrl-C to unregister the scheduler.
 
@@ -258,29 +285,6 @@ There is no quantum key. A revision-3 file that still sets `quantum_ns`
 is rejected as a whole, with the key name, the revision-4 reason and the
 allowed keys in the error. The key is never accepted and ignored.
 
-## Service slot
-
-One `ops.tick` call is one service slot. The scheduler does not take the
-slot from the configuration: it counts kernel ticks, and the tick rate is
-measured at run time. On the `CONFIG_HZ=1000` guest the measured rate is
-about 1000 ticks per second, so the nominal slot is 1 ms.
-
-The measurement, one busy task pinned to CPU 0 for 5 s:
-
-```
-task_tick_scx n=5001 span_ms=5001.048
- gap_ms min=0.1760 median=1.0000 p99=1.0250 max=2.8260
- gaps_gt_1.5ms=3 gaps_gt_2ms=1
-```
-
-The run had function tracing active, which adds overhead. The nominal
-1 ms is the dispatch slice and the band width, not a wall-clock promise:
-a late tick makes the slot longer, and a slice expiry before the tick
-ends it early. `ops.tick` runs only when a task of the scheduler's class
-is the donor of that runqueue, so an idle CPU does not deliver it. A
-`NOHZ_FULL` tick can arrive on another CPU, and that tick charges one
-nominal slot instead of a cross-CPU clock difference.
-
 ## Reload
 
 Send `SIGHUP` to reread the same path:
@@ -298,21 +302,28 @@ change on reload.
 
 ## Statistics
 
-The loader prints one line per second:
+The loader prints one line per second. The fields, abbreviated:
 
 ```
 inserts: head=... tail=... exempt=... expiries=... preemptions=... yields=... depth=...
-cgrp: throttled=... reenqueued=... eff_weight=... scale_q10=...
+cgrp: throttled=... reenqueued=... ...
+queue: steals=... llc=... node=... yield_to=... reweight=... stale=... lost=...
+disp: pop=... renew=... total=... q=... path: link_lost=... count_lost=...
+unowned: run=... stop=... ...
 ```
 
 `head_inserts` and `tail_inserts` count all enqueues that pass the 7:1
 gate, including wakeups, so their ratio approaches 7:1. `exempt_inserts`
-counts only `SCX_ENQ_HEAD` hints, expiries, requeues and forced progress.
-`depth` sums the per-CPU queue depths when the line is printed.
+counts only `SCX_ENQ_HEAD` hints. `depth` sums the per-CPU tree depths
+when the line is printed.
 
-The cgroup part counts `cpu.max` throttled enqueues and reenqueues, and
-reports the largest effective group weight and folded group scale seen on
-any CPU. `scale_q10` is the shares/load product in 1/1024 units.
+The cgroup part counts `cpu.max` throttled enqueues and reenqueues. The
+weight-library part prints the counters of the shared control map. The
+queue part counts steals per tier, yield-to and reweight moves, stale
+pops and `lost_state_errors`. The dispatch and path part counts pops,
+renewals, the `state_repairs` counter and the reservation counters. A
+campaign requires `lost`, `stale`, `link_lost` and
+`count_lost` to stay at zero.
 
 ## Test harnesses
 
@@ -376,8 +387,8 @@ one CPU, so the cases contend. Five trials each cover:
 - A live change from 100:100 to 100:200 after the first window.
 - `cpu.idle` 1, then 0, then 1, with progress after the normal worker
   stops.
-- `cpu.max` `50000 100000`, expected 45 to 55 percent and rising
-  `nr_throttled` and `throttled_usec`.
+- `cpu.max` `50000 100000`, expected 45 to 55 percent and a rising
+  scheduler throttle counter.
 - `cpu.max.burst` 40000 after an underspend, expected a short burst above
   quota.
 
@@ -405,10 +416,10 @@ Directed yield is reachable from user space only through KVM. Without
 workload passes the command that triggers the directed yield.
 
 `--mixed` runs every workload class at once for `--duration` and is the
-stall campaign: a ten-minute run (`--duration 600`) exercises CPU burn,
+stall campaign. A ten-minute run (`--duration 600`) exercises CPU burn,
 sleepers, fork and exec, affinity changes, migrations, `sched_yield`, a
 nice change and two live `cpu.weight` writes together. Every worker must
-report `done=1` with non-zero CPU time, and the run fails on a stall, a
+report `done=1` with non-zero CPU time. The run fails on a stall, a
 watchdog line, a lost or stale task or a worker that did not progress.
 
 `--trace` loads the scheduler with its diagnostic transition trace. The
@@ -419,7 +430,7 @@ cannot claim complete transition evidence. `--dump-dir DIR` copies the
 scheduler log, dmesg and every worker log out of the temporary directory,
 which is needed when a run aborts. `--test-dsq-refuse N` arms N
 controlled local-DSQ insert refusals, so the requeue fallback runs
-without a kernel refusal; the mixed phase then requires the `requeues`
+without a kernel refusal. The mixed phase then requires the `requeues`
 counter to reach N with `lost=0`.
 
 ### Two-node placement
@@ -450,85 +461,61 @@ unknown argument and fails closed on a host.
 
 This tree does not claim performance parity with native Infinity. The
 benchmark comparator runs a different kernel, so a cross-kernel result
-is directional, not a controlled A/B test. Revision 3 has no numeric
-performance regression gate. Correctness is the release gate. The EDQ
-default and the FIFO prototype are measured only to choose between them.
-A performance difference alone does not change the default unless the
-FIFO prototype also passes every case.
-
-## Unverified: multi-node NUMA
-
-The placement code reads the node distance matrix, ranks remote nodes
-and places tasks across nodes. Only a single-node host ran this
-scheduler. Revision 3 adds a two-node vNUMA VM test plan. It includes
-the preflight, the local-first placement check and the rule that a steal
-never crosses a node. Real hardware and a node hotplug remain unverified.
+is directional, not a controlled A/B test. Revision 4 has no numeric
+performance regression gate. Correctness is the release gate.
 
 ## Requirements
 
 Linux with `sched_ext` enabled (`CONFIG_SCHED_CLASS_EXT`), BPF arena
 support, and the sched_ext cgroup callbacks. Run
 `scripts/infinity_vm_preflight.sh` in the guest to check them. Build with
-`cargo build -p scx_infinity`. The FIFO prototype needs the `queue-list`
-Cargo feature.
+`cargo build -p scx_infinity`.
 
 ## Deviations from the reference
 
-The reference is the Infinity 7.2.6-7 fair patch. These are the
-behaviors of the current revision 2 tree. Revision 3 specifies the fix
-for the first three and for the cgroup gap in the last item. The fixes
-are not implemented yet:
+The reference is the Infinity 7.2.6-7 fair patch. Spec section 2.10
+lists the differences in policy, and spec section 2.11 lists the limits
+that the verifier and the shared code forced. The ones a user notices:
 
-1. Two-argument yield does not move a queued target to the head. The
-   donor forfeits its slice and rotates to the tail, and the target
-   keeps its queue position. Revision 3 replaces this with a target
-   remove and a head insert. See spec section 2.5.
-2. A queued task keeps its DSQ position on reweight. The new weight
-   changes the contending weight and the next slice, not the current
-   position. Revision 3 replaces this with a remove and a reinsert
-   through the 7:1 gate. See spec section 2.6.
-3. Dispatch does not spill from peer LLC or node DSQs. Placement picks
-   the target CPU at enqueue and the task waits on that CPU's DSQ. A
-   busy CPU does not move its queued work to an idle peer at dispatch.
-   Revision 3 adds same-LLC and same-NUMA peer steal. See spec section
-   4.2.
-4. Group load is not decayed, and live `cpu.weight` and `cpu.idle`
-   ratios remain unverified. A group that becomes empty updates on its
-   next member, and until then a stale load can under-credit it.
-   Revision 3 keeps runnable group load separate from queue membership.
-   It handles the dequeue flags distinctly. It refreshes the effective
-   weight at the next enqueue or dispatch. See spec section 5.
+1. A service slot is one measured kernel tick, not a fixed 1 ms of wall
+   time.
+2. Preemption is an IPI, so a wake-to-run after a preemption can be
+   later by the IPI latency. The check also compares the queue head
+   rather than the band winner at every level, so it is stricter.
+3. Dispatch does not steal across a NUMA node.
+4. A running task observes a weight change at its next tick, at most one
+   slot later.
+5. An explicit yield charges its reserved slot to the policy ledger while
+   `cpu.max` sees only actual runtime.
+6. A task in a cgroup deeper than four levels joins its fourth ancestor,
+   and the deeper levels carry no share of it.
 
 ## Current limitations
 
-- The cgroup hierarchy is folded into one effective weight per task, as
-  `scx_eevdf` does with a single runqueue. Nested shares multiply
-  correctly, but the exact per-level ordering of the kernel hierarchy is
-  not reproduced. A cgroup deeper than 32 levels uses its bottom 32
-  levels, the cgroup v2 cap.
-- A live `cpu.weight` or `cpu.idle` ratio has not been demonstrated. In
-  the integration smoke run, groups at weight 100 and 200, and also a
-  `cpu.idle` group against a normal group, received equal shares. The
-  reported effective weight also reached 1000000. Revision 3 records the
-  causes. A running task left the group load. A zero load could scale a
-  task up without bound. A queued or running task never refreshed its
-  fold. The five-run VM tests in spec section 7.4 are the acceptance
-  gate. `cpu.max` does hold a 50 ms / 100 ms group near 50 percent.
+- The entity tree holds four cgroup levels. The verifier rejects a
+  larger bound, so a deeper cgroup joins the deepest ancestor that has an
+  entity. See spec section 2.11, D1.
+- A parent queue whose service band holds more than 16 siblings falls
+  back to its head. See D2.
+- A steal tier probes at most two peers per dispatch. See D3.
+- A live `cpu.weight` or `cpu.idle` ratio and the CPU quota cases have no
+  PASS record for this revision. The last recorded run measured a weight
+  ratio near 1.0 on the guest tick granularity, and that run used a
+  revision-3 binary (`.agent/tasks/cgroup-guest-validation/`). Treat a
+  share ratio as unverified until a revision-4.1 run records it.
 - Placement reads the topology once at load. A CPU set change needs a
-  restart. Multi-node behavior is written for several nodes and the
-  revision 3 VM plan tests two nodes, but real hardware is unverified.
-- Dispatch does not steal across a NUMA node. A node with more runnable
-  tasks than CPUs can leave a remote node idle. See spec section 9.
+  restart. Real hardware and a node hotplug are unverified.
 - `cpu.max` is limited to 2048 managed cgroups and 32 levels of nesting
   by the bandwidth library defaults. A larger tree is accounted but the
   excess is not enforced.
 - A task in a throttled group is parked in the bandwidth library's arena
   backlog. The scheduler therefore needs arena support from the kernel
   and uses clang 22 or newer, like other arena-based schedulers.
-- A queued task whose group weight or idle state changes keeps a stale
-  contribution in the queue weight sum until it is dispatched. The error
-  is bounded by one task weight and one round. See spec section 5.1.
-- A CPU set or topology change requires a scheduler restart.
+- The arena allocator can refuse a page request under fork churn without
+  a scheduler-visible reason. See D6.
+- The runnable-task stall is not closed. A successful local DSQ insert
+  does not prove the task ran. See D7 and the campaign evidence in
+  `.agent/tasks/stall-bisect-rca/` and `.agent/tasks/enq-last-repair/`.
 - The previous CPU is reused only when it is idle. The frozen
   specification also allowed a shallow previous queue. This tree keeps
   the stricter locality rule.
