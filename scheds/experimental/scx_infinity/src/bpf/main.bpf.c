@@ -149,7 +149,7 @@ struct inf_group_entity {
 	u16		    flags;
 	u32		    refs;
 	u32		    state;
-	u32		    pad;
+	u32		    idle; /* a cpu.idle flag is at or above this entity */
 };
 
 typedef struct inf_group_entity __arena inf_group_entity_t;
@@ -245,14 +245,14 @@ static __noinline int inf_q_insert(void __arena *queue, void __arena *node,
 
 static __noinline int inf_q_remove(void __arena *queue, void __arena *node)
 {
-	int ret = scx_edq_try_remove((scx_edq_t *)queue,
-				     (scx_edq_task_t *)node);
+	int ret =
+		scx_edq_try_remove((scx_edq_t *)queue, (scx_edq_task_t *)node);
 
 	if (ret == -EBUSY)
-		ret = scx_edq_remove((scx_edq_t *)queue, (scx_edq_task_t *)node);
+		ret = scx_edq_remove((scx_edq_t *)queue,
+				     (scx_edq_task_t *)node);
 	return ret;
 }
-
 
 /*
  * Per-task context, allocated in the arena by scx_task_alloc(). The
@@ -565,6 +565,38 @@ struct {
 	__type(key, u32);
 	__type(value, struct inf_test_ctl);
 } test_stor SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, u32);
+	__type(value, struct inf_fault_ctl);
+} fault_stor SEC(".maps");
+
+/*
+ * The controlled-refusal map of the steal and yield-to tests. A normal
+ * run never arms it, so the lookup returns zeroed counters and every test
+ * hook takes its unarmed branch.
+ */
+static __always_inline struct inf_fault_ctl *inf_fault(void)
+{
+	u32 key = 0;
+
+	return bpf_map_lookup_elem(&fault_stor, &key);
+}
+
+/*
+ * Take one forced refusal from @counter. The decrement is atomic, so two
+ * CPUs cannot both use one armed probe. Returns false when the counter is
+ * zero.
+ */
+static __always_inline bool inf_fault_take(u64 *counter)
+{
+	if (!counter || !READ_ONCE(*counter))
+		return false;
+	__sync_fetch_and_add(counter, -1);
+	return true;
+}
 
 /*
  * Pack the source and destination CPU of a transition into one argument.
@@ -1091,7 +1123,7 @@ static __always_inline void inf_bitmap_free(inf_cpu_block_t *blk, u32 idx)
  * parent's frontier.
  */
 static __noinline u32 inf_entity_create(inf_cpu_block_t *blk, u64 cgrp_id,
-					u32 parent_idx, u32 weight)
+					u32 parent_idx, u32 weight, bool idle)
 {
 	inf_group_entity_t    *e;
 	struct inf_cgrp_state *st;
@@ -1129,6 +1161,7 @@ static __noinline u32 inf_entity_create(inf_cpu_block_t *blk, u64 cgrp_id,
 	e->flags	= 0;
 	e->refs		= 0;
 	e->state	= INF_ENTITY_INACTIVE;
+	e->idle		= idle ? 1 : 0;
 	st		= inf_cgrp_state(cgrp_id);
 	e->generation	= st ? st->gen : 0;
 
@@ -1342,8 +1375,10 @@ static __noinline u32 inf_resolve_leaf(inf_cpu_block_t *blk,
 		id  = inf_cgroup_id(anc);
 		idx = inf_lookup_entity(blk, id);
 		if (idx == INF_IDX_NONE) {
-			idx = inf_entity_create(blk, id, parent,
-						inf_cgroup_weight(id, NULL));
+			bool idle = false;
+			u32  weight = inf_cgroup_weight(id, &idle);
+
+			idx = inf_entity_create(blk, id, parent, weight, idle);
 			if (idx == INF_IDX_NONE) {
 				/*
 				 * The pool is full. The task joins the
@@ -1378,6 +1413,37 @@ static __always_inline u32 inf_gate_class(inf_group_entity_t *parent, u32 mode)
 	if ((seq & INF_GATE_MASK) == INF_GATE_MASK)
 		return INF_CLASS_TAIL;
 	return INF_CLASS_HEAD;
+}
+
+/*
+ * The verdict of one admission without a state change, and the commit of
+ * that admission. A transactional insert reads the verdict, attempts the
+ * insert, and commits the gate and the tie only when the insert succeeded,
+ * so a refused insert leaves the destination gate where it was.
+ */
+static __always_inline u32 inf_gate_peek(inf_group_entity_t *parent, u32 mode,
+					 u64 *tie)
+{
+	u64 seq;
+
+	seq  = READ_ONCE(parent->gate_seq);
+	*tie = READ_ONCE(parent->tie_seq);
+
+	if (mode == INF_INS_TAIL)
+		return INF_CLASS_TAIL;
+	if (mode == INF_INS_HEAD)
+		return INF_CLASS_HEAD;
+	if ((seq & INF_GATE_MASK) == INF_GATE_MASK)
+		return INF_CLASS_TAIL;
+	return INF_CLASS_HEAD;
+}
+
+static __always_inline void inf_gate_commit(inf_group_entity_t *parent,
+					    u32			mode)
+{
+	if (mode == INF_INS_NORMAL)
+		__sync_fetch_and_add(&parent->gate_seq, 1);
+	__sync_fetch_and_add(&parent->tie_seq, 1);
 }
 
 /* Insert a group entity into the queue of its parent. */
@@ -1448,6 +1514,61 @@ static __noinline void inf_count_down(inf_cpu_block_t *blk, u32 idx)
 		}
 		idx = e->parent_idx;
 	}
+}
+
+/*
+ * Put the ancestors of a task back after a refused steal. The removal
+ * took them out of their parent queues but kept their service value and
+ * their insertion record, so the restore re-links them with that record
+ * and advances no gate.
+ */
+static __noinline void inf_restore_up(inf_cpu_block_t *blk, u32 idx)
+{
+	u32 i;
+
+	for (i = 0; i < INF_MAX_LEVELS && idx != 0 && can_loop; i++) {
+		inf_group_entity_t *e = inf_entity(blk, idx);
+		inf_group_entity_t *par;
+		bool		    dormant;
+
+		if (!e)
+			return;
+		dormant = e->count == 0;
+		e->count++;
+		if (!dormant)
+			return;
+		par = inf_entity(blk, e->parent_idx);
+		if (!par)
+			return;
+		e->v_q16 = inf_service_max(e->v_q16, par->frontier_q16);
+		if (inf_q_insert(&par->children, &e->qnode, e->v_q16))
+			INF_STAT_INC(state_repairs);
+		e->state = INF_ENTITY_RUNNABLE;
+		idx	 = e->parent_idx;
+	}
+}
+
+/*
+ * The service value of the head of a queue. The head carries the minimum
+ * service of the queue, so it is the band minimum. The read takes no lock
+ * and changes no state: a queue that changes under the read can only make
+ * a band check refuse, which is the safe direction.
+ */
+static __always_inline void inf_node_info(inf_cpu_block_t *blk, u64 node,
+					  u64 *v, u32 *cls, u64 *tie);
+
+static __always_inline bool
+inf_queue_head_v(inf_cpu_block_t *blk, inf_group_entity_t *parent, u64 *vmin)
+{
+	scx_edq_node_t *hn = parent->children.first;
+	u64		v, tie;
+	u32		cls;
+
+	if (!hn)
+		return false;
+	inf_node_info(blk, (u64)inf_queue_node_task(hn), &v, &cls, &tie);
+	*vmin = v;
+	return true;
 }
 
 /*
@@ -1680,7 +1801,7 @@ inf_select_leaf(inf_cpu_block_t *blk, inf_cpu_block_t *scratch, task_ctx **leaf)
 
 					if (par)
 						inf_q_remove(&par->children,
-								 &pe->qnode);
+							     &pe->qnode);
 					pe->state = INF_ENTITY_INACTIVE;
 					pe->count = 0;
 					INF_STAT_INC(state_repairs);
@@ -1708,7 +1829,7 @@ inf_select_leaf(inf_cpu_block_t *blk, inf_cpu_block_t *scratch, task_ctx **leaf)
 
 					if (par)
 						inf_q_remove(&par->children,
-								 &e->qnode);
+							     &e->qnode);
 					e->state = INF_ENTITY_INACTIVE;
 					INF_STAT_INC(state_repairs);
 					inf_queue_drop(win.task);
@@ -1805,7 +1926,7 @@ static __noinline void	    inf_admit_task(inf_cpu_block_t *blk, task_ctx *tctx,
 			return;
 		}
 		if (inf_q_insert(&parent->children, &tctx->qnode,
-				     tctx->v_q16)) {
+				 tctx->v_q16)) {
 			INF_STAT_INC(lost_state_errors);
 			return;
 		}
@@ -1890,8 +2011,7 @@ static __noinline void inf_requeue_path(task_ctx *tctx, u32 mode)
 			INF_STAT_INC(lost_state_errors);
 			return;
 		}
-		if (inf_q_insert(&leaf->children, &tctx->qnode,
-				     tctx->v_q16)) {
+		if (inf_q_insert(&leaf->children, &tctx->qnode, tctx->v_q16)) {
 			INF_STAT_INC(lost_state_errors);
 			return;
 		}
@@ -2011,6 +2131,7 @@ static __always_inline void inf_refresh_weight(inf_group_entity_t *e)
 	e->weight = w;
 	e->rem	  = 0;
 	e->epoch  = epoch;
+	e->idle	  = st->idle ? 1 : 0;
 }
 
 /*
@@ -2343,35 +2464,64 @@ static __always_inline void inf_maybe_preempt(struct task_struct *p, s32 cpu,
 	struct inf_stats   *stats;
 	u64		    reserve;
 	task_ctx	   *tctx;
+	bool		    fork;
 
-	if (!(enq_flags & SCX_ENQ_WAKEUP))
-		return;
-	if (p->policy != INF_SCHED_NORMAL && p->policy != INF_SCHED_EXT)
-		return;
-
-	tctx = inf_task_ctx(p);
-	if (tctx && tctx->wake_fork) {
-		tctx->wake_fork = 0;
+	if (!(enq_flags & SCX_ENQ_WAKEUP)) {
+		INF_STAT_INC(preempt_refuse_flags);
 		return;
 	}
-	if (tctx && tctx->idle)
+
+	INF_STAT_INC(preempt_checks);
+
+	if (p->policy != INF_SCHED_NORMAL && p->policy != INF_SCHED_EXT) {
+		INF_STAT_INC(preempt_refuse_policy);
 		return;
+	}
+
+	tctx = inf_task_ctx(p);
+	if (!tctx) {
+		INF_STAT_INC(preempt_refuse_no_victim);
+		return;
+	}
+
+	/*
+	 * The fork marker belongs to one wakeup. Consume it here, whatever
+	 * the decision is, so a marker cannot leak into the next wakeup.
+	 */
+	fork		= !!tctx->wake_fork;
+	tctx->wake_fork = 0;
+	if (fork) {
+		INF_STAT_INC(preempt_refuse_fork);
+		return;
+	}
+	if (tctx->idle) {
+		INF_STAT_INC(preempt_refuse_idle);
+		return;
+	}
 
 	/*
 	 * The wakee must win its own queue and the queue of every
 	 * ancestor under the band. The peek is read-only.
 	 */
-	blk = inf_block(tctx ? tctx->queued_cpu : cpu);
-	if (!blk || !tctx)
+	blk = inf_block(tctx->queued_cpu);
+	if (!blk) {
+		INF_STAT_INC(preempt_refuse_no_victim);
 		return;
-	if (!inf_wakee_wins(blk, tctx))
+	}
+	if (!inf_wakee_wins(blk, tctx)) {
+		INF_STAT_INC(preempt_refuse_not_winner);
 		return;
+	}
 
 	victim = __COMPAT_scx_bpf_cpu_curr(cpu);
-	if (!victim || victim == p)
+	if (!victim || victim == p) {
+		INF_STAT_INC(preempt_refuse_no_victim);
 		return;
-	if (!(victim->scx.flags & SCX_TASK_QUEUED))
+	}
+	if (!(victim->scx.flags & SCX_TASK_QUEUED)) {
+		INF_STAT_INC(preempt_refuse_no_victim);
 		return;
+	}
 
 	{
 		struct inf_cfg *cfg = inf_cfg();
@@ -2379,8 +2529,10 @@ static __always_inline void inf_maybe_preempt(struct task_struct *p, s32 cpu,
 		reserve = cfg ? READ_ONCE(cfg->preempt_margin_ns) : 0;
 	}
 	/* The victim must retain strictly more than the margin. */
-	if (READ_ONCE(victim->scx.slice) <= reserve)
+	if (READ_ONCE(victim->scx.slice) <= reserve) {
+		INF_STAT_INC(preempt_refuse_slice);
 		return;
+	}
 
 	/*
 	 * The victim loses its slice. It re-enters the tree through the
@@ -2725,6 +2877,30 @@ static __noinline int inf_admit_on_cpu(struct task_struct *p, task_ctx *tctx,
 	if (!leaf)
 		return -EINVAL;
 
+	/*
+	 * The preemption rule of the policy: a task under a cpu.idle group
+	 * never preempts. The flag is read from the resolved path, so it
+	 * covers every ancestor without a second cgroup walk.
+	 */
+	{
+		u32  idx = leaf_parent;
+		u32  i;
+		bool idle = false;
+
+		for (i = 0; i < INF_MAX_LEVELS && idx != 0 && can_loop; i++) {
+			inf_group_entity_t *e = inf_entity(blk, idx);
+
+			if (!e)
+				break;
+			if (e->idle) {
+				idle = true;
+				break;
+			}
+			idx = e->parent_idx;
+		}
+		tctx->idle = idle ? 1 : 0;
+	}
+
 	/* The task references the entity that holds it. */
 	inf_task_attach(tctx, blk, cpu, leaf_parent);
 
@@ -3005,6 +3181,10 @@ static __always_inline s32 inf_task_allowed_cpu(struct task_struct *p,
 	return -1;
 }
 
+/* One steal attempt, defined with the steal tiers below. */
+static __noinline bool inf_steal_one(s32 cpu, struct inf_cpu_ctx *cctx,
+				     task_ctx **out, u32 *leaf_out);
+
 /*
  * Select the leaf task of this CPU's tree and hand it to the local DSQ.
  * The path of the task leaves the tree and is held by the reservation.
@@ -3019,30 +3199,44 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 	u32			 i;
 	u32			 leaf_idx;
 	int			 ret;
+	bool			 stolen = false;
 
 	if (!blk)
 		return false;
 
 	path = &blk->path;
 
-	if (!inf_select_leaf(blk, blk, &tctx))
-		return false;
-
 	/*
-	 * The parent of the selected task is the deepest entity on the
-	 * path, not the first one: a task two cgroup levels below the root
-	 * sits in the child queue of path->ent[1]. A task that is a direct
-	 * child of the root cgroup has no group level on its path, and the
-	 * root entity holds it.
+	 * The local selection first. When the local tree has nothing, one
+	 * steal brings a peer task into this tree. The stolen task is held
+	 * in the destination leaf queue at this point, and the shared tail
+	 * below removes it and hands it to the local DSQ. A kick of this
+	 * CPU would not re-enter dispatch from here, so the handoff has to
+	 * happen in this call.
 	 */
-	leaf_idx = path->depth > 0 ?
-			   path->ent[(path->depth - 1) & (INF_MAX_LEVELS - 1)] :
-			   0;
-	leaf	 = inf_entity(blk, leaf_idx);
+	if (inf_select_leaf(blk, blk, &tctx)) {
+		/*
+		 * The parent of the selected task is the deepest entity on
+		 * the path, not the first one: a task two cgroup levels
+		 * below the root sits in the child queue of path->ent[1]. A
+		 * task that is a direct child of the root cgroup has no
+		 * group level on its path, and the root entity holds it.
+		 */
+		leaf_idx = path->depth > 0 ?
+				   path->ent[(path->depth - 1) &
+					     (INF_MAX_LEVELS - 1)] :
+				   0;
+	} else {
+		if (!inf_steal_one(cpu, cctx, &tctx, &leaf_idx))
+			return false;
+		stolen = true;
+	}
+
+	leaf = inf_entity(blk, leaf_idx);
 	if (!leaf)
 		return false;
 
-	if (tctx->state != INF_ENTITY_RUNNABLE) {
+	if (!stolen && tctx->state != INF_ENTITY_RUNNABLE) {
 		INF_STAT_INC(disp_stale_state);
 		if (tctx->state == INF_ENTITY_INACTIVE)
 			INF_STAT_INC(disp_stale_inactive);
@@ -3113,19 +3307,30 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 	/* The counts below the leaf follow the task. */
 	inf_count_down(blk, leaf_idx);
 
-	/* The path of the task is held by the task. */
-	tctx->path_depth = path->depth;
-	tctx->path_cpu	 = cpu;
-	if (tctx->path_depth > INF_MAX_LEVELS)
-		tctx->path_depth = INF_MAX_LEVELS;
-	for (i = 0; i < INF_MAX_LEVELS && can_loop; i++) {
-		if (i >= tctx->path_depth)
-			break;
-		tctx->path_ent[i] = path->ent[i & (INF_MAX_LEVELS - 1)];
-	}
+	if (stolen) {
+		/*
+		 * The steal already built the path of the task on this CPU
+		 * and committed the destination leaf gate. The frontier of
+		 * the destination moved with that commit, so it is not
+		 * applied a second time here.
+		 */
+		tctx->path_cpu = cpu;
+	} else {
+		/* The path of the task is held by the task. */
+		tctx->path_depth = path->depth;
+		tctx->path_cpu	 = cpu;
+		if (tctx->path_depth > INF_MAX_LEVELS)
+			tctx->path_depth = INF_MAX_LEVELS;
+		for (i = 0; i < INF_MAX_LEVELS && can_loop; i++) {
+			if (i >= tctx->path_depth)
+				break;
+			tctx->path_ent[i] =
+				path->ent[i & (INF_MAX_LEVELS - 1)];
+		}
 
-	/* The frontier of every level follows the selection. */
-	inf_apply_frontier(blk, path);
+		/* The frontier of every level follows the selection. */
+		inf_apply_frontier(blk, path);
+	}
 
 	if ((p->flags & PF_EXITING) || tctx->state == INF_ENTITY_EXITING) {
 		/*
@@ -3233,12 +3438,13 @@ static __noinline bool inf_dispatch_tree(s32 cpu, struct inf_cpu_ctx *cctx)
 }
 
 /*
- * The read-only peek of a peer tree.
+ * The read-only peek of a peer tree, and the hypothetical destination
+ * selection of a steal.
  *
- * The peek follows the head of every queue on the path. The head of a
- * queue is its child with the lowest service, so the peek finds the task
- * the peer would run next. It takes no hold and removes nothing, and it
- * changes no key, no gate, no service and no frontier.
+ * The head of every queue on the path is the child with the lowest
+ * service, so it is the band minimum of that queue. The band filter can
+ * never exclude it. The peek removes nothing, takes no hold and changes
+ * no key, no gate, no service and no frontier.
  */
 static __noinline bool inf_steal_peek(inf_cpu_block_t *pblk,
 				      inf_cpu_block_t *dblk, task_ctx **leaf)
@@ -3248,8 +3454,8 @@ static __noinline bool inf_steal_peek(inf_cpu_block_t *pblk,
 	u32			 level = 0;
 
 	/*
-	 * The counter of the peek lives in the arena, so the verifier sees
-	 * an imprecise value and the states of the peek stay equal.
+	 * The counter of the descent lives in the arena, so the verifier
+	 * sees an imprecise value and the states of the peek stay equal.
 	 */
 	dblk->counter[INF_COUNTER_PEEK] = 0;
 	while (can_loop) {
@@ -3260,8 +3466,10 @@ static __noinline bool inf_steal_peek(inf_cpu_block_t *pblk,
 		if (!e)
 			return false;
 		hn = e->children.first;
-		if (!hn)
+		if (!hn) {
+			INF_STAT_INC(steal_peek_empty);
 			return false;
+		}
 		head = inf_queue_node_task(hn);
 
 		if (!inf_node_is_group(pblk, (u64)head)) {
@@ -3283,50 +3491,40 @@ static __noinline bool inf_steal_peek(inf_cpu_block_t *pblk,
 }
 
 /*
- * Steal the leaf task of a peer tree. The peek of the peer tree changes
- * no state. The task leaves the source queue only after the destination
- * accepted the move.
+ * Steal the band winner of a peer tree, transactionally.
+ *
+ * The order is the one of specification section 4.3: a read-only
+ * hypothetical selection, an affinity check, a compare-and-swap on the
+ * single-owner handoff flag, the removal of the task from its source
+ * queue, a revalidation of the destination, and an insertion at the
+ * destination frontier. The destination gate advances only after the
+ * insert commits. A refusal at any step restores the saved source record,
+ * so a failed steal leaves the source level where it was. The source queue
+ * lock is released before the destination queue lock is taken, so no two
+ * queue locks are held at once.
  */
 static __noinline bool inf_steal_from(s32 peer, s32 dst,
-				      struct inf_cpu_ctx *dcctx)
+				      struct inf_cpu_ctx *dcctx, task_ctx **out,
+				      u32 *leaf_out)
 {
-	inf_cpu_block_t		*pblk = inf_block(peer);
-	inf_cpu_block_t		*dblk = inf_block(dst);
-	inf_group_entity_t	*sleaf;
-	inf_group_entity_t	*dleaf;
-	struct inf_path __arena *spath = &dblk->path;
-	struct task_struct	*p;
-	task_ctx		*tctx = NULL;
-	u64			 saved_v;
-	u32			 saved_cls;
-	u64			 saved_tie;
-	u64			 saved_cgrp;
-	u32			 leaf_parent;
-	u32			 sleaf_idx;
-	u64			 cgrp_id;
-	int			 ret;
+	inf_cpu_block_t	     *pblk = inf_block(peer);
+	inf_cpu_block_t	     *dblk = inf_block(dst);
+	inf_group_entity_t   *sleaf;
+	inf_group_entity_t   *dleaf;
+	struct inf_fault_ctl *fault;
+	struct task_struct   *p;
+	task_ctx	     *tctx = NULL;
+	u64		      saved_v, saved_rem, saved_tie, tie = 0, cgrp_id;
+	u32		      saved_cls, leaf_parent = 0, sleaf_idx, cls;
+	int		      ret;
 
-	if (!pblk || !dblk)
+	if (!pblk || !dblk || pblk == dblk)
 		return false;
 
-	/*
-	 * The hypothetical destination selection: a read-only peek of the
-	 * peer tree. The peek reads the head of every queue on the path, so
-	 * it costs one read per level and changes no state.
-	 */
 	if (!inf_steal_peek(pblk, dblk, &tctx))
 		return false;
-
 	if (!tctx)
 		return false;
-
-	/* The task must be allowed on the destination CPU. */
-	{
-		struct inf_cpu_topo *dt = inf_cpu_topo(dst);
-
-		if (!dt)
-			return false;
-	}
 
 	p = bpf_task_from_pid(tctx->pid);
 	if (!p) {
@@ -3334,36 +3532,42 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 		return false;
 	}
 
+	/* The task must be allowed on the destination CPU. */
 	if (!inf_cpu_allowed(p, inf_cpu_topo(dst), dst)) {
+		INF_STAT_INC(steal_affinity_refusals);
 		bpf_task_release(p);
 		return false;
 	}
 
-	if (tctx->dequeue_pending || tctx->exit_pending) {
+	if (tctx->dequeue_pending || tctx->exit_pending ||
+	    tctx->state != INF_ENTITY_RUNNABLE || tctx->queued_cpu != peer) {
+		INF_STAT_INC(steal_revalidate_refusals);
 		bpf_task_release(p);
 		return false;
 	}
+
+	INF_STAT_INC(steal_attempts);
 
 	/* One writer owns the move. A lost race is a refusal. */
 	inf_queue_hold(&tctx->qnode);
 	if (cmpxchg(&tctx->moving, 0, 1)) {
 		inf_queue_drop(&tctx->qnode);
 		bpf_task_release(p);
-		INF_STAT_INC(steal_refusals);
+		INF_STAT_INC(steal_owner_refusals);
 		return false;
 	}
 
 	/*
-	 * The source leaf. It is the deepest entity on the peer path: the
-	 * node sits in the child queue of spath->ent[depth - 1]. A peer
-	 * tree whose path has no group level holds the task in the root
-	 * entity, so the index is 0.
+	 * The source leaf. It is the deepest entity on the peeked path: the
+	 * node sits in the child queue of path->ent[depth - 1]. A peer tree
+	 * whose path has no group level holds the task in the root entity,
+	 * so the index is 0.
 	 */
-	sleaf_idx =
-		spath->depth > 0 ?
-			spath->ent[(spath->depth - 1) & (INF_MAX_LEVELS - 1)] :
-			0;
-	sleaf = inf_entity(pblk, sleaf_idx);
+	sleaf_idx = dblk->path.depth > 0 ?
+			    dblk->path.ent[(dblk->path.depth - 1) &
+					   (INF_MAX_LEVELS - 1)] :
+			    0;
+	sleaf	  = inf_entity(pblk, sleaf_idx);
 	if (!sleaf) {
 		tctx->moving = 0;
 		inf_queue_drop(&tctx->qnode);
@@ -3373,10 +3577,10 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 	}
 
 	/* The source record is saved before the task leaves the source. */
-	saved_v	     = tctx->v_q16;
-	saved_cls    = tctx->class;
-	saved_tie    = tctx->tie;
-	saved_cgrp   = tctx->cgrp_id;
+	saved_v	  = tctx->v_q16;
+	saved_rem = tctx->rem;
+	saved_cls = tctx->class;
+	saved_tie = tctx->tie;
 
 	/* The task leaves the source queue. */
 	ret = inf_q_remove(&sleaf->children, &tctx->qnode);
@@ -3387,32 +3591,66 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 		INF_STAT_INC(steal_failures);
 		return false;
 	}
+	/*
+	 * The task leaves the source queue and its counts follow. The
+	 * removal runs on this CPU while the source CPU may admit, so the
+	 * order is queue first and counts second; the source selection
+	 * treats an empty queue with a count as a task in transit.
+	 */
 	tctx->state	 = INF_ENTITY_HANDOFF;
 	tctx->queued_cpu = -1;
 	inf_count_down(pblk, sleaf_idx);
-
-	/* The destination leaf parent. */
-	leaf_parent = inf_resolve_leaf(dblk, inf_task_cgroup(p), &cgrp_id);
-	dleaf	    = inf_entity(dblk, leaf_parent);
-	if (!dleaf)
-		goto restore;
+	inf_depth_add(peer, -1);
 
 	/*
-	 * The destination record and the insert. The node is fully formed
-	 * before it becomes visible in the destination queue, and the
-	 * reference and the path follow the commit, so a refused insert
-	 * only has to put the saved record back.
+	 * The destination is revalidated after the source removal, because
+	 * the affinity mask can change while the task moves. A refusal here
+	 * restores the source record.
 	 */
-	tctx->v_q16 = dleaf->frontier_q16;
-	tctx->rem   = 0;
-	tctx->class = inf_gate_class(dleaf, INF_INS_NORMAL);
-	tctx->tie   = dleaf->tie_seq++;
-	if (inf_q_insert(&dleaf->children, &tctx->qnode, tctx->v_q16)) {
-		INF_STAT_INC(state_repairs);
+	fault = inf_fault();
+	if (!fault)
+		INF_STAT_INC(steal_fault_missing);
+	if (!inf_cpu_allowed(p, inf_cpu_topo(dst), dst)) {
+		INF_STAT_INC(steal_revalidate_refusals);
+		goto restore;
+	}
+	if (fault && inf_fault_take(&fault->steal_dest_refuse)) {
+		INF_STAT_INC(steal_fault_taken);
+		INF_STAT_INC(steal_revalidate_refusals);
+		goto restore;
+	}
+	if (tctx->dequeue_pending || tctx->exit_pending) {
+		INF_STAT_INC(steal_revalidate_refusals);
 		goto restore;
 	}
 
-	/* The steal committed: the task now belongs to the destination. */
+	leaf_parent = inf_resolve_leaf(dblk, inf_task_cgroup(p), &cgrp_id);
+	dleaf	    = inf_entity(dblk, leaf_parent);
+	if (!dleaf) {
+		INF_STAT_INC(steal_revalidate_refusals);
+		goto restore;
+	}
+
+	/*
+	 * The destination record. The gate verdict is read, not committed:
+	 * the gate and the tie advance only after the insert succeeded.
+	 */
+	cls	    = inf_gate_peek(dleaf, INF_INS_NORMAL, &tie);
+	tctx->v_q16 = dleaf->frontier_q16;
+	tctx->rem   = 0;
+	tctx->class = cls;
+	tctx->tie   = tie;
+	if (fault && inf_fault_take(&fault->steal_insert_refuse)) {
+		INF_STAT_INC(steal_insert_refusals);
+		goto restore;
+	}
+	if (inf_q_insert(&dleaf->children, &tctx->qnode, tctx->v_q16)) {
+		INF_STAT_INC(steal_insert_refusals);
+		goto restore;
+	}
+
+	/* The steal committed: the gate steps, then the task moves. */
+	inf_gate_commit(dleaf, INF_INS_NORMAL);
 	tctx->state = INF_ENTITY_RUNNABLE;
 	inf_task_attach(tctx, dblk, dst, leaf_parent);
 	tctx->cgrp_id	 = cgrp_id;
@@ -3438,10 +3676,13 @@ static __noinline bool inf_steal_from(s32 peer, s32 dst,
 	}
 
 	inf_count_up(dblk, leaf_parent, INF_INS_NORMAL);
+	inf_depth_add(dst, 1);
 	INF_STAT_INC(steals);
 	INF_STAT_INC(disp_steal);
 	inf_trace(INF_TR_STEAL, tctx, INF_TR_WHERE(peer, dst), 0);
-	scx_bpf_kick_cpu(dst, SCX_KICK_IDLE);
+
+	*out	  = tctx;
+	*leaf_out = leaf_parent;
 	tctx->moving = 0;
 	inf_queue_drop(&tctx->qnode);
 	bpf_task_release(p);
@@ -3451,13 +3692,13 @@ restore:
 	/*
 	 * The destination refused the task. The source record goes back and
 	 * the node re-enters the source queue with its old service and tie.
-	 * The reference and the path of the task still name the source, so
-	 * neither is touched here.
+	 * The destination leaf gate never advanced, and the source ancestors
+	 * are re-linked with their own retained record.
 	 */
 	tctx->v_q16	 = saved_v;
+	tctx->rem	 = saved_rem;
 	tctx->class	 = saved_cls;
 	tctx->tie	 = saved_tie;
-	tctx->cgrp_id	 = saved_cgrp;
 	tctx->state	 = INF_ENTITY_RUNNABLE;
 	tctx->queued_cpu = peer;
 	if (inf_q_insert(&sleaf->children, &tctx->qnode, saved_v)) {
@@ -3465,13 +3706,35 @@ restore:
 		if (inf_q_insert(&sleaf->children, &tctx->qnode, saved_v))
 			INF_STAT_INC(lost_state_errors);
 	}
-	inf_count_up(pblk, sleaf_idx, INF_INS_NORMAL);
+	inf_restore_up(pblk, sleaf_idx);
+	inf_depth_add(peer, 1);
+	/*
+	 * The task is back in the source tree. The source CPU may be idle,
+	 * so it needs a kick or the task waits for an unrelated wakeup.
+	 */
+	scx_bpf_kick_cpu(peer, SCX_KICK_IDLE);
 	tctx->moving = 0;
 	INF_STAT_INC(steal_failures);
+	INF_STAT_INC(steal_rollbacks);
 	inf_trace(INF_TR_STEAL_SKIP, tctx, INF_TR_WHERE(peer, dst), -1);
 	inf_queue_drop(&tctx->qnode);
 	bpf_task_release(p);
 	return false;
+}
+
+/*
+ * The local-work oracle of the steal decision. A remote spill is allowed
+ * only when this CPU's own tree holds no dispatchable entity. The depth
+ * counts the tasks that are allowed on this CPU and not throttled, so a
+ * local task that the last selection could not hand out blocks the node
+ * tier. An affinity-limited task and a throttled task are not in this
+ * tree, so they do not block it.
+ */
+static __noinline bool inf_local_work(s32 cpu)
+{
+	struct inf_cpu_ctx *cctx = inf_cpu_ctx(cpu);
+
+	return cctx && READ_ONCE(cctx->depth) > 0;
 }
 
 /*
@@ -3480,7 +3743,8 @@ restore:
  * dispatch starts where this one stopped.
  */
 static __noinline bool inf_steal_tier(s32 cpu, u32 llc, u32 node, u32 tier,
-				      u32 *cursor, struct inf_cpu_ctx *dcctx)
+				      u32 *cursor, struct inf_cpu_ctx *dcctx,
+				      task_ctx **out, u32 *leaf_out)
 {
 	u32 ncpu = inf_nr_cpu_ids();
 	u32 start, next;
@@ -3525,7 +3789,7 @@ static __noinline bool inf_steal_tier(s32 cpu, u32 llc, u32 node, u32 tier,
 		if (next >= ncpu)
 			next = 0;
 
-		if (inf_steal_from((s32)peer, cpu, dcctx)) {
+		if (inf_steal_from((s32)peer, cpu, dcctx, out, leaf_out)) {
 			WRITE_ONCE(*cursor, next);
 			if (tier == INF_STEAL_LLC) {
 				INF_STAT_INC(steal_llc);
@@ -3541,15 +3805,38 @@ static __noinline bool inf_steal_tier(s32 cpu, u32 llc, u32 node, u32 tier,
 }
 
 /*
+ * One steal attempt for this CPU. The same-LLC tier always runs. The
+ * node tier is the remote spill, and it runs only when the local tree
+ * holds no dispatchable task that is allowed on this CPU. Returns true
+ * when one task entered this CPU's tree.
+ */
+static __noinline bool inf_steal_one(s32 cpu, struct inf_cpu_ctx *cctx,
+				     task_ctx **out, u32 *leaf_out)
+{
+	struct inf_cpu_topo *lt = inf_cpu_topo(cpu);
+
+	if (!lt || !lt->online)
+		return false;
+	if (inf_steal_tier(cpu, lt->llc_id, lt->node_id, INF_STEAL_LLC,
+			   &cctx->steal_llc_cursor, cctx, out, leaf_out))
+		return true;
+	if (inf_local_work(cpu)) {
+		INF_STAT_INC(steal_remote_refusals);
+		return false;
+	}
+	return inf_steal_tier(cpu, lt->llc_id, lt->node_id, INF_STEAL_NODE,
+			      &cctx->steal_node_cursor, cctx, out, leaf_out);
+}
+
+/*
  * Dispatch: the local tree first, then same-LLC peers, then same-NUMA
  * peers outside the local LLC. If nothing is runnable, renew the previous
  * task in place when its slice expired.
  */
 void BPF_STRUCT_OPS(infinity_dispatch, s32 cpu, struct task_struct *prev)
 {
-	struct inf_cpu_ctx  *cctx;
-	struct inf_cpu_topo *lt;
-	task_ctx	    *tctx = NULL;
+	struct inf_cpu_ctx *cctx;
+	task_ctx	   *tctx = NULL;
 
 	TOUCH_ARENA();
 
@@ -3561,18 +3848,13 @@ void BPF_STRUCT_OPS(infinity_dispatch, s32 cpu, struct task_struct *prev)
 	if (inf_cpu_bw_enabled())
 		scx_cgroup_ctl_reenqueue();
 
+	/*
+	 * The tree selection runs the steal itself when the local tree has
+	 * nothing to hand out, so the stolen task is selected again in the
+	 * same dispatch.
+	 */
 	if (inf_dispatch_tree(cpu, cctx))
 		return;
-
-	lt = inf_cpu_topo(cpu);
-	if (lt && lt->online) {
-		if (inf_steal_tier(cpu, lt->llc_id, lt->node_id, INF_STEAL_LLC,
-				   &cctx->steal_llc_cursor, cctx))
-			return;
-		if (inf_steal_tier(cpu, lt->llc_id, lt->node_id, INF_STEAL_NODE,
-				   &cctx->steal_node_cursor, cctx))
-			return;
-	}
 
 	/*
 	 * The tree is empty and the previous task is still runnable with
@@ -3787,55 +4069,133 @@ void BPF_STRUCT_OPS(infinity_set_weight, struct task_struct *p, u32 weight)
 }
 
 /*
- * Move a runnable queued target to the head of its own queue. The target
- * must be inside its service band. A target that is running, dispatched,
- * throttled, exiting or not queued is refused.
+ * True when @v is inside the service band of the queue of @parent. The
+ * head of the queue carries the minimum service, so it is the band
+ * minimum. An empty queue has no band, and the caller is refused.
+ */
+static __always_inline bool
+inf_entity_in_band(inf_cpu_block_t *blk, inf_group_entity_t *parent, u64 v)
+{
+	u64 vmin;
+
+	if (!inf_queue_head_v(blk, parent, &vmin))
+		return false;
+	return !!inf_in_band_mask(v, vmin);
+}
+
+/*
+ * Move a runnable queued target to the head class of its own queue. The
+ * target must be inside its current service band, and every group entity
+ * on its path must be inside the band of its own parent queue. The
+ * promotion takes the head class with the newest tie and does not advance
+ * a gate, so the 7:1 ratio of the normal arrivals is unchanged. A target
+ * that is running, dispatched, throttled, exiting or not queued is
+ * refused. A target on another CPU stays on that CPU.
  */
 static __noinline bool inf_yield_to(struct task_struct *from,
 				    struct task_struct *to)
 {
-	inf_cpu_block_t	   *blk;
-	inf_group_entity_t *parent;
-	task_ctx	   *tctx;
-	u64		    saved_v;
-	u32		    saved_cls;
-	u64		    saved_tie;
-	s32		    tcpu;
-	int		    ret;
+	inf_cpu_block_t	     *blk;
+	inf_group_entity_t   *parent;
+	struct inf_fault_ctl *fault;
+	task_ctx	     *tctx;
+	u64		      saved_v, saved_rem, saved_tie, tie;
+	u32		      saved_cls;
+	s32		      tcpu;
+	u32		      level;
+	int		      ret;
 
-	if (!to || to == from)
+	INF_STAT_INC(yield_to_checks);
+
+	if (!to || to == from || (to->flags & PF_EXITING)) {
+		INF_STAT_INC(yield_to_refuse_state);
 		return false;
-	if (to->flags & PF_EXITING)
+	}
+	if (scx_bpf_task_running(to)) {
+		INF_STAT_INC(yield_to_refuse_running);
 		return false;
-	if (scx_bpf_task_running(to))
-		return false;
+	}
 
 	tctx = inf_task_ctx(to);
-	if (!tctx)
+	if (!tctx || tctx->state != INF_ENTITY_RUNNABLE ||
+	    tctx->queued_cpu < 0) {
+		INF_STAT_INC(yield_to_refuse_state);
 		return false;
-	if (tctx->state != INF_ENTITY_RUNNABLE || tctx->queued_cpu < 0)
-		return false;
+	}
 
 	tcpu = tctx->queued_cpu;
 	/* A task in a sched_ext local DSQ is not in our tree. */
-	if (to == __COMPAT_scx_bpf_cpu_curr(tcpu))
+	if (to == __COMPAT_scx_bpf_cpu_curr(tcpu)) {
+		INF_STAT_INC(yield_to_refuse_running);
 		return false;
+	}
 
 	blk = inf_block(tcpu);
-	if (!blk)
+	if (!blk) {
+		INF_STAT_INC(yield_to_refuse_state);
 		return false;
+	}
 	parent = inf_entity(blk, (u32)tctx->parent_idx);
-	if (!parent)
+	if (!parent) {
+		INF_STAT_INC(yield_to_refuse_state);
 		return false;
+	}
+
+	/*
+	 * The band of the target inside its own leaf queue, then the band
+	 * of every group entity on its path inside the parent queue of that
+	 * entity. The reads are advisory: a queue that changes can only make
+	 * the check refuse.
+	 */
+	if (!inf_entity_in_band(blk, parent, tctx->v_q16)) {
+		INF_STAT_INC(yield_to_refuse_band);
+		return false;
+	}
+
+	/*
+	 * The ancestors of the target. The leaf parent competes in the
+	 * queue of the root, its parent in the next queue, and so on. Each
+	 * entity must be inside the band of the queue that holds it.
+	 */
+	{
+		u32 idx = (u32)tctx->parent_idx;
+
+		for (level = 0; level < INF_MAX_LEVELS && idx != 0 && can_loop;
+		     level++) {
+			inf_group_entity_t *e = inf_entity(blk, idx);
+			inf_group_entity_t *par;
+
+			if (!e)
+				break;
+			par = inf_entity(blk, e->parent_idx);
+			if (!par) {
+				INF_STAT_INC(yield_to_refuse_band);
+				return false;
+			}
+			if (!inf_entity_in_band(blk, par, e->v_q16)) {
+				INF_STAT_INC(yield_to_refuse_band);
+				return false;
+			}
+			idx = e->parent_idx;
+		}
+	}
+
+	fault = inf_fault();
+	if (fault && inf_fault_take(&fault->yield_probe_band_refuse)) {
+		INF_STAT_INC(yield_to_refuse_band);
+		return false;
+	}
 
 	/* One writer owns the node. A lost race is a refusal, not a move. */
 	inf_queue_hold(&tctx->qnode);
 	if (cmpxchg(&tctx->moving, 0, 1)) {
 		inf_queue_drop(&tctx->qnode);
+		INF_STAT_INC(yield_to_refuse_state);
 		return false;
 	}
 
 	saved_v	  = tctx->v_q16;
+	saved_rem = tctx->rem;
 	saved_cls = tctx->class;
 	saved_tie = tctx->tie;
 
@@ -3843,35 +4203,46 @@ static __noinline bool inf_yield_to(struct task_struct *from,
 	if (ret) {
 		tctx->moving = 0;
 		inf_queue_drop(&tctx->qnode);
-		INF_STAT_INC(lost_state_errors);
+		INF_STAT_INC(yield_to_refuse_state);
 		return false;
 	}
 
 	/*
 	 * The head class with the newest tie. The gate does not advance, so
-	 * the 7:1 ratio of the normal arrivals is unchanged.
+	 * the 7:1 ratio of the normal arrivals is unchanged. The tie steps
+	 * only after the insert commits.
 	 */
+	tie	    = READ_ONCE(parent->tie_seq);
 	tctx->class = INF_CLASS_HEAD;
-	tctx->tie   = parent->tie_seq++;
+	tctx->tie   = tie;
 	tctx->v_q16 = inf_service_max(tctx->v_q16, parent->frontier_q16);
-	if (inf_q_insert(&parent->children, &tctx->qnode, tctx->v_q16)) {
+	if ((fault && inf_fault_take(&fault->yield_insert_refuse)) ||
+	    inf_q_insert(&parent->children, &tctx->qnode, tctx->v_q16)) {
 		/* Put the task back with its saved record. */
 		tctx->v_q16 = saved_v;
+		tctx->rem   = saved_rem;
 		tctx->class = saved_cls;
 		tctx->tie   = saved_tie;
-		if (inf_q_insert(&parent->children, &tctx->qnode,
-				     saved_v)) {
-			tctx->state	 = INF_ENTITY_INACTIVE;
-			tctx->queued_cpu = -1;
-			inf_count_up(blk, (u32)tctx->parent_idx,
-				     INF_INS_NORMAL);
+		/*
+		 * The task never left the ancestry of this queue, so the
+		 * ancestor counts are unchanged and no count-up follows.
+		 */
+		if (inf_q_insert(&parent->children, &tctx->qnode, saved_v)) {
+			inf_queue_unlink(&tctx->qnode);
+			if (inf_q_insert(&parent->children, &tctx->qnode,
+					 saved_v)) {
+				tctx->state	 = INF_ENTITY_INACTIVE;
+				tctx->queued_cpu = -1;
+				INF_STAT_INC(lost_state_errors);
+			}
 		}
 		tctx->moving = 0;
+		INF_STAT_INC(yield_to_insert_fail);
 		inf_queue_drop(&tctx->qnode);
 		return false;
 	}
 
-	inf_count_up(blk, (u32)tctx->parent_idx, INF_INS_NORMAL);
+	__sync_fetch_and_add(&parent->tie_seq, 1);
 	tctx->moving = 0;
 	INF_STAT_INC(yield_to_moves);
 	inf_trace(INF_TR_YIELD_TO, tctx, INF_TR_WHERE(tcpu, tcpu), 0);
@@ -3879,11 +4250,62 @@ static __noinline bool inf_yield_to(struct task_struct *from,
 	return true;
 }
 
+/*
+ * A synthetic yield-to target for the controlled-refusal test. The probe
+ * runs only when user space arms it, and it uses a real queued or running
+ * task, so the tested path is the production one.
+ */
+static __noinline struct task_struct *
+inf_probe_target(struct inf_fault_ctl *fault)
+{
+	inf_cpu_block_t	   *blk;
+	inf_group_entity_t *e;
+	scx_edq_node_t	   *n;
+	task_ctx	   *tctx;
+	s32		    cpu;
+	u32		    ncpu, level;
+
+	cpu  = bpf_get_smp_processor_id();
+	ncpu = inf_nr_cpu_ids();
+
+	if (inf_fault_take(&fault->yield_probe_running)) {
+		s32		    other = cpu + 1 < (s32)ncpu ? cpu + 1 : 0;
+		struct task_struct *cur;
+
+		if (other == cpu)
+			return NULL;
+		cur = __COMPAT_scx_bpf_cpu_curr(other);
+		if (!cur)
+			return NULL;
+		return bpf_task_from_pid(cur->pid);
+	}
+
+	blk = inf_block(cpu);
+	if (!blk)
+		return NULL;
+	e = inf_entity(blk, 0);
+	if (!e)
+		return NULL;
+	n = e->children.first;
+	for (level = 0; n && level < INF_MAX_LEVELS && can_loop; level++) {
+		scx_edq_task_t *node = inf_queue_node_task(n);
+
+		if (!inf_node_is_group(blk, (u64)node)) {
+			tctx = inf_task_from_qnode(node);
+			return tctx ? bpf_task_from_pid(tctx->pid) : NULL;
+		}
+		e = (inf_group_entity_t *)node;
+		n = e->children.first;
+	}
+	return NULL;
+}
+
 bool BPF_STRUCT_OPS(infinity_yield, struct task_struct *from,
 		    struct task_struct *to)
 {
-	task_ctx *tctx;
-	bool	  moved = false;
+	struct inf_fault_ctl *fault;
+	task_ctx	     *tctx;
+	bool		      moved = false;
 
 	TOUCH_ARENA();
 
@@ -3908,6 +4330,20 @@ bool BPF_STRUCT_OPS(infinity_yield, struct task_struct *from,
 
 	if (to && to != from)
 		moved = inf_yield_to(from, to);
+
+	/*
+	 * The controlled-refusal probe. It adds a real promotion or a real
+	 * refusal to a plain yield, and it runs only when armed.
+	 */
+	fault = inf_fault();
+	if (!to && fault && inf_fault_take(&fault->yield_probe)) {
+		struct task_struct *probe = inf_probe_target(fault);
+
+		if (probe) {
+			moved = inf_yield_to(from, probe) || moved;
+			bpf_task_release(probe);
+		}
+	}
 
 	INF_STAT_INC(yields);
 

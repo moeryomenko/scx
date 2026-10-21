@@ -519,6 +519,35 @@ struct inf_stats {
 	u64 requeue_no_block; /* a requeue found no entity block */
 	u64 requeue_no_leaf; /* a requeue found no leaf entity */
 	u64 rekey_fail; /* an ancestor re-key could not re-enter its queue */
+	/*
+	 * Preemption decision counters, one per refusal path. A refusal
+	 * changes no state, so only the counter moves.
+	 */
+	u64 preempt_checks; /* wakeups that reached the decision */
+	u64 preempt_refuse_flags; /* not a wakeup, no decision taken */
+	u64 preempt_refuse_policy; /* not SCHED_NORMAL or SCHED_EXT */
+	u64 preempt_refuse_fork; /* the wakeup followed a fork */
+	u64 preempt_refuse_idle; /* idle cgroup or SCHED_IDLE task */
+	u64 preempt_refuse_not_winner; /* the wakee does not win its path */
+	u64 preempt_refuse_no_victim; /* no distinct queued victim */
+	u64 preempt_refuse_slice; /* the victim has too little slice left */
+	/* Steal transaction counters, one per refusal and rollback path. */
+	u64 steal_peek_empty; /* the peer tree had no band winner */
+	u64 steal_affinity_refusals; /* the task is not allowed on the CPU */
+	u64 steal_owner_refusals; /* another writer owned the handoff */
+	u64 steal_revalidate_refusals; /* the destination refused the move */
+	u64 steal_insert_refusals; /* the destination leaf insert failed */
+	u64 steal_fault_missing; /* the fault map lookup failed */
+	u64 steal_fault_taken; /* a forced destination refusal was consumed */
+	u64 steal_attempts; /* steals that reached the handoff */
+	u64 steal_rollbacks; /* the source record was restored */
+	u64 steal_remote_refusals; /* local work blocked the node tier */
+	/* Yield-to decision counters, one per refusal path. */
+	u64 yield_to_checks; /* yield calls that carried a target */
+	u64 yield_to_refuse_state; /* the target is not queued and runnable */
+	u64 yield_to_refuse_running; /* the target is running or dispatched */
+	u64 yield_to_refuse_band; /* the target is outside its band */
+	u64 yield_to_insert_fail; /* the promotion insert failed */
 };
 
 /*
@@ -642,6 +671,21 @@ struct inf_task_snap {
 /* Controlled-refusal counter for the local DSQ insert regression test. */
 struct inf_test_ctl {
 	u64 dsq_refuse;
+};
+
+/*
+ * Controlled refusals for the steal and yield-to tests. The map is empty
+ * unless user space arms it, so a normal run never reads a forced verdict.
+ * A nonzero counter is the number of decisions to refuse; it is
+ * decremented once per decision.
+ */
+struct inf_fault_ctl {
+	u64 steal_dest_refuse; /* refuse one destination revalidation */
+	u64 steal_insert_refuse; /* skip one destination leaf insert */
+	u64 yield_probe; /* run one synthetic yield-to probe */
+	u64 yield_probe_band_refuse; /* make the probe fail its band check */
+	u64 yield_probe_running; /* give the probe a running target */
+	u64 yield_insert_refuse; /* skip one promotion insert */
 };
 
 /*
