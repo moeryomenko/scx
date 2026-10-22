@@ -50,7 +50,6 @@ fn main() {
         .add_source("src/bpf/lib/bitmap.bpf.c")
         .add_source("src/bpf/lib/cgroup_bw.bpf.c")
         .add_source("src/bpf/lib/cgroup_weight.bpf.c")
-        .add_source("src/bpf/lib/cgroup_ctl.bpf.c")
         .add_source("src/bpf/lib/cpumask.bpf.c")
         .add_source("src/bpf/lib/edq.bpf.c")
         .add_source("src/bpf/lib/minheap.bpf.c")

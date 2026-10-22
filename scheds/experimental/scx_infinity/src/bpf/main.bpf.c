@@ -26,7 +26,8 @@
 #include <scx/common.bpf.h>
 #include <scx/compat.bpf.h>
 #include <lib/arena_map.h>
-#include <lib/cgroup_ctl.h>
+#include <lib/cgroup.h>
+#include <lib/cgroup_weight.h>
 #include <lib/edq.h>
 #include <lib/sdt_task.h>
 #include "intf.h"
@@ -1476,7 +1477,7 @@ struct {
 	__uint(pinning, LIBBPF_PIN_BY_NAME);
 	__type(key, u32);
 	__type(value, struct inf_audit);
-} audit_stor SEC(".maps");
+} audit_stor	       SEC(".maps");
 
 static __noinline void inf_audit_cpu(inf_cpu_block_t *blk, u32 cpu,
 				     struct inf_audit *a, u32 *sample)
@@ -1488,8 +1489,8 @@ static __noinline void inf_audit_cpu(inf_cpu_block_t *blk, u32 cpu,
 
 	bpf_for(idx, 0, INF_GROUPS_PER_CPU)
 	{
-		inf_group_entity_t *e	  = inf_entity(blk, idx);
-		inf_group_entity_t *par	  = NULL;
+		inf_group_entity_t *e	= inf_entity(blk, idx);
+		inf_group_entity_t *par = NULL;
 		scx_edq_t	   *owner;
 		u32		    state, linked, kind = 0;
 		u64		    nr;
@@ -1537,16 +1538,16 @@ static __noinline void inf_audit_cpu(inf_cpu_block_t *blk, u32 cpu,
 		if (a->nrec < INF_AUDIT_REC_MAX) {
 			struct inf_audit_rec *r = &a->rec[a->nrec];
 
-			r->ts	       = scx_bpf_now();
-			r->cpu	       = cpu;
-			r->idx	       = idx;
-			r->kind	       = kind;
-			r->state       = state;
-			r->count       = e->count;
-			r->nr_children = nr;
-			r->linked      = linked;
-			r->parent_idx  = e->parent_idx;
-			r->streak      = (u32)a->streak[kind] + 1;
+			r->ts			= scx_bpf_now();
+			r->cpu			= cpu;
+			r->idx			= idx;
+			r->kind			= kind;
+			r->state		= state;
+			r->count		= e->count;
+			r->nr_children		= nr;
+			r->linked		= linked;
+			r->parent_idx		= e->parent_idx;
+			r->streak		= (u32)a->streak[kind] + 1;
 			a->nrec++;
 		}
 	}
@@ -1610,7 +1611,6 @@ static __noinline void inf_tree_audit(bool force)
 		}
 	}
 }
-
 
 /* The control entry of the per-task transition trace. */
 #if INF_DIAG_TRACE
@@ -2163,9 +2163,17 @@ static __noinline u32 inf_tt_check(u32 cb)
 }
 #endif /* INF_DIAG_TRACE */
 
+/*
+ * The bandwidth library is live only when it initialized. The loader clears
+ * `enable_cpu_bw` when the kernel lacks cpu.max, and the library can still
+ * refuse with -EOPNOTSUPP, so both have to agree before a bandwidth call is
+ * made.
+ */
+static bool		    inf_bw_live;
+
 static __always_inline bool inf_cpu_bw_enabled(void)
 {
-	return enable_cpu_bw;
+	return enable_cpu_bw && inf_bw_live;
 }
 
 /*
@@ -2187,7 +2195,7 @@ static __always_inline void inf_bw_consume(struct task_struct *p,
 		return;
 	}
 
-	ret   = scx_cgroup_ctl_consume(p, (u64)tctx, actual);
+	ret   = scx_cgroup_bw_consume(p, (u64)tctx, actual);
 	stats = inf_stats();
 	if (stats) {
 		__sync_fetch_and_add(&stats->bw_consume, 1);
@@ -2524,7 +2532,7 @@ static __noinline bool inf_unlink_entity(inf_cpu_block_t    *blk,
 	return inf_queue_nr(&e->children) == 0;
 }
 
-static __noinline int inf_link_entity(inf_cpu_block_t    *blk,
+static __noinline int inf_link_entity(inf_cpu_block_t	 *blk,
 				      inf_group_entity_t *e, u32 mode);
 
 /*
@@ -2541,7 +2549,7 @@ static __noinline int inf_link_entity(inf_cpu_block_t    *blk,
  *
  * Returns true when the entity left the tree.
  */
-static __noinline bool inf_entity_drop(inf_cpu_block_t *blk,
+static __noinline bool inf_entity_drop(inf_cpu_block_t	  *blk,
 				       inf_group_entity_t *e)
 {
 	u64 nr;
@@ -2615,7 +2623,7 @@ static __noinline u32 inf_entity_create(inf_cpu_block_t *blk, u64 cgrp_id,
 	e->count	= 0;
 	e->tie		= 0;
 	e->tie_seq	= 0;
-	e->epoch	= scx_cgroup_ctl_epoch();
+	e->epoch	= scx_cgroup_weight_epoch();
 	e->parent_idx	= parent_idx;
 	e->weight	= weight;
 	e->gate_seq	= 0;
@@ -2940,7 +2948,7 @@ static __always_inline void inf_gate_commit(inf_group_entity_t *parent,
  * retried once: after the removal the node is in no queue, and the retry can
  * only fail on a dead membership, which the removal reinitialises.
  */
-static __noinline int inf_link_repair(inf_cpu_block_t    *blk,
+static __noinline int inf_link_repair(inf_cpu_block_t	 *blk,
 				      inf_group_entity_t *e)
 {
 	inf_group_entity_t *par = inf_entity(blk, e->parent_idx);
@@ -2974,7 +2982,7 @@ static __noinline int inf_link_repair(inf_cpu_block_t    *blk,
  * pointers have the same type at every site, so the verifier validates the
  * body once.
  */
-static __noinline int inf_link_entity(inf_cpu_block_t    *blk,
+static __noinline int inf_link_entity(inf_cpu_block_t	 *blk,
 				      inf_group_entity_t *e, u32 mode)
 {
 	inf_group_entity_t *par = inf_entity(blk, e->parent_idx);
@@ -4085,7 +4093,7 @@ static __always_inline u32 inf_event_mode(u32 event)
 static __always_inline void inf_refresh_weight(inf_group_entity_t *e)
 {
 	struct inf_cgrp_state *st;
-	u64		       epoch = scx_cgroup_ctl_epoch();
+	u64		       epoch = scx_cgroup_weight_epoch();
 	u32		       w;
 
 	if (e->epoch == epoch)
@@ -4978,7 +4986,7 @@ static __noinline int inf_admit_on_cpu(struct task_struct *p, task_ctx *tctx,
 	 */
 	if (!tctx->reweight_pending) {
 		tctx->latched_weight = inf_task_weight(p);
-		tctx->epoch	     = scx_cgroup_ctl_epoch();
+		tctx->epoch	     = scx_cgroup_weight_epoch();
 	}
 
 	return inf_admit_task(blk, tctx, leaf_parent, mode);
@@ -5033,7 +5041,7 @@ static __noinline int inf_admit_root(struct task_struct *p, task_ctx *tctx,
 	}
 	if (!tctx->reweight_pending) {
 		tctx->latched_weight = inf_task_weight(p);
-		tctx->epoch	     = scx_cgroup_ctl_epoch();
+		tctx->epoch	     = scx_cgroup_weight_epoch();
 	}
 
 	return inf_admit_task(blk, tctx, 0, mode);
@@ -5198,13 +5206,13 @@ static __noinline int inf_enqueue_common(struct task_struct *p, u64 enq_flags,
 		u64 ho_park = scx_bpf_now();
 
 		INF_STAT_INC(bw_gate);
-		ret = scx_cgroup_ctl_throttled(p, (u64)tctx);
+		ret = scx_cgroup_bw_throttled(p, (u64)tctx);
 		if (ret == -EAGAIN)
 			INF_STAT_INC(bw_eagain);
 		else if (ret)
 			INF_STAT_INC(bw_terr);
 		if (ret == -EAGAIN) {
-			if (!scx_cgroup_ctl_put_aside(p, (u64)tctx, 0)) {
+			if (!scx_cgroup_bw_put_aside(p, (u64)tctx, 0)) {
 				if (enq_flags & SCX_ENQ_LAST)
 					INF_STAT_INC(enq_last_park);
 				inf_settle_slot(p, tctx, inf_slot_event(tctx),
@@ -6638,7 +6646,7 @@ void BPF_STRUCT_OPS(infinity_dispatch, s32 cpu, struct task_struct *prev)
 
 	/* Re-enqueue backlogged tasks of cgroups that got time again. */
 	if (inf_cpu_bw_enabled()) {
-		int bw_ret = scx_cgroup_ctl_reenqueue();
+		int bw_ret = scx_cgroup_bw_reenqueue();
 
 		INF_STAT_INC(bw_drain);
 		if (bw_ret)
@@ -7625,7 +7633,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init_task, struct task_struct *p,
 	tctx->pending_weight   = 0;
 	tctx->slice_ns	       = 0;
 	tctx->last_running_ns  = scx_bpf_now();
-	tctx->epoch	       = scx_cgroup_ctl_epoch();
+	tctx->epoch	       = scx_cgroup_weight_epoch();
 	tctx->queued_cpu       = -1;
 	tctx->path_cpu	       = -1;
 	tctx->cgrp_cpu	       = -1;
@@ -7714,7 +7722,7 @@ s32 BPF_STRUCT_OPS(infinity_exit_task, struct task_struct *p,
 	 */
 	if (inf_cpu_bw_enabled()) {
 		INF_STAT_INC(bw_cancel);
-		scx_cgroup_ctl_cancel((u64)tctx, SCX_CGROUP_BW_CANCEL_DROP);
+		scx_cgroup_bw_cancel((u64)tctx, SCX_CGROUP_BW_CANCEL_DROP);
 	}
 
 	if (pool) {
@@ -7757,8 +7765,9 @@ void BPF_STRUCT_OPS(infinity_cgroup_move, struct task_struct *p,
 	INF_STAT_INC(resv_move);
 
 	/* The bandwidth library follows the task to the new cgroup. */
-	ret = scx_cgroup_ctl_move(p, (u64)tctx, from, to, tctx->path_cpu,
-				  tctx->base_weight, false);
+	ret = inf_cpu_bw_enabled() ?
+		      scx_cgroup_bw_move(p, (u64)tctx, from, to) :
+		      0;
 	INF_STAT_INC(bw_move);
 	if (ret) {
 		INF_STAT_INC(bw_move_err);
@@ -7851,7 +7860,7 @@ static __noinline int inf_cgroup_state_put(struct cgroup *cgrp, u32 weight,
 	st.weight  = weight;
 	st.idle	   = idle ? 1 : 0;
 	st.present = 1;
-	st.epoch   = scx_cgroup_ctl_epoch();
+	st.epoch   = scx_cgroup_weight_epoch();
 	/*
 	 * A cgroup id can be reused. The generation names this control
 	 * entry, so an entity of an earlier cgroup at the same id is known
@@ -7871,7 +7880,20 @@ s32 BPF_STRUCT_OPS(infinity_cgroup_init, struct cgroup *cgrp,
 
 	TOUCH_ARENA();
 
-	ret = scx_cgroup_ctl_cgroup_init(cgrp, args);
+	if (inf_cpu_bw_enabled()) {
+		ret = scx_cgroup_bw_init(cgrp, args);
+		if (ret) {
+			INF_STAT_INC(bw_init_err);
+			return ret;
+		}
+	}
+
+	/*
+	 * The stored cpu.weight and cpu.idle of the group. The tree reads
+	 * them through the scheduler's own map, and the shared library keeps
+	 * the control entry that its read-only node accessor returns.
+	 */
+	ret = scx_cgroup_weight_init(cgrp, args);
 	if (ret) {
 		INF_STAT_INC(bw_init_err);
 		return ret;
@@ -7891,7 +7913,9 @@ void BPF_STRUCT_OPS(infinity_cgroup_exit, struct cgroup *cgrp)
 
 	TOUCH_ARENA();
 
-	scx_cgroup_ctl_cgroup_exit(cgrp);
+	if (inf_cpu_bw_enabled())
+		scx_cgroup_bw_exit(cgrp);
+	scx_cgroup_weight_exit(cgrp);
 
 	if (!cgrp)
 		return;
@@ -7920,7 +7944,7 @@ void BPF_STRUCT_OPS(infinity_cgroup_set_weight, struct cgroup *cgrp, u32 weight)
 
 	TOUCH_ARENA();
 
-	scx_cgroup_ctl_set_weight(cgrp, weight);
+	scx_cgroup_weight_set_weight(cgrp, weight);
 
 	if (!cgrp)
 		return;
@@ -7945,7 +7969,7 @@ void BPF_STRUCT_OPS(infinity_cgroup_set_idle, struct cgroup *cgrp, bool idle)
 
 	TOUCH_ARENA();
 
-	scx_cgroup_ctl_set_idle(cgrp, idle);
+	scx_cgroup_weight_set_idle(cgrp, idle);
 
 	if (!cgrp)
 		return;
@@ -7967,8 +7991,10 @@ void BPF_STRUCT_OPS(infinity_cgroup_set_idle, struct cgroup *cgrp, bool idle)
 void BPF_STRUCT_OPS(infinity_cgroup_set_bandwidth, struct cgroup *cgrp,
 		    u64 period_us, u64 quota_us, u64 burst_us)
 {
-	int ret = scx_cgroup_ctl_set_bandwidth(cgrp, period_us, quota_us,
-					       burst_us);
+	int ret = 0;
+
+	if (inf_cpu_bw_enabled())
+		ret = scx_cgroup_bw_set(cgrp, period_us, quota_us, burst_us);
 
 	INF_STAT_INC(bw_set);
 	if (ret) {
@@ -7979,16 +8005,12 @@ void BPF_STRUCT_OPS(infinity_cgroup_set_bandwidth, struct cgroup *cgrp,
 
 s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init)
 {
-	struct inf_cpu_ctx	    *cctx;
-	struct scx_cgroup_ctl_config ctl = {
-		.verbose   = 0,
-		.enable_bw = enable_cpu_bw,
-	};
-	u32 ncpu = inf_nr_cpu_ids();
-	u32 key, pages;
-	s32 cpu;
-	int i, ret;
-	u64 t0, t1;
+	struct inf_cpu_ctx *cctx;
+	u32		    ncpu = inf_nr_cpu_ids();
+	u32		    key, pages;
+	s32		    cpu;
+	int		    i, ret;
+	u64		    t0, t1;
 
 	TOUCH_ARENA();
 
@@ -8022,13 +8044,39 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init)
 	/*
 	 * Bring up cpu.weight and cpu.idle, and cpu.max when the loader kept
 	 * it on. A kernel without cpu.max support leaves the weight half
-	 * usable, so the scheduler still loads.
+	 * usable, so the scheduler still loads: the bandwidth half stays off
+	 * and every bandwidth call is skipped.
 	 */
-	ret = scx_cgroup_ctl_lib_init(&ctl);
-	if (ret) {
-		INF_STAT_INC(bw_lib_init_err);
-		scx_bpf_error("failed to initialize cgroup control: %d", ret);
-		return ret;
+	if (enable_cpu_bw) {
+		struct scx_cgroup_bw_config bw = {
+			.verbose = 0,
+		};
+
+		ret = scx_cgroup_bw_lib_init(&bw);
+		if (!ret) {
+			inf_bw_live = true;
+		} else if (ret != -EOPNOTSUPP) {
+			INF_STAT_INC(bw_lib_init_err);
+			scx_bpf_error(
+				"failed to initialize the cgroup bandwidth library: %d",
+				ret);
+			return ret;
+		}
+	}
+
+	{
+		struct scx_cgroup_weight_config weight = {
+			.verbose = 0,
+		};
+
+		ret = scx_cgroup_weight_lib_init(&weight);
+		if (ret) {
+			INF_STAT_INC(bw_lib_init_err);
+			scx_bpf_error(
+				"failed to initialize the cgroup weight library: %d",
+				ret);
+			return ret;
+		}
 	}
 
 	/* Arm the diagnostic ring before the first transition. */
@@ -8040,7 +8088,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init)
 	 * own samples and not the sum of every run since the map was pinned.
 	 */
 	{
-		u32		   akey = 0;
+		u32		  akey = 0;
 		struct inf_audit *a = bpf_map_lookup_elem(&audit_stor, &akey);
 
 		if (a)
