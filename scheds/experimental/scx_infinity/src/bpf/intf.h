@@ -939,6 +939,17 @@ struct inf_stats {
 	u64 link_lost; /* a counted entity is not in its parent queue */
 	u64 count_lost; /* an entity left its parent queue with children */
 	u64 count_repairs; /* an entity count repaired from its queue */
+	/*
+	 * The repair paths of the entity links. A stale membership makes every
+	 * later insert of an entity fail, so the insert removes the node from
+	 * the queue that owns it and retries once. A removal that found the
+	 * node in another queue is counted separately: it names the stale
+	 * membership that the removal discovered.
+	 */
+	u64 link_repairs; /* a stale membership removed and the insert retried */
+	u64 link_repair_fail; /* the retry after the removal also failed */
+	u64 unlink_repairs; /* a removal found the node in another queue */
+	u64 ancestor_link_repairs; /* an ancestor link repaired on the walk up */
 	u64 admit_unlinked; /* a task entered a leaf that is not linked */
 	u64 disp_empty_lost; /* the tree had depth but nothing to select */
 	/*
@@ -1410,6 +1421,63 @@ struct inf_chain_snap {
 	u32		       depth;
 	u32		       nr_levels;
 	struct inf_chain_level lvl[INF_MAX_LEVELS];
+};
+
+/*
+ * The entity-chain audit.
+ *
+ * A task reaches the selection only through the child queue of its leaf
+ * entity and, above it, the child queue of every ancestor. Five states of a
+ * single entity break that rule, and every one of them has been observed in
+ * a stall:
+ *
+ *   inactive_linked     INACTIVE, and its node is still in a queue
+ *   inactive_counted    INACTIVE, and it still counts descendants
+ *   inactive_children   INACTIVE, and its child queue still holds nodes
+ *   runnable_unlinked   RUNNABLE, and no queue holds its node
+ *   link_mismatch       RUNNABLE, and its node sits in a queue that is not
+ *                       the child queue of its parent
+ *
+ * The audit walks the entity store of every CPU and counts each state. A
+ * state that is present in one sample can be a window between two locked
+ * steps, so a class is confirmed only when two consecutive samples see it.
+ * The first records are kept with the entity that showed them.
+ */
+#define INF_AUDIT_KINDS 5
+#define INF_AUDIT_INACTIVE_LINKED 0
+#define INF_AUDIT_INACTIVE_COUNTED 1
+#define INF_AUDIT_INACTIVE_CHILDREN 2
+#define INF_AUDIT_RUNNABLE_UNLINKED 3
+#define INF_AUDIT_LINK_MISMATCH 4
+#define INF_AUDIT_REC_MAX 8
+#define INF_AUDIT_INTERVAL_NS 1000000000ULL
+
+struct inf_audit_rec {
+	u64 ts;
+	u32 cpu;
+	u32 idx;
+	u32 kind;
+	u32 state;
+	u64 count;
+	u64 nr_children;
+	u32 linked;
+	u32 parent_idx;
+	u32 streak;
+	u32 pad;
+};
+
+struct inf_audit {
+	u64 next_ns; /* the next sample is due, written by the sampler */
+	u64 samples; /* audit samples taken */
+	u64 entities; /* entity slots that were part of a tree */
+	u64 violations; /* class hits, all samples */
+	u64 confirmed; /* class hits seen in two consecutive samples */
+	u64 streak[INF_AUDIT_KINDS]; /* consecutive samples that saw the class */
+	u64 seen[INF_AUDIT_KINDS]; /* samples that saw the class at all */
+	u64 max_streak[INF_AUDIT_KINDS];
+	u32 nrec;
+	u32 pad;
+	struct inf_audit_rec rec[INF_AUDIT_REC_MAX];
 };
 
 /* Controlled-refusal counter for the local DSQ insert regression test. */

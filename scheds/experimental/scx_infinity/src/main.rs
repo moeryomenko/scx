@@ -242,6 +242,18 @@ fn callback_name(cb: i32) -> &'static str {
     }
 }
 
+/// Name of one entity-chain audit class, from `intf.h`.
+fn audit_kind_name(kind: u32) -> &'static str {
+    match kind {
+        bpf_intf::INF_AUDIT_INACTIVE_LINKED => "inactive_linked",
+        bpf_intf::INF_AUDIT_INACTIVE_COUNTED => "inactive_counted",
+        bpf_intf::INF_AUDIT_INACTIVE_CHILDREN => "inactive_children",
+        bpf_intf::INF_AUDIT_RUNNABLE_UNLINKED => "runnable_unlinked",
+        bpf_intf::INF_AUDIT_LINK_MISMATCH => "link_mismatch",
+        _ => "unknown",
+    }
+}
+
 /// Name of one trace operation, from `intf.h`.
 fn trace_op_name(op: u32) -> &'static str {
     match op {
@@ -488,6 +500,60 @@ impl<'a> Scheduler<'a> {
             pool.detach_fail,
             pool.no_ctx
         );
+    }
+
+    /// Print the entity-chain audit of the run.
+    ///
+    /// The audit is in the default build: the BPF side samples the entity
+    /// store of every CPU once a second and counts the five states that make
+    /// a task unreachable from the root. A class is confirmed only when two
+    /// consecutive samples see it, so a move that is caught between two
+    /// locked steps is not reported as a defect. The first records name the
+    /// entity that showed each state.
+    fn log_audit(&self, when: &str) {
+        let key = 0u32.to_ne_bytes();
+        let Some(a) = read_map_value::<bpf_intf::inf_audit, _>(&self.skel.maps.audit_stor, &key)
+        else {
+            error!("audit: the audit entry is missing");
+            return;
+        };
+
+        let s = |v: &[u64; bpf_intf::INF_AUDIT_KINDS as usize]| -> String {
+            v.iter()
+                .map(|x| x.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+
+        info!(
+            "audit[{when}]: samples={} entities={} violations={} confirmed={} \
+             streak=[{}] seen=[{}] max_streak=[{}] records={}",
+            a.samples,
+            a.entities,
+            a.violations,
+            a.confirmed,
+            s(&a.streak),
+            s(&a.seen),
+            s(&a.max_streak),
+            a.nrec
+        );
+
+        for i in 0..(a.nrec as usize).min(bpf_intf::INF_AUDIT_REC_MAX as usize) {
+            let r = &a.rec[i];
+            info!(
+                "audit[{when}]: kind={} cpu={} idx={} state={} count={} \
+                 nr_children={} linked={} parent_idx={} streak={}",
+                audit_kind_name(r.kind),
+                r.cpu,
+                r.idx,
+                r.state,
+                r.count,
+                r.nr_children,
+                r.linked,
+                r.parent_idx,
+                r.streak
+            );
+        }
     }
 
     /// Print the diagnostic trace, the per-CPU queue snapshot and the task
@@ -890,6 +956,10 @@ impl<'a> Scheduler<'a> {
         let mut disp_q = 0u64;
         let mut link_lost = 0u64;
         let mut count_lost = 0u64;
+        let mut link_repairs = 0u64;
+        let mut link_repair_fail = 0u64;
+        let mut unlink_repairs = 0u64;
+        let mut ancestor_link_repairs = 0u64;
         let mut admit_unlinked = 0u64;
         let mut disp_empty_lost = 0u64;
         let mut run_unowned = 0u64;
@@ -1013,6 +1083,10 @@ impl<'a> Scheduler<'a> {
                 disp_q += stats.disp_q;
                 link_lost += stats.link_lost;
                 count_lost += stats.count_lost;
+                link_repairs += stats.link_repairs;
+                link_repair_fail += stats.link_repair_fail;
+                unlink_repairs += stats.unlink_repairs;
+                ancestor_link_repairs += stats.ancestor_link_repairs;
                 admit_unlinked += stats.admit_unlinked;
                 disp_empty_lost += stats.disp_empty_lost;
                 run_unowned += stats.run_unowned;
@@ -1139,7 +1213,11 @@ impl<'a> Scheduler<'a> {
              stale_requeues={stale_requeues} stale_skips={stale_skips} \
              disp: pop={disp_pop} renew={disp_renew} \
              total={disp_total} q={disp_q} path: link_lost={link_lost} \
-             count_lost={count_lost} admit_unlinked={admit_unlinked} \
+             count_lost={count_lost} link_repairs={link_repairs} \
+             link_repair_fail={link_repair_fail} \
+             unlink_repairs={unlink_repairs} \
+             ancestor_link_repairs={ancestor_link_repairs} \
+             admit_unlinked={admit_unlinked} \
              empty_lost={disp_empty_lost} unowned: run={run_unowned} \
              stop={stop_unowned} qui={q_unowned} slot_end_stop={slot_end_stop} \
              stop_slice_refused={stop_slice_refused} \
@@ -1152,6 +1230,8 @@ impl<'a> Scheduler<'a> {
              handoff_inflight={handoff_inflight} dsq_refusals={dsq_refusals} \
              entity: own={entity_own} ancestor={entity_ancestor}"
         );
+
+        self.log_audit("periodic");
 
         if self.trace
             && let Some(ctl) =
@@ -1196,6 +1276,7 @@ impl<'a> Scheduler<'a> {
         let _ = self.struct_ops.take();
         /* The quiescent value of the pool, after the workload drained. */
         self.log_task_pool("exit");
+        self.log_audit("exit");
         self.dump_diagnostics();
         uei_report!(&self.skel, uei)
     }
@@ -1232,6 +1313,17 @@ fn main() -> Result<()> {
         simplelog::TerminalMode::Stderr,
         simplelog::ColorChoice::Auto,
     )?;
+
+    /*
+     * The diagnostic trace is a build feature. A binary without it has no
+     * ring and no per-task snapshots, so `--trace` is refused instead of
+     * printing an empty dump that reads like a clean run.
+     */
+    if opts.trace && !cfg!(feature = "trace") {
+        bail!(
+            "--trace needs a build with the trace feature: cargo build -p scx_infinity --features trace"
+        );
+    }
 
     let overrides = opts.overrides();
     let config_path = config::resolve_path(opts.config.as_deref());

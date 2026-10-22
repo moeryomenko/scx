@@ -60,6 +60,19 @@
 #define INF_BISECT_VARIANT 0
 #endif
 
+/*
+ * The diagnostic trace is a build feature. It carries the transition ring,
+ * the per-task snapshots, the frozen traces and the custody checks, and it
+ * costs verifier instructions in the dispatch and enqueue programs. The
+ * default object compiles the calls out and keeps the counters, the
+ * handoff records and the tree audit below. The build script sets the
+ * define for `--features trace`; a direct clang build can pass it with
+ * -DINF_DIAG_TRACE=1.
+ */
+#ifndef INF_DIAG_TRACE
+#define INF_DIAG_TRACE 0
+#endif
+
 #define INF_FIXED_SLICE_NS 5000000ULL
 
 char _license[] SEC("license") = "GPL";
@@ -1005,6 +1018,45 @@ static __always_inline void inf_ho_leave(struct inf_cpu_ctx *cctx,
 	(((u64)(u32)(u16)(s32)(src)) | ((u64)(u32)(u16)(s32)(dst) << 16))
 
 /*
+ * The trace entry points as the rest of the file calls them. In a build
+ * without the trace the calls compile to nothing, so a hot path pays no
+ * instructions and no verifier states for a record it cannot use.
+ */
+#if !INF_DIAG_TRACE
+#define inf_trace(op, tctx, where, result) \
+	do {                               \
+	} while (0)
+#define inf_tt(cb, p, tctx, enq_flags, deq_flags) \
+	do {                                      \
+	} while (0)
+#define inf_tt_check(cb) 0
+#define inf_custody_mark(cpu, cctx) \
+	do {                        \
+	} while (0)
+#define inf_snap_core(cpu, tag, running_self) \
+	do {                                  \
+	} while (0)
+#define inf_snap_core_tick(cpu, cctx) \
+	do {                          \
+	} while (0)
+#define inf_snap_selection(cpu, blk) \
+	do {                         \
+	} while (0)
+#define inf_dump_queues() \
+	do {              \
+	} while (0)
+#define inf_trace_arm() \
+	do {            \
+	} while (0)
+#define inf_trace_seal() \
+	do {             \
+	} while (0)
+#define inf_depth_loss_note(blk, e, idx, site, pid) \
+	do {                                        \
+	} while (0)
+#endif /* !INF_DIAG_TRACE */
+
+/*
  * The ring records only transitions that can lose a task or repair one.
  * A normal insert or pop is kept in the per-task snapshot instead, so a
  * ten-minute campaign does not overwrite the ring with steady-state
@@ -1012,6 +1064,7 @@ static __always_inline void inf_ho_leave(struct inf_cpu_ctx *cctx,
  * requires: a non-zero value means the anomalous-event record is
  * incomplete. `total` counts every transition; `next` counts ringed ones.
  */
+#if INF_DIAG_TRACE
 static __always_inline bool inf_trace_in_ring(u32 op)
 {
 	switch (op) {
@@ -1031,6 +1084,7 @@ static __always_inline bool inf_trace_in_ring(u32 op)
 		return false;
 	}
 }
+#endif /* INF_DIAG_TRACE */
 
 /*
  * Record the tree position of a task in its snapshot. The selection reaches
@@ -1043,6 +1097,7 @@ static __always_inline bool inf_trace_in_ring(u32 op)
  * the moment of the transition, and a concurrent change can only make it
  * stale, never wrong about the queue the node was in.
  */
+#if INF_DIAG_TRACE
 static __noinline void inf_snap_path(task_ctx *tctx, struct inf_task_snap *snap)
 {
 	inf_cpu_block_t	   *blk;
@@ -1093,8 +1148,10 @@ static __noinline void inf_snap_path(task_ctx *tctx, struct inf_task_snap *snap)
 	}
 	snap->chain_broken = broken;
 }
+#endif /* INF_DIAG_TRACE */
 
 /* True when a RUNNABLE task cannot be reached from the root of its tree. */
+#if INF_DIAG_TRACE
 static __always_inline bool inf_path_lost(task_ctx	       *tctx,
 					  struct inf_task_snap *snap)
 {
@@ -1102,6 +1159,7 @@ static __always_inline bool inf_path_lost(task_ctx	       *tctx,
 		return false;
 	return snap->node_owner != 1 || snap->chain_broken != 0;
 }
+#endif /* INF_DIAG_TRACE */
 
 /*
  * Record a task that is RUNNABLE but whose node sits in no queue, or in a
@@ -1110,6 +1168,7 @@ static __always_inline bool inf_path_lost(task_ctx	       *tctx,
  * record carries the operation that left it there in its result field and the
  * ring holds every occurrence.
  */
+#if INF_DIAG_TRACE
 static __noinline void inf_trace_path_lost(task_ctx *tctx, u32 op)
 {
 	struct inf_trace_ctl *ctl;
@@ -1151,7 +1210,9 @@ static __noinline void inf_trace_path_lost(task_ctx *tctx, u32 op)
 		tctx->hist_idx++;
 	}
 }
+#endif /* INF_DIAG_TRACE */
 
+#if INF_DIAG_TRACE
 static __noinline void inf_trace(u32 op, task_ctx *tctx, u64 where, s64 result)
 {
 	struct inf_trace_ctl *ctl;
@@ -1269,12 +1330,14 @@ static __noinline void inf_trace(u32 op, task_ctx *tctx, u64 where, s64 result)
 	if (bpf_map_update_elem(&tsnap_stor, &pid, snap, BPF_ANY))
 		__sync_fetch_and_add(&ctl->task_overflow, 1);
 }
+#endif /* INF_DIAG_TRACE */
 
 /*
  * Exit-time snapshot of every per-CPU tree. The head pointer is read
  * without the queue lock: a diagnostic record may be stale, and taking a
  * queue lock in the exit path risks a second error.
  */
+#if INF_DIAG_TRACE
 static __noinline void inf_dump_queues(void)
 {
 	u32 ncpu = inf_nr_blocks;
@@ -1347,6 +1410,7 @@ static __noinline void inf_dump_queues(void)
 		}
 	}
 }
+#endif /* INF_DIAG_TRACE */
 
 /*
  * Arm the trace from ops.init(), before the first transition. The ring
@@ -1356,6 +1420,7 @@ static __noinline void inf_dump_queues(void)
  * slot. Writing cap, enabled and the counters here makes the entry
  * describe the live ring from the first dispatch on.
  */
+#if INF_DIAG_TRACE
 static __noinline void inf_trace_arm(void)
 {
 	struct inf_trace_ctl *ctl;
@@ -1371,6 +1436,7 @@ static __noinline void inf_trace_arm(void)
 	WRITE_ONCE(ctl->cap, INF_TRACE_CAP);
 	WRITE_ONCE(ctl->enabled, enable_trace ? 1 : 0);
 }
+#endif /* INF_DIAG_TRACE */
 
 /*
  * Write the exit status of the trace into the control entry, so the
@@ -1378,6 +1444,7 @@ static __noinline void inf_trace_arm(void)
  * enabled fields are written again here because an exit can follow a run
  * whose init never armed the trace.
  */
+#if INF_DIAG_TRACE
 static __noinline void inf_trace_seal(void)
 {
 	struct inf_trace_ctl *ctl;
@@ -1389,14 +1456,171 @@ static __noinline void inf_trace_seal(void)
 	WRITE_ONCE(ctl->cap, INF_TRACE_CAP);
 	WRITE_ONCE(ctl->enabled, enable_trace ? 1 : 0);
 }
+#endif /* INF_DIAG_TRACE */
+
+/*
+ * The entity-chain audit.
+ *
+ * The audit walks the entity store of one CPU and counts every state that
+ * makes a task unreachable from the root of its tree. It changes nothing in
+ * the tree: it is a read of the state that the selection walks, taken from a
+ * sample point that no repair runs in.
+ *
+ * A class that one sample sees can be the window between two locked steps of
+ * a move, so a class is confirmed only when two consecutive samples see it.
+ * A defect that strands a task is permanent, and the second sample names it.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+	__type(key, u32);
+	__type(value, struct inf_audit);
+} audit_stor SEC(".maps");
+
+static __noinline void inf_audit_cpu(inf_cpu_block_t *blk, u32 cpu,
+				     struct inf_audit *a, u32 *sample)
+{
+	u32 idx;
+
+	if (!inf_entity(blk, 0))
+		return;
+
+	bpf_for(idx, 0, INF_GROUPS_PER_CPU)
+	{
+		inf_group_entity_t *e	  = inf_entity(blk, idx);
+		inf_group_entity_t *par	  = NULL;
+		scx_edq_t	   *owner;
+		u32		    state, linked, kind = 0;
+		u64		    nr;
+
+		if (!e)
+			break;
+
+		state  = READ_ONCE(e->state);
+		owner  = inf_queue_node_owner(&e->qnode);
+		linked = owner ? 1 : 0;
+		nr     = inf_queue_nr(&e->children);
+
+		/*
+		 * A slot that no entity of a live tree uses carries no id,
+		 * no reference, no count and no child, and holds no node.
+		 */
+		if (state == INF_ENTITY_INACTIVE && !linked && !nr &&
+		    !e->count && !e->cgrp_id && !e->refs)
+			continue;
+
+		a->entities++;
+
+		if (state == INF_ENTITY_INACTIVE) {
+			if (linked)
+				kind = INF_AUDIT_INACTIVE_LINKED;
+			else if (e->count)
+				kind = INF_AUDIT_INACTIVE_COUNTED;
+			else if (nr)
+				kind = INF_AUDIT_INACTIVE_CHILDREN;
+		} else if (state == INF_ENTITY_RUNNABLE && idx) {
+			par = inf_entity(blk, e->parent_idx);
+			if (!linked)
+				kind = INF_AUDIT_RUNNABLE_UNLINKED;
+			else if (par && owner != &par->children)
+				kind = INF_AUDIT_LINK_MISMATCH;
+		}
+
+		if (!kind)
+			continue;
+
+		a->violations++;
+		if (kind < INF_AUDIT_KINDS)
+			sample[kind] = 1;
+
+		if (a->nrec < INF_AUDIT_REC_MAX) {
+			struct inf_audit_rec *r = &a->rec[a->nrec];
+
+			r->ts	       = scx_bpf_now();
+			r->cpu	       = cpu;
+			r->idx	       = idx;
+			r->kind	       = kind;
+			r->state       = state;
+			r->count       = e->count;
+			r->nr_children = nr;
+			r->linked      = linked;
+			r->parent_idx  = e->parent_idx;
+			r->streak      = (u32)a->streak[kind] + 1;
+			a->nrec++;
+		}
+	}
+}
+
+/*
+ * Sample the entity store of every CPU. The interval keeps the cost off the
+ * tick path, and the sampler returns when another CPU took the sample this
+ * second. From ops.exit() the sample is forced, so the state of a run that
+ * the watchdog disabled is recorded before the arena goes away.
+ */
+static __noinline void inf_tree_audit(bool force)
+{
+	struct inf_audit *a;
+	u64		  now, due;
+	u32		  key = 0, cpu, k;
+	u32		  sample[INF_AUDIT_KINDS];
+
+	if (!inf_blocks || !inf_nr_blocks)
+		return;
+
+	a = bpf_map_lookup_elem(&audit_stor, &key);
+	if (!a)
+		return;
+
+	now = scx_bpf_now();
+	if (!force) {
+		due = READ_ONCE(a->next_ns);
+		if (due && now < due)
+			return;
+		if (!__sync_bool_compare_and_swap(&a->next_ns, due,
+						  now + INF_AUDIT_INTERVAL_NS))
+			return;
+	}
+
+	__builtin_memset(sample, 0, sizeof(sample));
+	a->samples++;
+
+	bpf_for(cpu, 0, INF_MAX_CPUS)
+	{
+		inf_cpu_block_t *blk;
+
+		if (cpu >= inf_nr_blocks)
+			break;
+		blk = inf_block((s32)cpu);
+		if (blk)
+			inf_audit_cpu(blk, cpu, a, sample);
+	}
+
+	bpf_for(k, 0, INF_AUDIT_KINDS)
+	{
+		if (sample[k]) {
+			a->streak[k]++;
+			a->seen[k]++;
+			if (a->streak[k] > a->max_streak[k])
+				a->max_streak[k] = a->streak[k];
+			if (a->streak[k] >= 2)
+				a->confirmed++;
+		} else {
+			a->streak[k] = 0;
+		}
+	}
+}
+
 
 /* The control entry of the per-task transition trace. */
+#if INF_DIAG_TRACE
 static __always_inline struct inf_tt_ctl *inf_tt_ctl(void)
 {
 	u32 key = 0;
 
 	return bpf_map_lookup_elem(&ttctl_stor, &key);
 }
+#endif /* INF_DIAG_TRACE */
 
 /*
  * The queue membership of the node of @tctx, read from the side the record
@@ -1405,6 +1629,7 @@ static __always_inline struct inf_tt_ctl *inf_tt_ctl(void)
  * RUNNABLE task with a membership other than 1 is unreachable from the
  * selection, which is the first half of the invariant violation.
  */
+#if INF_DIAG_TRACE
 static __noinline u32 inf_tt_node_owner(task_ctx *tctx, u32 *chain_broken)
 {
 	inf_cpu_block_t	   *blk;
@@ -1447,6 +1672,7 @@ static __noinline u32 inf_tt_node_owner(task_ctx *tctx, u32 *chain_broken)
 	*chain_broken = broken;
 	return INF_TT_NODE_OWN;
 }
+#endif /* INF_DIAG_TRACE */
 
 /*
  * Append one record of @cb to the trace of @p.
@@ -1461,6 +1687,7 @@ static __noinline u32 inf_tt_node_owner(task_ctx *tctx, u32 *chain_broken)
  * holds the moment the task lost its last reference, and a later callback
  * would only replace the evidence.
  */
+#if INF_DIAG_TRACE
 static __noinline void inf_tt(u32 cb, struct task_struct *p, task_ctx *tctx,
 			      u64 enq_flags, u64 deq_flags)
 {
@@ -1579,10 +1806,14 @@ static __noinline void inf_tt(u32 cb, struct task_struct *p, task_ctx *tctx,
 		}
 	}
 }
+#endif /* INF_DIAG_TRACE */
 
+#if INF_DIAG_TRACE
 static __noinline void inf_chain_note(task_ctx *tctx, u32 slot);
+#endif /* INF_DIAG_TRACE */
 
 /* Copy the trace of @pid into the next frozen slot and count it. */
+#if INF_DIAG_TRACE
 static __noinline void inf_tt_freeze(s32 pid, u32 cb, u32 cpu, task_ctx *tctx)
 {
 	struct inf_tt_val *v;
@@ -1625,6 +1856,7 @@ static __noinline void inf_tt_freeze(s32 pid, u32 cb, u32 cpu, task_ctx *tctx)
 	__sync_fetch_and_add(&ctl->canaries, 1);
 	bpf_printk("SCX_INFINITY_CANARY pid=%d cb=%d", pid, (int)cb);
 }
+#endif /* INF_DIAG_TRACE */
 
 /*
  * Test the invariant that a runnable task always has a scheduler reference.
@@ -1662,6 +1894,7 @@ static __noinline void inf_tt_freeze(s32 pid, u32 cb, u32 cpu, task_ctx *tctx)
  * dmesg, once per CPU. The pids that CPU handled are in its per-CPU ring and
  * the full check of ops.tick() freezes the trace of the task it finds.
  */
+#if INF_DIAG_TRACE
 static __noinline void inf_custody_mark(s32 cpu, struct inf_cpu_ctx *cctx)
 {
 	struct rq *rq = scx_bpf_locked_rq();
@@ -1692,6 +1925,7 @@ static __noinline void inf_custody_mark(s32 cpu, struct inf_cpu_ctx *cctx)
 	bpf_printk("SCX_INFINITY_CUSTODY cpu=%d missing=%d depth=%d local=%d",
 		   cpu, (int)missing, (int)depth, (int)rq->scx.local_dsq.nr);
 }
+#endif /* INF_DIAG_TRACE */
 
 /*
  * Decide whether a task that the core counts as runnable has a reference in
@@ -1708,6 +1942,7 @@ static __noinline void inf_custody_mark(s32 cpu, struct inf_cpu_ctx *cctx)
  * scheduler can reach. The verdict is returned and counted, so a run shows
  * how often each class happened and not only that a check ran.
  */
+#if INF_DIAG_TRACE
 static __noinline u32 inf_tt_lost(task_ctx *tctx)
 {
 	struct inf_cpu_ctx *pc;
@@ -1758,7 +1993,9 @@ static __noinline u32 inf_tt_lost(task_ctx *tctx)
 
 	return INF_TT_WHY_NO_STATE;
 }
+#endif /* INF_DIAG_TRACE */
 
+#if INF_DIAG_TRACE
 static __noinline u32 inf_tt_check_one(s32 pid, s32 cpu, u32 cb)
 {
 	struct inf_tt_ctl  *ctl;
@@ -1845,6 +2082,7 @@ static __noinline u32 inf_tt_check_one(s32 pid, s32 cpu, u32 cb)
 	bpf_task_release(p);
 	return 1;
 }
+#endif /* INF_DIAG_TRACE */
 
 /*
  * Test the invariant over the tasks this CPU handled recently.
@@ -1854,6 +2092,7 @@ static __noinline u32 inf_tt_check_one(s32 pid, s32 cpu, u32 cb)
  * come from the ring that the enqueue writes, because the stranded task is
  * in no queue of this scheduler and no structure of the policy can name it.
  */
+#if INF_DIAG_TRACE
 static __noinline u32 inf_tt_check(u32 cb)
 {
 	struct inf_cpu_ctx *cctx;
@@ -1922,6 +2161,7 @@ static __noinline u32 inf_tt_check(u32 cb)
 
 	return found;
 }
+#endif /* INF_DIAG_TRACE */
 
 static __always_inline bool inf_cpu_bw_enabled(void)
 {
@@ -2257,6 +2497,82 @@ static __always_inline void inf_bitmap_free(inf_cpu_block_t *blk, u32 idx)
 }
 
 /*
+ * Take @e out of its parent queue and report whether it still holds a child.
+ *
+ * The removal is the decision, not a read of the queue count: the node is
+ * removed first and the child queue is read after the removal, so a child
+ * that arrived inside the window is seen and keeps the entity reachable. The
+ * result of the removal is honoured: a node that sits in another queue, or in
+ * no queue at all, is unlinked from wherever it is and counted, because a
+ * membership the code does not know about is what made every later insert of
+ * the entity fail.
+ *
+ * The caller marks the entity INACTIVE only when the return value is true.
+ */
+static __noinline bool inf_unlink_entity(inf_cpu_block_t    *blk,
+					 inf_group_entity_t *e)
+{
+	inf_group_entity_t *par = inf_entity(blk, e->parent_idx);
+	int		    ret;
+
+	ret = par ? inf_q_remove(&par->children, &e->qnode) : -ENOENT;
+	if (ret) {
+		INF_STAT_INC(unlink_repairs);
+		inf_queue_unlink(&e->qnode);
+	}
+
+	return inf_queue_nr(&e->children) == 0;
+}
+
+static __noinline int inf_link_entity(inf_cpu_block_t    *blk,
+				      inf_group_entity_t *e, u32 mode);
+
+/*
+ * End the life of a counted child of its parent queue.
+ *
+ * The removal comes first and the result decides: an entity whose queue still
+ * holds a child after the removal keeps its place in the tree. The state is
+ * written INACTIVE and then verified again, because another CPU admits into
+ * this entity under the destination queue lock and not under this runqueue
+ * lock, so a child can arrive between the removal and the state write. A link
+ * that lands behind the INACTIVE write would leave the entity unlinked with a
+ * populated child queue, and every task below it would be unreachable: that
+ * is the state the tree dump of the stall evidence shows.
+ *
+ * Returns true when the entity left the tree.
+ */
+static __noinline bool inf_entity_drop(inf_cpu_block_t *blk,
+				       inf_group_entity_t *e)
+{
+	u64 nr;
+
+	if (!inf_unlink_entity(blk, e))
+		return false;
+
+	WRITE_ONCE(e->state, INF_ENTITY_INACTIVE);
+	nr = inf_queue_nr(&e->children);
+	if (!nr && !READ_ONCE(e->count))
+		return true;
+
+	/*
+	 * A child, or the count of one, arrived inside the window. The entity
+	 * does not leave the tree, and it is put back here in both cases: an
+	 * admission of another CPU can have checked the link before this
+	 * removal and skipped its own insert, so the count is not proof that
+	 * some other path will link the entity. A concurrent insert of the
+	 * same entity makes the insert fail and the repair re-inserts it
+	 * once.
+	 */
+	INF_STAT_INC(count_lost);
+	INF_STAT_INC(count_repairs);
+	if (nr)
+		WRITE_ONCE(e->count, nr);
+	if (inf_link_entity(blk, e, INF_INS_TAIL))
+		INF_STAT_INC(link_repair_fail);
+	return false;
+}
+
+/*
  * Create the entity of one cgroup on this CPU. The entity starts with
  * the frontier of its parent, so a new entity never sits below the
  * parent's frontier.
@@ -2278,6 +2594,14 @@ static __noinline u32 inf_entity_create(inf_cpu_block_t *blk, u64 cgrp_id,
 		inf_bitmap_free(blk, idx);
 		return INF_IDX_NONE;
 	}
+
+	/*
+	 * The slot can still hold a membership of the entity that used it
+	 * before. A membership left behind is invisible to this entity and
+	 * makes every later insert fail with the queue's own verdict, so it
+	 * is removed before the node is reinitialised.
+	 */
+	inf_queue_unlink(&e->qnode);
 
 	e->v_q16 = 0;
 	e->rem	 = 0;
@@ -2357,11 +2681,13 @@ static __noinline void inf_entity_release(inf_cpu_block_t *blk, u32 idx)
 		return;
 	}
 
-	if (e->state == INF_ENTITY_RUNNABLE) {
-		par = inf_entity(blk, e->parent_idx);
-		if (par)
-			inf_q_remove(&par->children, &e->qnode);
-	}
+	/*
+	 * The slot is about to be reused. Remove the node from whatever queue
+	 * holds it, not only from the parent queue of a RUNNABLE entity: a
+	 * membership that the state does not imply is exactly the stale link
+	 * that blocks the next entity of this slot.
+	 */
+	inf_queue_unlink(&e->qnode);
 
 	/* Only the index entry that still points at this slot is removed. */
 	if (inf_index_find(blk, e->cgrp_id) == idx)
@@ -2604,9 +2930,52 @@ static __always_inline void inf_gate_commit(inf_group_entity_t *parent,
 	__sync_fetch_and_add(&parent->tie_seq, 1);
 }
 
-/* Insert a group entity into the queue of its parent. */
-static __always_inline int inf_link_entity(inf_cpu_block_t    *blk,
-					   inf_group_entity_t *e, u32 mode)
+/*
+ * Repair a refused entity insert.
+ *
+ * A queue refuses the insert when the node is still a member of a queue, or
+ * when a teardown marked the membership dead. The removal names the queue
+ * that owns the node, so the stale membership is removed from wherever it
+ * is, not from the parent queue that the insert expected. The insert is then
+ * retried once: after the removal the node is in no queue, and the retry can
+ * only fail on a dead membership, which the removal reinitialises.
+ */
+static __noinline int inf_link_repair(inf_cpu_block_t    *blk,
+				      inf_group_entity_t *e)
+{
+	inf_group_entity_t *par = inf_entity(blk, e->parent_idx);
+	int		    ret;
+
+	INF_STAT_INC(link_lost);
+	if (!par)
+		return -ENOENT;
+
+	if (inf_queue_unlink(&e->qnode)) {
+		INF_STAT_INC(link_repair_fail);
+		return -EBUSY;
+	}
+
+	ret = inf_q_insert(&par->children, &e->qnode, e->v_q16);
+	if (ret) {
+		INF_STAT_INC(link_repair_fail);
+		return ret;
+	}
+
+	INF_STAT_INC(link_repairs);
+	return 0;
+}
+
+/*
+ * Insert a group entity into the queue of its parent.
+ *
+ * A subprogram and not an inlined body: every call site would otherwise
+ * carry its own copy of the gate, the frontier clamp and the repair, and the
+ * dispatch program is at the verifier instruction limit. The two arena
+ * pointers have the same type at every site, so the verifier validates the
+ * body once.
+ */
+static __noinline int inf_link_entity(inf_cpu_block_t    *blk,
+				      inf_group_entity_t *e, u32 mode)
 {
 	inf_group_entity_t *par = inf_entity(blk, e->parent_idx);
 	int		    ret;
@@ -2622,23 +2991,24 @@ static __always_inline int inf_link_entity(inf_cpu_block_t    *blk,
 	 * which is what weights the shares.
 	 */
 	if (par->frontier_q16 > e->v_q16 &&
-	    par->frontier_q16 - e->v_q16 >
-		    INF_BAND_Q16 * INF_SLICE_WEIGHT_MAX)
+	    par->frontier_q16 - e->v_q16 > INF_BAND_Q16 * INF_SLICE_WEIGHT_MAX)
 		e->v_q16 = par->frontier_q16;
 	e->class = inf_gate_class(par, mode);
 	e->tie	 = par->tie_seq++;
 	ret	 = inf_q_insert(&par->children, &e->qnode, e->v_q16);
 	if (ret) {
 		/*
-		 * The entity is not in its parent queue, so nothing below
-		 * it is reachable from the root. Marking it RUNNABLE here
-		 * would hide every descendant from the selection and move
-		 * no counter, so the failure is recorded and the entity
-		 * stays INACTIVE. Its children are still in its own child
-		 * queue; the caller repairs the path.
+		 * A node that a stale membership still holds makes every
+		 * later insert of this entity fail with the queue's own
+		 * verdict, so the refusal is repaired instead of only being
+		 * counted: the node leaves the queue that owns it and the
+		 * insert is retried once. An entity that stays unlinked keeps
+		 * its INACTIVE state and moves a counter, so a failure that
+		 * the repair cannot close is still named.
 		 */
-		INF_STAT_INC(link_lost);
-		return ret;
+		ret = inf_link_repair(blk, e);
+		if (ret)
+			return ret;
 	}
 	e->state = INF_ENTITY_RUNNABLE;
 	return 0;
@@ -2665,19 +3035,20 @@ static __noinline void inf_count_up(inf_cpu_block_t *blk, u32 idx, u32 mode)
 			return;
 
 		/*
-		 * A counted entity must sit in its parent queue. The count
-		 * alone is not proof: an entity can hold a positive count and
-		 * still be unlinked, and every task below it is then
-		 * unreachable from the root. The link is repaired here, and the
-		 * walk continues so the ancestors that were left unlinked with
-		 * it are repaired as well. The count of an ancestor that was
-		 * already linked is not increased twice, because the repair
-		 * only runs for an entity whose link is missing.
+		 * The entity that this admission makes reachable must sit in
+		 * the child queue of its parent. The count alone is not proof:
+		 * an entity can hold a positive count and still be unlinked,
+		 * and every task below it is then unreachable from the root.
+		 * The link is repaired here, and an entity that was already
+		 * counted above this one ends the walk, because the path above
+		 * it is already represented in the tree.
 		 */
 		if (!dormant)
 			INF_STAT_INC(link_lost);
 		if (inf_link_entity(blk, e, mode))
 			return;
+		if (!dormant)
+			INF_STAT_INC(ancestor_link_repairs);
 		idx = e->parent_idx;
 	}
 }
@@ -2690,6 +3061,7 @@ static __noinline void inf_count_up(inf_cpu_block_t *blk, u32 idx, u32 mode)
  * task, and its count next to its child count says whether the count or the
  * link was wrong.
  */
+#if INF_DIAG_TRACE
 static __noinline void inf_chain_note(task_ctx *tctx, u32 slot)
 {
 	struct inf_chain_snap *snap;
@@ -2770,8 +3142,10 @@ static __noinline void inf_chain_note(task_ctx *tctx, u32 slot)
 		}
 	}
 }
+#endif /* INF_DIAG_TRACE */
 
 /* Publish one bad unlink of the entity counts. The first eight are kept. */
+#if INF_DIAG_TRACE
 static __noinline void inf_depth_loss_note(inf_cpu_block_t    *blk,
 					   inf_group_entity_t *e, u32 idx,
 					   u32 site, s32 pid)
@@ -2802,6 +3176,7 @@ static __noinline void inf_depth_loss_note(inf_cpu_block_t    *blk,
 	d->cpu	       = (u32)inf_entity_index(blk, e);
 	d->seq	       = slot;
 }
+#endif /* INF_DIAG_TRACE */
 
 /*
  * One dispatchable child of @idx left. The entity and its dormant
@@ -2823,30 +3198,20 @@ static __noinline void inf_count_down(inf_cpu_block_t *blk, u32 idx, u32 site,
 		if (e->count > 0)
 			return;
 		if (e->state == INF_ENTITY_RUNNABLE) {
-			inf_group_entity_t *par =
-				inf_entity(blk, e->parent_idx);
-			u32 nr = inf_queue_nr(&e->children);
-
 			/*
-			 * The entity is about to leave its parent queue
-			 * because its last counted child left. A child that is
-			 * still queued here is not counted, so the count is
-			 * wrong and the queue is not. Unlinking it would strand
-			 * every task below it, so the count is repaired from
-			 * the queue and the entity keeps its link. The defect is
-			 * still counted, and the repair is not a rescue: no task
-			 * leaves a queue and no task is re-admitted.
+			 * The entity leaves its parent queue because its last
+			 * counted child left. The removal decides, and the
+			 * child queue is read only after it: a child that
+			 * arrived inside the window is still in the queue, so
+			 * the entity is put back and its count is taken from
+			 * the queue instead of from the decrement above.
+			 * Unlinking it on a count alone is what stranded a
+			 * populated subtree under an unreachable parent.
 			 */
-			if (nr) {
-				INF_STAT_INC(count_lost);
-				INF_STAT_INC(count_repairs);
+			if (!inf_entity_drop(blk, e)) {
 				inf_depth_loss_note(blk, e, idx, site, pid);
-				WRITE_ONCE(e->count, nr);
 				return;
 			}
-			if (par)
-				inf_q_remove(&par->children, &e->qnode);
-			e->state = INF_ENTITY_INACTIVE;
 		}
 		idx = e->parent_idx;
 	}
@@ -3270,15 +3635,16 @@ inf_select_leaf(inf_cpu_block_t *blk, inf_cpu_block_t *scratch, task_ctx **leaf)
 				 * stale: an empty root is an empty tree.
 				 */
 				if (ret == -ENOENT && depth > 0) {
-					inf_group_entity_t *par =
-						inf_entity(blk, pe->parent_idx);
-
-					if (par)
-						inf_q_remove(&par->children,
-							     &pe->qnode);
-					pe->state = INF_ENTITY_INACTIVE;
-					pe->count = 0;
-					INF_STAT_INC(state_repairs);
+					/*
+					 * The removal decides whether the
+					 * entity is stale or the count is. A
+					 * child that is still in the queue
+					 * after the removal keeps the entity
+					 * alive, and the selection starts
+					 * again on a tree it can reach.
+					 */
+					if (inf_entity_drop(blk, pe))
+						INF_STAT_INC(state_repairs);
 					cause	= INF_SEL_EMPTY;
 					restart = true;
 					break;
@@ -3312,17 +3678,17 @@ inf_select_leaf(inf_cpu_block_t *blk, inf_cpu_block_t *scratch, task_ctx **leaf)
 					 * winner the band scan already chose.
 					 */
 					if (!nr) {
-						inf_group_entity_t *par =
-							inf_entity(
-								blk,
-								e->parent_idx);
-
-						if (par)
-							inf_q_remove(
-								&par->children,
-								&e->qnode);
-						e->state = INF_ENTITY_INACTIVE;
-						INF_STAT_INC(state_repairs);
+						/*
+						 * Same decision as in the
+						 * stale-scan path: the
+						 * removal is taken first, and
+						 * a child that is still in
+						 * the queue after it keeps
+						 * the entity in the tree.
+						 */
+						if (inf_entity_drop(blk, e))
+							INF_STAT_INC(
+								state_repairs);
 						inf_queue_drop(
 							scratch->win.task);
 						cause	= INF_SEL_ZERO_COUNT;
@@ -5149,6 +5515,7 @@ static __noinline bool inf_steal_one(s32 cpu, struct inf_cpu_ctx *cctx,
  * dispatch queue, so the record is worth keeping from the callbacks that
  * still run on an otherwise idle CPU.
  */
+#if INF_DIAG_TRACE
 static __noinline void inf_snap_core(s32 cpu, u32 tag, bool running_self)
 {
 	struct inf_core_snap  *snap;
@@ -5210,6 +5577,7 @@ static __noinline void inf_snap_core(s32 cpu, u32 tag, bool running_self)
 		e->cb[i] = cctx->cb[i];
 	e->pad = cctx->cb_next;
 }
+#endif /* INF_DIAG_TRACE */
 
 /*
  * The core record of a CPU whose tick is worth keeping: the tree holds
@@ -5217,6 +5585,7 @@ static __noinline void inf_snap_core(s32 cpu, u32 tag, bool running_self)
  * core counts queued tasks that the tree does not hold. A clean CPU writes
  * nothing, so an empty ring is a result and not a missing instrument.
  */
+#if INF_DIAG_TRACE
 static __noinline void inf_snap_core_tick(s32 cpu, struct inf_cpu_ctx *cctx)
 {
 	struct rq *rq;
@@ -5251,7 +5620,9 @@ static __noinline void inf_snap_core_tick(s32 cpu, struct inf_cpu_ctx *cctx)
 	if (depth > 0 && now && scx_bpf_now() - now > 5000000ULL)
 		inf_snap_core(cpu, INF_CB_TICK, true);
 }
+#endif /* INF_DIAG_TRACE */
 
+#if INF_DIAG_TRACE
 static __noinline void inf_snap_selection(s32 cpu, inf_cpu_block_t *blk)
 {
 	struct inf_dispatch_snap *snap;
@@ -5401,6 +5772,7 @@ static __noinline void inf_snap_selection(s32 cpu, inf_cpu_block_t *blk)
 		}
 	}
 }
+#endif /* INF_DIAG_TRACE */
 
 /*
  * Rescue every task of this CPU that the core holds with no scheduler
@@ -7006,6 +7378,14 @@ void BPF_STRUCT_OPS(infinity_tick, struct task_struct *p)
 	 */
 	INF_STAT_INC(tick_slots);
 
+	/*
+	 * Sample the entity chains of every CPU once a second. The sampler
+	 * returns at once when another CPU already took this sample, so the
+	 * cost of the walk is one tick per second for the whole machine and
+	 * not one per CPU.
+	 */
+	inf_tree_audit(false);
+
 	tctx = inf_task_ctx(p);
 	if (!tctx)
 		return;
@@ -7071,10 +7451,10 @@ void BPF_STRUCT_OPS(infinity_tick, struct task_struct *p)
 	 * here, and the core picks the next task.
 	 */
 	if (local && event == INF_EV_POST_SLOT && READ_ONCE(p->scx.slice)) {
-		inf_cpu_block_t	  *blk = inf_block(tctx->path_cpu);
+		inf_cpu_block_t	   *blk = inf_block(tctx->path_cpu);
 		inf_group_entity_t *leaf;
-		u64		   head_v = 0;
-		bool		   cont = false;
+		u64		    head_v = 0;
+		bool		    cont   = false;
 
 		leaf = blk ? inf_entity(blk, (u32)tctx->parent_idx) : NULL;
 		if (leaf && inf_peek_leaf_v(blk, &head_v))
@@ -7654,6 +8034,20 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init)
 	/* Arm the diagnostic ring before the first transition. */
 	inf_trace_arm();
 
+	/*
+	 * The audit map is pinned, so a previous run of this scheduler leaves
+	 * its samples in it. The entry is cleared here, so a run reports its
+	 * own samples and not the sum of every run since the map was pinned.
+	 */
+	{
+		u32		   akey = 0;
+		struct inf_audit *a = bpf_map_lookup_elem(&audit_stor, &akey);
+
+		if (a)
+			__builtin_memset(a, 0, sizeof(*a));
+	}
+
+#if INF_DIAG_TRACE
 	/* Arm the per-task transition trace beside the ring. */
 	{
 		struct inf_tt_ctl *ttc = inf_tt_ctl();
@@ -7663,6 +8057,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(infinity_init)
 			WRITE_ONCE(ttc->enabled, enable_trace ? 1 : 0);
 		}
 	}
+#endif /* INF_DIAG_TRACE */
 
 	/*
 	 * The entity store of every possible CPU: the group entities, the
@@ -7743,8 +8138,11 @@ void BPF_STRUCT_OPS(infinity_exit, struct scx_exit_info *ei)
 
 	/*
 	 * Snapshot the trees while the arena still owns them, so the exit
-	 * dump names the queue and task state of a stalled run.
+	 * dump names the queue and task state of a stalled run. The audit is
+	 * forced here: the last sample before a disable can precede the
+	 * state that disabled the scheduler.
 	 */
+	inf_tree_audit(true);
 	inf_dump_queues();
 	inf_trace_seal();
 

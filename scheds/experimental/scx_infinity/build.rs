@@ -28,6 +28,18 @@ fn main() {
     /* The warning is not actionable for this scheduler. */
     add_bpf_warning_suppression("-Wno-missing-declarations");
 
+    /*
+     * The diagnostic trace is a build feature. The BPF side needs the
+     * define, because every call site of the trace is compiled out of
+     * the default object: the ring, the per-task snapshots and the
+     * custody checks cost verifier instructions in the dispatch and
+     * enqueue programs, and neither fits them together with a repair.
+     */
+    if std::env::var_os("CARGO_FEATURE_TRACE").is_some() {
+        add_bpf_warning_suppression("-DINF_DIAG_TRACE=1");
+        println!("cargo:rustc-env=SCX_INFINITY_TRACE=1");
+    }
+
     let mut builder = scx_cargo::BpfBuilder::new().unwrap();
     builder
         .enable_intf("src/bpf/intf.h", "bpf_intf.rs")
