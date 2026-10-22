@@ -9,11 +9,8 @@ license = "GPL-2.0-only"
 
 [features]
 default = []
-# The diagnostic trace: the transition ring, the per-task snapshots, the
-# frozen traces and the custody checks. It costs verifier budget in the
-# dispatch and enqueue programs, so the default binary leaves it out and
-# keeps the counters, the handoff records and the tree audit.
-trace = []
+# Prototype: replace the EDQ ready queue with an intrusive FIFO list.
+queue-list = []
 
 [dependencies]
 anyhow = "1"

@@ -1,27 +1,44 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * The per-parent child queue of the entity tree.
+ * The scheduler-owned per-CPU ready queue.
  *
- * Every level of the tree is an eligible deadline queue from lib/edq.h.
- * The queue is ordered by the normalized service value of its children:
- * the service value is the EDQ deadline and the EDQ sequence breaks an
- * equal-service tie. A child leaves with an exact node removal, and a hold
- * keeps a child alive across the gap between two queue locks.
+ * sched_ext has no queue that the scheduler can reorder under its own
+ * lock, so the ready queue lives in scheduler memory. The default is the
+ * eligible deadline queue from lib/edq.h: an intrusive AVL tree with a
+ * hold count and exact node removal. The queue-list build feature
+ * replaces it with an intrusive FIFO list that exposes the same
+ * interface.
  *
- * The intrusive FIFO list prototype of revision 3 is gone. Its insert used
- * the key only to choose the head or the tail, so it has no key search and
- * cannot order a child queue by service. It is not a hierarchy backend.
+ * Both implementations are ordered by the scheduler-owned key. A head key
+ * counts down from INF_KEY_MID and a tail key counts up from it, so the
+ * newest head insert is first and a tail insert is last.
  */
 #pragma once
 
 #include <lib/edq.h>
 
+#ifdef INF_QUEUE_LIST
+#include "queue_list.h"
+
+typedef struct inf_list __arena	     inf_queue_t;
+typedef struct inf_list_node __arena inf_queue_node_t;
+/* A struct member cannot repeat the address space of its type. */
+#define INF_QUEUE_NODE_FIELD struct inf_list_node
+#else
+typedef struct scx_edq __arena	    inf_queue_t;
+typedef struct scx_edq_task __arena inf_queue_node_t;
+#define INF_QUEUE_NODE_FIELD struct scx_edq_task
+#endif
+
 /*
- * Initialize an empty queue and its lock. Called once per group entity
- * when the entity is created.
+ * Initialize an empty queue and its lock. Called once per possible CPU
+ * from the sleepable ops.init().
  */
-static __always_inline void inf_queue_init(scx_edq_t *queue)
+static __always_inline void inf_queue_init(inf_queue_t *queue)
 {
+#ifdef INF_QUEUE_LIST
+	inf_list_init(queue);
+#else
 	WRITE_ONCE(queue->root, NULL);
 	WRITE_ONCE(queue->first, NULL);
 	WRITE_ONCE(queue->first_deadline, 0);
@@ -29,149 +46,152 @@ static __always_inline void inf_queue_init(scx_edq_t *queue)
 	WRITE_ONCE(queue->lock, 0);
 	WRITE_ONCE(queue->nr, 0);
 	WRITE_ONCE(queue->seq, 0);
+#endif
 }
 
-/*
- * Insert a child with @v as its service value. The eligibility and the
- * slice fields carry no policy meaning in this tree.
- */
-static __always_inline int inf_queue_insert(scx_edq_t		*queue,
-					    scx_edq_task_t __arg_arena *node,
-					    u64				v)
+static __always_inline int inf_queue_insert(inf_queue_t			 *queue,
+					    inf_queue_node_t __arg_arena *node,
+					    u64 key, u64 slice)
 {
-	return scx_edq_insert(queue, node, v, 0, 0);
+#ifdef INF_QUEUE_LIST
+	return inf_list_insert(queue, node, key, slice);
+#else
+	return scx_edq_insert(queue, node, key, 0, slice);
+#endif
 }
 
-/*
- * Remove a child. A busy queue lock is retried with the blocking variant,
- * because a queue lock is never held across a callback and a failed
- * remove here would strand a runnable task.
- */
-static __always_inline int inf_queue_remove(scx_edq_t		*queue,
-					    scx_edq_task_t __arg_arena *node)
+static __always_inline int inf_queue_remove(inf_queue_t			 *queue,
+					    inf_queue_node_t __arg_arena *node)
 {
-	int ret = scx_edq_try_remove(queue, node);
-
-	if (ret == -EBUSY)
-		ret = scx_edq_remove(queue, node);
-	return ret;
+#ifdef INF_QUEUE_LIST
+	return inf_list_remove(queue, node);
+#else
+	return scx_edq_remove(queue, node);
+#endif
 }
 
-/* Hold a child without removing it. */
-static __always_inline void inf_queue_hold(scx_edq_task_t __arg_arena *node)
+static __always_inline int
+inf_queue_try_remove(inf_queue_t *queue, inf_queue_node_t __arg_arena *node)
 {
+#ifdef INF_QUEUE_LIST
+	return inf_list_try_remove(queue, node);
+#else
+	return scx_edq_try_remove(queue, node);
+#endif
+}
+
+/* Pop the head, optionally holding the node across the caller's use. */
+static __always_inline u64 inf_queue_pop(inf_queue_t *queue, bool hold)
+{
+#ifdef INF_QUEUE_LIST
+	return inf_list_pop(queue, hold);
+#else
+	return scx_edq_pop(queue, hold);
+#endif
+}
+
+/* Hold the head without removing it. */
+static __always_inline u64 inf_queue_peek_hold(inf_queue_t *queue)
+{
+#ifdef INF_QUEUE_LIST
+	return inf_list_peek_hold(queue);
+#else
+	return scx_edq_peek_hold(queue);
+#endif
+}
+
+static __always_inline void inf_queue_hold(inf_queue_node_t __arg_arena *node)
+{
+#ifdef INF_QUEUE_LIST
+	inf_list_node_hold(node);
+#else
 	scx_edq_task_hold(node);
+#endif
 }
 
-/* Drop a hold taken by inf_queue_hold() or by a queue peek. */
-static __always_inline void inf_queue_drop(scx_edq_task_t __arg_arena *node)
+static __always_inline void inf_queue_drop(inf_queue_node_t __arg_arena *node)
 {
+#ifdef INF_QUEUE_LIST
+	inf_list_node_drop(node);
+#else
 	scx_edq_task_drop(node);
+#endif
 }
 
-/* Bring a freshly allocated child to the state of one in no queue. */
-static __always_inline int inf_queue_node_init(scx_edq_task_t __arg_arena *node)
+static __always_inline int
+inf_queue_node_init(inf_queue_node_t __arg_arena *node)
 {
+#ifdef INF_QUEUE_LIST
+	return inf_list_node_init(node);
+#else
 	return scx_edq_task_init(node);
+#endif
 }
 
 /*
- * Remove a child from any queue and wait for the last hold to drop. A
- * task context is never freed while a selection or a steal still holds it.
+ * Remove the node from any queue and wait for the last hold to drop. A
+ * task context is never freed while a pop or a steal still holds it.
  */
-static __always_inline int inf_queue_node_detach(scx_edq_task_t __arg_arena *node)
+static __always_inline int
+inf_queue_node_detach(inf_queue_node_t __arg_arena *node)
 {
+#ifdef INF_QUEUE_LIST
+	return inf_list_node_detach(node);
+#else
 	return scx_edq_task_detach(node);
+#endif
 }
 
-/* The number of children in the queue. */
-static __always_inline u64 inf_queue_nr(scx_edq_t *queue)
+/* The key the node was inserted with, used to restore a failed move. */
+static __always_inline u64 inf_queue_node_key(inf_queue_node_t __arg_arena *node)
 {
+#ifdef INF_QUEUE_LIST
+	return node->key;
+#else
+	return node->node.deadline;
+#endif
+}
+
+static __always_inline u64 inf_queue_nr(inf_queue_t *queue)
+{
+#ifdef INF_QUEUE_LIST
+	return inf_list_nr(queue);
+#else
 	return scx_edq_nr_queued(queue);
+#endif
 }
 
 /*
- * The task that owns the node. The node sits at offset 0 of a group entity
- * and at a fixed offset of a task context, so the task pointer names the
- * entity or the context.
+ * Lockless head for the exit snapshot. The pointer is advisory: it may be
+ * stale if the queue changes while the dump runs, which is acceptable for a
+ * diagnostic record.
  */
-static __always_inline scx_edq_task_t *inf_queue_node_task(scx_edq_node_t *node)
+static __always_inline inf_queue_node_t __arg_arena *
+inf_queue_first(inf_queue_t *queue)
 {
-	return (scx_edq_task_t *)((u64)node -
-				  offsetof(struct scx_edq_task, node));
-}
-
-/*
- * The next node of a queue in deadline order. The queue is locked while
- * the caller walks, so the tree is stable.
- */
-static __always_inline scx_edq_node_t *inf_queue_next(scx_edq_node_t *node)
-{
-	scx_edq_node_t *p;
-
-	if (node->right) {
-		p = node->right;
-		while (p->left && can_loop)
-			p = p->left;
-		return p;
-	}
-
-	p = node->parent;
-	while (p && p->right == node && can_loop) {
-		node = p;
-		p = p->parent;
-	}
-	return p;
-}
-
-/* Take and release the lock of a queue. */
-static __always_inline int inf_queue_lock(scx_edq_t *queue)
-{
-	return scx_edq_lock(queue);
-}
-
-static __always_inline void inf_queue_unlock(scx_edq_t *queue)
-{
-	scx_edq_unlock(queue);
-}
-
-/*
- * The queue that owns the node, or NULL when the node is unlinked. The
- * membership is the source of truth for a child that is in a queue.
- */
-static __always_inline scx_edq_t *inf_queue_node_owner(scx_edq_task_t __arg_arena *node)
-{
-	return node->edq;
+#ifdef INF_QUEUE_LIST
+	return queue->head;
+#else
+	return (inf_queue_node_t *)queue->first;
+#endif
 }
 
 /* Current hold count, for the trace record. */
-static __always_inline u32 inf_queue_node_hold(scx_edq_task_t __arg_arena *node)
+static __always_inline u32
+inf_queue_node_hold(inf_queue_node_t __arg_arena *node)
 {
 	if (!node)
 		return 0;
 	return (u32)node->holdcnt;
 }
 
-/*
- * Unlink a child from whatever queue holds it, without marking the node
- * dead.
- *
- * inf_queue_node_detach() is the teardown primitive: it marks the node dead
- * and no later insert can claim it, because scx_edq_insert() refuses a dead
- * membership with -ECANCELED. A repair of a live node therefore needs the
- * plain removal of the queue that owns it.
- *
- * A node that a teardown already detached carries the dead membership and
- * holds no queue. Its links are rebuilt so that the node can be inserted
- * again.
- */
-static __always_inline int inf_queue_unlink(scx_edq_task_t __arg_arena *node)
+/* The queue that owns the node, or NULL when it is unlinked. */
+static __always_inline inf_queue_t __arg_arena *
+inf_queue_node_owner(inf_queue_node_t __arg_arena *node)
 {
-	scx_edq_t *owner = inf_queue_node_owner(node);
-
-	if (owner == (scx_edq_t *)SCX_EDQ_DEAD)
-		return inf_queue_node_init(node);
-	if (!owner)
-		return 0;
-	return inf_queue_remove(owner, node);
+#ifdef INF_QUEUE_LIST
+	return node->owner;
+#else
+	return node->edq;
+#endif
 }

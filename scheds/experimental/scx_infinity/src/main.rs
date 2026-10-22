@@ -29,8 +29,6 @@ use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::Result;
-use anyhow::anyhow;
-use anyhow::bail;
 use clap::Parser;
 use config::LiveConfig;
 use config::Overrides;
@@ -124,42 +122,6 @@ struct Opts {
     /// requeue fallback. Requires --trace for the transition records.
     #[clap(long, value_name = "N", hide = true)]
     test_dsq_refuse: Option<u64>,
-
-    /// Diagnostic: refuse this many handoff operations of KIND, where KIND
-    /// is dsq, dest-insert, source-remove, steal or hold. Each refusal is
-    /// counted by faults_injected. Without the option no handoff is
-    /// refused.
-    #[clap(long, value_name = "KIND:COUNT", hide = true)]
-    test_handoff_fail: Option<String>,
-}
-
-/// The handoff kinds of `--test-handoff-fail`, in the same order as the
-/// `INF_HO_*` constants of the BPF interface.
-const HANDOFF_FAULT_KINDS: [&str; 5] = ["dsq", "dest-insert", "source-remove", "steal", "hold"];
-
-/// Parse `KIND:COUNT` into the kind index of the BPF interface and the
-/// number of refusals to arm.
-fn parse_handoff_fault(spec: &str) -> Result<(u32, u64)> {
-    let (kind, count) = spec
-        .split_once(':')
-        .ok_or_else(|| anyhow!("--test-handoff-fail expects KIND:COUNT, got '{spec}'"))?;
-    let index = HANDOFF_FAULT_KINDS
-        .iter()
-        .position(|name| *name == kind)
-        .ok_or_else(|| {
-            anyhow!(
-                "--test-handoff-fail: unknown handoff kind '{kind}', expected one of {}",
-                HANDOFF_FAULT_KINDS.join(", ")
-            )
-        })?;
-    let count: u64 = count
-        .parse()
-        .with_context(|| format!("--test-handoff-fail: '{count}' is not a count of refusals"))?;
-    if count == 0 {
-        bail!("--test-handoff-fail: the count of refusals must be at least one");
-    }
-    /* Kind 0 is INF_HO_NONE, so the first injectable kind is 1. */
-    Ok(((index + 1) as u32, count))
 }
 
 impl Opts {
@@ -217,43 +179,6 @@ fn read_map_value<T: Copy, M: MapCore>(map: &M, key: &[u8]) -> Option<T> {
     Some(unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const T) })
 }
 
-/// Name of one callback of the per-task transition trace, from `intf.h`.
-fn callback_name(cb: i32) -> &'static str {
-    match cb as u32 {
-        bpf_intf::INF_CB_NONE => "none",
-        bpf_intf::INF_CB_SELECT_CPU => "select_cpu",
-        bpf_intf::INF_CB_ENQUEUE => "enqueue",
-        bpf_intf::INF_CB_RUNNING => "running",
-        bpf_intf::INF_CB_TICK => "tick",
-        bpf_intf::INF_CB_STOPPING => "stopping",
-        bpf_intf::INF_CB_DEQUEUE => "dequeue",
-        bpf_intf::INF_CB_QUIESCENT => "quiescent",
-        bpf_intf::INF_CB_DISPATCH => "dispatch",
-        bpf_intf::INF_CB_YIELD => "yield",
-        bpf_intf::INF_CB_SET_WEIGHT => "set_weight",
-        bpf_intf::INF_CB_CGROUP_MOVE => "cgroup_move",
-        bpf_intf::INF_CB_EXIT_TASK => "exit_task",
-        bpf_intf::INF_TT_ENQ_RET => "enqueue_ret",
-        bpf_intf::INF_TT_DISP_RET => "dispatch_ret",
-        bpf_intf::INF_TT_TICK_CHECK => "tick_check",
-        bpf_intf::INF_TT_DISP_CHECK => "dispatch_check",
-        bpf_intf::INF_TT_ENQ_CHECK => "enqueue_check",
-        _ => "unknown",
-    }
-}
-
-/// Name of one entity-chain audit class, from `intf.h`.
-fn audit_kind_name(kind: u32) -> &'static str {
-    match kind {
-        bpf_intf::INF_AUDIT_INACTIVE_LINKED => "inactive_linked",
-        bpf_intf::INF_AUDIT_INACTIVE_COUNTED => "inactive_counted",
-        bpf_intf::INF_AUDIT_INACTIVE_CHILDREN => "inactive_children",
-        bpf_intf::INF_AUDIT_RUNNABLE_UNLINKED => "runnable_unlinked",
-        bpf_intf::INF_AUDIT_LINK_MISMATCH => "link_mismatch",
-        _ => "unknown",
-    }
-}
-
 /// Name of one trace operation, from `intf.h`.
 fn trace_op_name(op: u32) -> &'static str {
     match op {
@@ -283,12 +208,6 @@ fn trace_op_name(op: u32) -> &'static str {
         bpf_intf::INF_TR_SET_WEIGHT => "set_weight",
         bpf_intf::INF_TR_DISPATCH_EMPTY => "dispatch_empty",
         bpf_intf::INF_TR_EXIT_PASS => "exit_pass",
-        bpf_intf::INF_TR_ENQ_ENTER => "enq_enter",
-        bpf_intf::INF_TR_QUIESCENT => "quiescent",
-        bpf_intf::INF_TR_Q_LEAVE => "q_leave",
-        bpf_intf::INF_TR_STOPPING => "stopping",
-        bpf_intf::INF_TR_RUN_START => "run_start",
-        bpf_intf::INF_TR_PATH_LOST => "path_lost",
         _ => "unknown",
     }
 }
@@ -301,8 +220,6 @@ struct Scheduler<'a> {
     live: LiveConfig,
     generation: u32,
     trace: bool,
-    /* The next frozen per-task trace the loader prints. */
-    frozen_printed: std::sync::atomic::AtomicU32,
     /* Kept alive for as long as the scheduler uses the arena. */
     _arenalib: ArenaLib,
 }
@@ -369,15 +286,6 @@ impl<'a> Scheduler<'a> {
         rodata.enable_cpu_bw = cpu_bw;
         rodata.enable_trace = opts.trace;
         rodata.inject_dsq_refusal = opts.test_dsq_refuse.is_some();
-        /*
-         * The handoff refusals are parsed before the load, so an invalid
-         * KIND:COUNT fails before the scheduler attaches.
-         */
-        let handoff_fault = match opts.test_handoff_fail.as_deref() {
-            Some(spec) => Some(parse_handoff_fault(spec)?),
-            None => None,
-        };
-        rodata.inject_handoff_fault = handoff_fault.is_some();
         if opts.trace {
             info!("Diagnostic trace enabled");
         }
@@ -426,31 +334,6 @@ impl<'a> Scheduler<'a> {
             info!("Controlled DSQ refusal armed for {count} inserts");
         }
 
-        /*
-         * Arm one handoff refusal. The array is indexed by the INF_HO_*
-         * kind, so the loader and the BPF side share the order of
-         * HANDOFF_FAULT_KINDS.
-         */
-        if let Some((kind, count)) = handoff_fault {
-            let mut value: bpf_intf::inf_fault_ctl = unsafe { std::mem::zeroed() };
-            value.handoff_fail[(kind as usize) & 7] = count;
-            /* SAFETY: the value is a plain C-layout struct and its length is exact. */
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    std::ptr::addr_of!(value) as *const u8,
-                    std::mem::size_of::<bpf_intf::inf_fault_ctl>(),
-                )
-            };
-            skel.maps
-                .fault_stor
-                .update(&0u32.to_ne_bytes(), bytes, libbpf_rs::MapFlags::ANY)
-                .context("failed to arm the handoff refusal injection")?;
-            info!(
-                "Handoff refusal armed: {} x {count}",
-                HANDOFF_FAULT_KINDS[(kind as usize) - 1]
-            );
-        }
-
         info!("Infinity configuration: {}", describe(&live));
 
         Ok(Self {
@@ -461,99 +344,8 @@ impl<'a> Scheduler<'a> {
             live,
             generation: 1,
             trace: opts.trace,
-            frozen_printed: std::sync::atomic::AtomicU32::new(0),
             _arenalib: arenalib,
         })
-    }
-
-    /// Read the arena task-context counters. The map entry is written by
-    /// `ops.init_task()` and `ops.exit_task()` on the BPF side.
-    fn task_pool(&self) -> Option<bpf_intf::inf_task_pool> {
-        read_map_value::<bpf_intf::inf_task_pool, _>(
-            &self.skel.maps.task_pool_stor,
-            &0u32.to_ne_bytes(),
-        )
-    }
-
-    /// Print the lifetime of the arena task contexts.
-    ///
-    /// A context that is allocated and never freed keeps its arena pages
-    /// for the rest of the run, so the pool eventually refuses an
-    /// allocation and a fork fails with `scx_alloc failed`. The live value
-    /// must return to zero when the workload drains; a peak far above the
-    /// live count is the signature of a leak.
-    fn log_task_pool(&self, when: &str) {
-        let Some(pool) = self.task_pool() else {
-            error!("tasks[{when}]: the task-context counter entry is missing");
-            return;
-        };
-
-        info!(
-            "tasks[{when}]: live={} peak={} inits={} reinits={} frees={} alloc_fail={} pool_full={} detach_fail={} no_ctx={}",
-            pool.live,
-            pool.peak,
-            pool.inits,
-            pool.reinits,
-            pool.frees,
-            pool.alloc_fail,
-            pool.pool_full,
-            pool.detach_fail,
-            pool.no_ctx
-        );
-    }
-
-    /// Print the entity-chain audit of the run.
-    ///
-    /// The audit is in the default build: the BPF side samples the entity
-    /// store of every CPU once a second and counts the five states that make
-    /// a task unreachable from the root. A class is confirmed only when two
-    /// consecutive samples see it, so a move that is caught between two
-    /// locked steps is not reported as a defect. The first records name the
-    /// entity that showed each state.
-    fn log_audit(&self, when: &str) {
-        let key = 0u32.to_ne_bytes();
-        let Some(a) = read_map_value::<bpf_intf::inf_audit, _>(&self.skel.maps.audit_stor, &key)
-        else {
-            error!("audit: the audit entry is missing");
-            return;
-        };
-
-        let s = |v: &[u64; bpf_intf::INF_AUDIT_KINDS as usize]| -> String {
-            v.iter()
-                .map(|x| x.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-
-        info!(
-            "audit[{when}]: samples={} entities={} violations={} confirmed={} \
-             streak=[{}] seen=[{}] max_streak=[{}] records={}",
-            a.samples,
-            a.entities,
-            a.violations,
-            a.confirmed,
-            s(&a.streak),
-            s(&a.seen),
-            s(&a.max_streak),
-            a.nrec
-        );
-
-        for i in 0..(a.nrec as usize).min(bpf_intf::INF_AUDIT_REC_MAX as usize) {
-            let r = &a.rec[i];
-            info!(
-                "audit[{when}]: kind={} cpu={} idx={} state={} count={} \
-                 nr_children={} linked={} parent_idx={} streak={}",
-                audit_kind_name(r.kind),
-                r.cpu,
-                r.idx,
-                r.state,
-                r.count,
-                r.nr_children,
-                r.linked,
-                r.parent_idx,
-                r.streak
-            );
-        }
     }
 
     /// Print the diagnostic trace, the per-CPU queue snapshot and the task
@@ -587,11 +379,6 @@ impl<'a> Scheduler<'a> {
             ctl.task_overflow,
             ctl.next.saturating_sub(start)
         );
-        if cap == 0 {
-            error!(
-                "diagnostics: the ring control entry carries no cap, so the ring was not armed by ops.init() and no record can be read"
-            );
-        }
 
         for cpu in 0..*NR_CPU_IDS {
             let key = (cpu as u32).to_ne_bytes();
@@ -600,33 +387,8 @@ impl<'a> Scheduler<'a> {
             else {
                 continue;
             };
-            let mut calls = String::new();
-            if let Ok(Some(row)) = self
-                .skel
-                .maps
-                .cpu_ctx_stor
-                .lookup(&key, libbpf_rs::MapFlags::ANY)
-                && row.len() >= std::mem::size_of::<bpf_intf::inf_cpu_ctx>()
-            {
-                /* SAFETY: the map value is inf_cpu_ctx and the length is checked. */
-                let cctx = unsafe {
-                    std::ptr::read_unaligned(row.as_ptr() as *const bpf_intf::inf_cpu_ctx)
-                };
-                calls = format!(
-                    " calls: disp={}/{} enq={} run={} stop={} qui={} deq={} tick={} last_disp_ns={}",
-                    cctx.disp_calls,
-                    cctx.disp_empty,
-                    cctx.enq_calls,
-                    cctx.run_calls,
-                    cctx.stop_calls,
-                    cctx.q_calls,
-                    cctx.deq_calls,
-                    cctx.tick_calls,
-                    cctx.last_disp_ns
-                );
-            }
             info!(
-                "infq: cpu={} depth={} w_sum={} head_pid={} head_state={} head_cpu={} head_gcpu={} head_hold={} head_slice={} head_weight={} head_key={} head_kflags=0x{:x} head_ops_state={} head_runnable_cpu={} local_nr={}{}",
+                "infq: cpu={} depth={} w_sum={} head_pid={} head_state={} head_cpu={} head_gcpu={} head_hold={} head_slice={} head_weight={} head_key={} head_kflags=0x{:x} head_ops_state={} head_runnable_cpu={}",
                 qs.cpu,
                 qs.depth,
                 qs.w_sum,
@@ -640,9 +402,7 @@ impl<'a> Scheduler<'a> {
                 qs.head_key,
                 qs.head_kflags,
                 qs.head_ops_state,
-                qs.head_runnable_cpu,
-                qs.local_nr,
-                calls
+                qs.head_runnable_cpu
             );
         }
 
@@ -655,7 +415,7 @@ impl<'a> Scheduler<'a> {
             };
             tasks += 1;
             info!(
-                "inftask: pid={} state={} queued_cpu={} group_cpu={} hold={} slice={} weight={} joined={} moving={} reweight_pending={} dequeue_pending={} exit_pending={} last_op={} src={} dst={} result={} ts={} prev_op={} prev_state={} prev_src={} prev_dst={} prev_result={} prev_ts={} node_owner={} leaf_idx={} leaf_cpu={} leaf_state={} leaf_count={} chain_broken={} path_depth={}",
+                "inftask: pid={} state={} queued_cpu={} group_cpu={} hold={} slice={} weight={} joined={} moving={} reweight_pending={} dequeue_pending={} exit_pending={} last_op={} src={} dst={} result={} ts={} prev_op={} prev_state={} prev_src={} prev_dst={} prev_result={} prev_ts={}",
                 ts.pid,
                 ts.state,
                 ts.queued_cpu,
@@ -678,14 +438,7 @@ impl<'a> Scheduler<'a> {
                 ts.prev_src,
                 ts.prev_dst,
                 ts.prev_result,
-                ts.prev_ts,
-                ts.node_owner,
-                ts.leaf_idx,
-                ts.leaf_cpu,
-                ts.leaf_state,
-                ts.leaf_count,
-                ts.chain_broken,
-                ts.path_depth
+                ts.prev_ts
             );
 
             let count = usize::min(ts.hist_count as usize, ts.hist.len());
@@ -730,116 +483,6 @@ impl<'a> Scheduler<'a> {
                 rec.ts
             );
         }
-
-        self.dump_task_traces();
-    }
-
-    /// Print one frozen trace: the detection line and every record the ring
-    /// kept, oldest first.
-    fn log_frozen_value(&self, slot: u32, fz: &bpf_intf::inf_tt_val) {
-        info!(
-            "infttfrozen: slot={} pid={} detected_cb={} records={}",
-            slot,
-            fz.pid,
-            callback_name(fz.detected_cb as i32),
-            fz.next
-        );
-        for rec in fz.rec.iter() {
-            if rec.ts == 0 {
-                break;
-            }
-            info!(
-                "inftt: pid={} cb={} ts={} enq_flags=0x{:x} deq_flags=0x{:x} scx_flags=0x{:x} ops_state=0x{:x} dsq=0x{:x} task_cpu={} holding_cpu={} queued_cpu={} path_cpu={} ent_state={} node_owner={} chain_broken={} depth={} local_nr={} rq_nr={} ho_pending={} last_dsq_ret={}",
-                rec.pid,
-                callback_name(rec.cb),
-                rec.ts,
-                rec.enq_flags,
-                rec.deq_flags,
-                rec.scx_flags,
-                rec.ops_state,
-                rec.dsq,
-                rec.task_cpu,
-                rec.holding_cpu,
-                rec.queued_cpu,
-                rec.path_cpu,
-                rec.ent_state,
-                rec.node_owner,
-                rec.chain_broken,
-                rec.tree_depth,
-                rec.local_nr,
-                rec.rq_nr,
-                rec.ho_pending,
-                rec.last_dsq_ret
-            );
-        }
-    }
-
-    /// Print and publish every frozen trace that this run has not printed yet.
-    ///
-    /// The freeze happens in the BPF custody check, which sees the violation
-    /// before the watchdog does. The loader prints the trace as soon as the
-    /// frozen table names it, so the record survives even when the watchdog
-    /// aborts the scheduler, and it writes one CANARY line to dmesg with the
-    /// pid so the kernel log names the stranded task as well.
-    fn log_new_frozen(&self) {
-        let key = 0u32.to_ne_bytes();
-        let Some(ctl) = read_map_value::<bpf_intf::inf_tt_ctl, _>(&self.skel.maps.ttctl_stor, &key)
-        else {
-            return;
-        };
-        let present = u32::try_from(ctl.frozen.min(u64::from(bpf_intf::INF_TT_FROZEN_MAX)))
-            .unwrap_or(bpf_intf::INF_TT_FROZEN_MAX);
-        let mut slot = self.frozen_printed.load(Ordering::Relaxed);
-        while slot < present {
-            let Some(fz) = read_map_value::<bpf_intf::inf_tt_val, _>(
-                &self.skel.maps.ttfrozen_stor,
-                &slot.to_ne_bytes(),
-            ) else {
-                break;
-            };
-            if fz.frozen_seq == 0 || fz.pid <= 0 {
-                break;
-            }
-            self.log_frozen_value(slot, &fz);
-            let canary = format!(
-                "scx_infinity: CANARY stranded pid={} cb={} slot={}",
-                fz.pid,
-                callback_name(fz.detected_cb as i32),
-                slot
-            );
-            if let Err(err) = std::fs::write("/dev/kmsg", format!("{canary}\n")) {
-                error!("CANARY: cannot write to /dev/kmsg: {err}");
-            } else {
-                info!("{canary}");
-            }
-            slot += 1;
-        }
-        self.frozen_printed.store(slot, Ordering::Relaxed);
-    }
-
-    /// Print the per-task trace control entry and every frozen trace.
-    fn dump_task_traces(&self) {
-        let key = 0u32.to_ne_bytes();
-        let Some(ctl) = read_map_value::<bpf_intf::inf_tt_ctl, _>(&self.skel.maps.ttctl_stor, &key)
-        else {
-            error!("diagnostics: the per-task trace control entry is missing");
-            return;
-        };
-
-        info!(
-            "inftt: enabled={} cap={} created={} checks={} scans={} stranded={} frozen={} canaries={} overwritten={}",
-            ctl.enabled,
-            ctl.cap,
-            ctl.created,
-            ctl.checks,
-            ctl.scans,
-            ctl.stranded,
-            ctl.frozen,
-            ctl.canaries,
-            ctl.overwritten
-        );
-
-        self.log_new_frozen();
     }
 
     fn exited(&self) -> bool {
@@ -884,42 +527,6 @@ impl<'a> Scheduler<'a> {
         let mut yields = 0u64;
         let mut cgrp_throttled = 0u64;
         let mut cgrp_reenqueued = 0u64;
-        let mut bw_gate = 0u64;
-        let mut bw_eagain = 0u64;
-        let mut bw_terr = 0u64;
-        let mut bw_park_ok = 0u64;
-        let mut bw_park_fail = 0u64;
-        let mut bw_cb = 0u64;
-        let mut bw_drain = 0u64;
-        let mut bw_drain_err = 0u64;
-        let mut bw_consume = 0u64;
-        let mut bw_consume_ns = 0u64;
-        let mut bw_consume_err = 0u64;
-        let mut bw_consume_skip = 0u64;
-        let mut bw_set = 0u64;
-        let mut bw_set_err = 0u64;
-        let mut bw_init = 0u64;
-        let mut bw_init_err = 0u64;
-        let mut bw_move = 0u64;
-        let mut bw_move_err = 0u64;
-        let mut bw_cancel = 0u64;
-        let mut bw_lib_init_err = 0u64;
-        let mut resv_renew = 0u64;
-        let mut resv_open = 0u64;
-        let mut resv_settled = 0u64;
-        let mut resv_none = 0u64;
-        let mut resv_closed = 0u64;
-        let mut resv_stale = 0u64;
-        let mut resv_mismatch = 0u64;
-        let mut settle_local = 0u64;
-        let mut settle_local_ns = 0u64;
-        let mut settle_remote = 0u64;
-        let mut settle_remote_ns = 0u64;
-        let mut settle_max_ns = 0u64;
-        let mut settle_over_slot = 0u64;
-        let mut bw_park_wait_ns = 0u64;
-        let mut bw_park_closed = 0u64;
-        let mut bw_park_open_max_ns = 0u64;
         let mut cgrp_eff_weight = 0u64;
         let mut cgrp_eff_min = 0u64;
         let mut cgrp_eff_max = 0u64;
@@ -954,34 +561,6 @@ impl<'a> Scheduler<'a> {
         let mut disp_renew = 0u64;
         let mut disp_total = 0u64;
         let mut disp_q = 0u64;
-        let mut link_lost = 0u64;
-        let mut count_lost = 0u64;
-        let mut link_repairs = 0u64;
-        let mut link_repair_fail = 0u64;
-        let mut unlink_repairs = 0u64;
-        let mut ancestor_link_repairs = 0u64;
-        let mut admit_unlinked = 0u64;
-        let mut disp_empty_lost = 0u64;
-        let mut run_unowned = 0u64;
-        let mut stop_unowned = 0u64;
-        let mut q_unowned = 0u64;
-        let mut slot_end_stop = 0u64;
-        let mut stop_slice_refused = 0u64;
-        let mut disp_renew_unowned = 0u64;
-        let mut runnable_unlinked = 0u64;
-        let mut ticks = 0u64;
-        let mut handoffs = 0u64;
-        let mut handoff_max_ns = 0u64;
-        let mut handoff_overdue = 0u64;
-        let mut handoff_orphans = 0u64;
-        let mut handoff_duplicates = 0u64;
-        let mut faults_injected = 0u64;
-        let mut core_rescues = 0u64;
-        let mut core_missing_seen = 0u64;
-        let mut dsq_refusals = 0u64;
-        let mut entity_own = 0u64;
-        let mut entity_ancestor = 0u64;
-        let mut handoff_inflight = 0u64;
 
         let key = 0u32.to_ne_bytes();
         if let Ok(Some(rows)) = self
@@ -1005,42 +584,6 @@ impl<'a> Scheduler<'a> {
                 yields += stats.yields;
                 cgrp_throttled += stats.cgrp_throttled;
                 cgrp_reenqueued += stats.cgrp_reenqueued;
-                bw_gate += stats.bw_gate;
-                bw_eagain += stats.bw_eagain;
-                bw_terr += stats.bw_terr;
-                bw_park_ok += stats.bw_park_ok;
-                bw_park_fail += stats.bw_park_fail;
-                bw_cb += stats.bw_cb;
-                bw_drain += stats.bw_drain;
-                bw_drain_err += stats.bw_drain_err;
-                bw_consume += stats.bw_consume;
-                bw_consume_ns += stats.bw_consume_ns;
-                bw_consume_err += stats.bw_consume_err;
-                bw_consume_skip += stats.bw_consume_skip;
-                bw_set += stats.bw_set;
-                bw_set_err += stats.bw_set_err;
-                bw_init += stats.bw_init;
-                bw_init_err += stats.bw_init_err;
-                bw_move += stats.bw_move;
-                bw_move_err += stats.bw_move_err;
-                bw_cancel += stats.bw_cancel;
-                bw_lib_init_err += stats.bw_lib_init_err;
-                resv_renew += stats.resv_renew;
-                resv_open += stats.resv_open;
-                resv_settled += stats.resv_settled;
-                resv_none += stats.resv_none;
-                resv_closed += stats.resv_closed;
-                resv_stale += stats.resv_stale;
-                resv_mismatch += stats.resv_mismatch;
-                settle_local += stats.settle_local;
-                settle_local_ns += stats.settle_local_ns;
-                settle_remote += stats.settle_remote;
-                settle_remote_ns += stats.settle_remote_ns;
-                settle_max_ns = settle_max_ns.max(stats.settle_max_ns);
-                settle_over_slot += stats.settle_over_slot;
-                bw_park_wait_ns += stats.bw_park_wait_ns;
-                bw_park_closed += stats.bw_park_closed;
-                bw_park_open_max_ns = bw_park_open_max_ns.max(stats.bw_park_open_max_ns);
                 cgrp_eff_weight = cgrp_eff_weight.max(stats.cgrp_eff_weight);
                 if stats.cgrp_eff_min != 0 {
                     cgrp_eff_min = if cgrp_eff_min == 0 {
@@ -1081,33 +624,6 @@ impl<'a> Scheduler<'a> {
                 disp_renew += stats.disp_renew;
                 disp_total += stats.disp_total;
                 disp_q += stats.disp_q;
-                link_lost += stats.link_lost;
-                count_lost += stats.count_lost;
-                link_repairs += stats.link_repairs;
-                link_repair_fail += stats.link_repair_fail;
-                unlink_repairs += stats.unlink_repairs;
-                ancestor_link_repairs += stats.ancestor_link_repairs;
-                admit_unlinked += stats.admit_unlinked;
-                disp_empty_lost += stats.disp_empty_lost;
-                run_unowned += stats.run_unowned;
-                stop_unowned += stats.stop_unowned;
-                q_unowned += stats.q_unowned;
-                slot_end_stop += stats.slot_end_stop;
-                stop_slice_refused += stats.stop_slice_refused;
-                disp_renew_unowned += stats.disp_renew_unowned;
-                runnable_unlinked += stats.runnable_unlinked;
-                ticks += stats.tick_slots;
-                handoffs += stats.handoffs;
-                handoff_max_ns = handoff_max_ns.max(stats.handoff_max_ns);
-                handoff_overdue += stats.handoff_overdue;
-                handoff_orphans += stats.handoff_orphans;
-                handoff_duplicates += stats.handoff_duplicates;
-                faults_injected += stats.faults_injected;
-                core_rescues += stats.core_rescues;
-                core_missing_seen += stats.core_missing_seen;
-                dsq_refusals += stats.dsq_refusals;
-                entity_own += stats.entity_own;
-                entity_ancestor += stats.entity_ancestor;
             }
         }
 
@@ -1167,7 +683,6 @@ impl<'a> Scheduler<'a> {
                     std::ptr::read_unaligned(row.as_ptr() as *const bpf_intf::inf_cpu_ctx)
                 };
                 depth += cctx.depth;
-                handoff_inflight += cctx.ho_pid.iter().filter(|pid| **pid != 0).count() as u64;
             }
         }
 
@@ -1175,24 +690,7 @@ impl<'a> Scheduler<'a> {
             "inserts: head={head} tail={tail} exempt={exempt} \
              expiries={expiries} preemptions={preemptions} yields={yields} \
              depth={depth} cgrp: throttled={cgrp_throttled} \
-             reenqueued={cgrp_reenqueued} bw: gate={bw_gate} \
-             eagain={bw_eagain} terr={bw_terr} park_ok={bw_park_ok} \
-             park_fail={bw_park_fail} cb={bw_cb} drain={bw_drain} \
-             drain_err={bw_drain_err} consume={bw_consume} \
-             consume_ns={bw_consume_ns} consume_err={bw_consume_err} \
-             consume_skip={bw_consume_skip} set={bw_set} \
-             set_err={bw_set_err} init={bw_init} init_err={bw_init_err} \
-             move={bw_move} move_err={bw_move_err} cancel={bw_cancel} \
-             lib_init_err={bw_lib_init_err} resv_renew={resv_renew} \
-             resv: open={resv_open} settled={resv_settled} \
-             none={resv_none} closed={resv_closed} stale={resv_stale} \
-             mismatch={resv_mismatch} \
-             settle: local={settle_local} local_ns={settle_local_ns} \
-             remote={settle_remote} remote_ns={settle_remote_ns} \
-             max_ns={settle_max_ns} over_slot={settle_over_slot} \
-             park: closed={bw_park_closed} wait_ns={bw_park_wait_ns} \
-             wait_max_ns={bw_park_open_max_ns} \
-             eff_weight={cgrp_eff_weight} \
+             reenqueued={cgrp_reenqueued} eff_weight={cgrp_eff_weight} \
              eff_min={cgrp_eff_min} eff_max={cgrp_eff_max} \
              eff_samples={cgrp_eff_samples} scale_q10={cgrp_scale} \
              refolds={cgrp_refolds} deq: sleep={deq_sleep} \
@@ -1212,26 +710,8 @@ impl<'a> Scheduler<'a> {
              no_ctx={enq_no_ctx} no_cctx={enq_no_cctx} \
              stale_requeues={stale_requeues} stale_skips={stale_skips} \
              disp: pop={disp_pop} renew={disp_renew} \
-             total={disp_total} q={disp_q} path: link_lost={link_lost} \
-             count_lost={count_lost} link_repairs={link_repairs} \
-             link_repair_fail={link_repair_fail} \
-             unlink_repairs={unlink_repairs} \
-             ancestor_link_repairs={ancestor_link_repairs} \
-             admit_unlinked={admit_unlinked} \
-             empty_lost={disp_empty_lost} unowned: run={run_unowned} \
-             stop={stop_unowned} qui={q_unowned} slot_end_stop={slot_end_stop} \
-             stop_slice_refused={stop_slice_refused} \
-             renew_unowned={disp_renew_unowned} runnable_unlinked={runnable_unlinked} \
-             ticks={ticks} handoffs={handoffs} handoff_max_ns={handoff_max_ns} \
-             handoff_overdue={handoff_overdue} handoff_orphans={handoff_orphans} \
-             handoff_duplicates={handoff_duplicates} \
-             faults_injected={faults_injected} core_rescues={core_rescues} \
-             core_missing_seen={core_missing_seen} \
-             handoff_inflight={handoff_inflight} dsq_refusals={dsq_refusals} \
-             entity: own={entity_own} ancestor={entity_ancestor}"
+             total={disp_total} q={disp_q}"
         );
-
-        self.log_audit("periodic");
 
         if self.trace
             && let Some(ctl) =
@@ -1241,14 +721,6 @@ impl<'a> Scheduler<'a> {
                 "trace: transitions={} ringed={} cap={} overwritten={} task_overflow={}",
                 ctl.total, ctl.next, ctl.cap, ctl.overwritten, ctl.task_overflow
             );
-        }
-
-        /* The arena task-context lifetime, once per stats interval. */
-        self.log_task_pool("periodic");
-
-        /* A frozen custody trace is printed as soon as it exists. */
-        if self.trace {
-            self.log_new_frozen();
         }
     }
 
@@ -1274,9 +746,6 @@ impl<'a> Scheduler<'a> {
         }
 
         let _ = self.struct_ops.take();
-        /* The quiescent value of the pool, after the workload drained. */
-        self.log_task_pool("exit");
-        self.log_audit("exit");
         self.dump_diagnostics();
         uei_report!(&self.skel, uei)
     }
@@ -1313,17 +782,6 @@ fn main() -> Result<()> {
         simplelog::TerminalMode::Stderr,
         simplelog::ColorChoice::Auto,
     )?;
-
-    /*
-     * The diagnostic trace is a build feature. A binary without it has no
-     * ring and no per-task snapshots, so `--trace` is refused instead of
-     * printing an empty dump that reads like a clean run.
-     */
-    if opts.trace && !cfg!(feature = "trace") {
-        bail!(
-            "--trace needs a build with the trace feature: cargo build -p scx_infinity --features trace"
-        );
-    }
 
     let overrides = opts.overrides();
     let config_path = config::resolve_path(opts.config.as_deref());
@@ -1394,44 +852,6 @@ mod tests {
         assert!(message.contains("--quantum-us"), "{message}");
         assert!(message.contains("revision 4"), "{message}");
         assert!(message.contains("measured kernel tick"), "{message}");
-    }
-
-    #[test]
-    fn cli_parses_the_handoff_fault_spec() {
-        let opts =
-            Opts::try_parse_from(["scx_infinity", "--test-handoff-fail", "dest-insert:4"]).unwrap();
-
-        assert_eq!(
-            parse_handoff_fault(opts.test_handoff_fail.as_deref().unwrap()).unwrap(),
-            (2, 4)
-        );
-    }
-
-    #[test]
-    fn every_fault_kind_maps_to_its_bpf_index() {
-        for (index, kind) in HANDOFF_FAULT_KINDS.iter().enumerate() {
-            let spec = format!("{kind}:1");
-            assert_eq!(
-                parse_handoff_fault(&spec).unwrap(),
-                ((index + 1) as u32, 1),
-                "{kind}"
-            );
-        }
-    }
-
-    #[test]
-    fn an_unknown_fault_kind_is_rejected() {
-        let error = parse_handoff_fault("nonsense:1").unwrap_err().to_string();
-
-        assert!(error.contains("unknown handoff kind"), "{error}");
-        assert!(error.contains("dest-insert"), "{error}");
-    }
-
-    #[test]
-    fn a_zero_handoff_fault_count_is_rejected() {
-        let error = parse_handoff_fault("dsq:0").unwrap_err().to_string();
-
-        assert!(error.contains("at least one"), "{error}");
     }
 
     #[test]
